@@ -1,0 +1,7 @@
+from django.apps import AppConfig
+
+
+class ResultsConfig(AppConfig):
+    name = 'apps.results'
+    label = 'results'
+    verbose_name = 'Exam Results'

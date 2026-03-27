@@ -1,0 +1,48 @@
+# =============================================================================
+# Cytova Backend — Python Dependencies
+# =============================================================================
+
+# Web framework
+Django==4.2.17
+djangorestframework==3.15.2
+
+# Multi-tenancy (schema-per-tenant)
+django-tenants==3.6.1
+
+# Authentication
+djangorestframework-simplejwt==5.3.1
+
+# Database
+psycopg2-binary==2.9.10
+
+# Task queue
+celery==5.3.6
+django-celery-beat==2.6.0
+redis==5.0.8
+django-redis==5.4.0
+
+# Environment variables
+python-decouple==3.8
+
+# CORS
+django-cors-headers==4.3.1
+
+# API documentation (OpenAPI / Swagger)
+drf-spectacular==0.27.2
+
+# Filtering
+django-filter==24.3
+
+# File storage (S3 / MinIO)
+django-storages==1.14.4
+boto3==1.35.81
+
+# Structured logging
+structlog==24.4.0
+
+# Production server
+gunicorn==22.0.0
+whitenoise==6.7.0
+
+# Image processing (for file validation)
+Pillow==10.4.0
