@@ -4,7 +4,7 @@ Served on all tenant subdomains: laba.cytova.io, labb.cytova.io, etc.
 """
 from django.contrib import admin
 from django.urls import path, include
-from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerUIView
+from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView
 
 urlpatterns = [
     # Django admin (accessible from tenant context in development)
@@ -26,7 +26,7 @@ urlpatterns = [
         # API schema & docs (restrict access in production via settings)
         # ------------------------------------------------------------------
         path('schema/', SpectacularAPIView.as_view(), name='schema'),
-        path('docs/', SpectacularSwaggerUIView.as_view(url_name='schema'), name='swagger-ui'),
+        path('docs/', SpectacularSwaggerView.as_view(url_name='schema'), name='swagger-ui'),
 
         # ------------------------------------------------------------------
         # Domain modules

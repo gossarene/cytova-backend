@@ -22,7 +22,7 @@ from .services import AuthService
 
 
 class LoginRateThrottle(AnonRateThrottle):
-    """10 attempts per 15 minutes per IP — matches DEFAULT_THROTTLE_RATES['auth_login']."""
+    """5 attempts per  minute per IP — matches DEFAULT_THROTTLE_RATES['auth_login']."""
     scope = 'auth_login'
 
 

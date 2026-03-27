@@ -35,15 +35,16 @@ SHARED_APPS = [
     # Standard Django shared apps
     'django.contrib.contenttypes',
     'django.contrib.auth',
-    'django.contrib.admin',
-    'django.contrib.sessions',
-    'django.contrib.messages',
     'django.contrib.staticfiles',
 ]
 
 # TENANT_APPS: installed in every tenant's private schema.
 TENANT_APPS = [
     'django.contrib.contenttypes',
+    'django.contrib.auth',
+    'django.contrib.admin',
+    'django.contrib.sessions',
+    'django.contrib.messages',
 
     # Domain apps (per-tenant)
     'apps.authentication',
@@ -258,9 +259,9 @@ REST_FRAMEWORK = {
         'rest_framework.throttling.UserRateThrottle',
     ],
     'DEFAULT_THROTTLE_RATES': {
-        'anon': '100/hour',
+        'anon': '50/hour',
         'user': '1000/hour',
-        'auth_login': '10/15min',
+        'auth_login': '5/minute',
     },
 }
 
