@@ -55,6 +55,7 @@ TENANT_APPS = [
     'apps.results',
     'apps.stock',
     'apps.suppliers',
+    'apps.partners',
     'apps.alerts',
     'apps.dashboard',
     'apps.audit',

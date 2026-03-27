@@ -72,14 +72,18 @@ class AnalysisRequestViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet)
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_class = AnalysisRequestFilter
     search_fields = ['request_number', 'patient__first_name', 'patient__last_name',
-                     'patient__national_id']
+                     'patient__national_id', 'external_reference',
+                     'partner_organization__code', 'partner_organization__name']
     ordering_fields = ['created_at', 'status', 'request_number']
     ordering = ['-created_at']
 
     def get_queryset(self):
         return (
             AnalysisRequest.objects
-            .select_related('patient', 'created_by', 'confirmed_by', 'cancelled_by')
+            .select_related(
+                'patient', 'partner_organization',
+                'created_by', 'confirmed_by', 'cancelled_by',
+            )
             .prefetch_related('items')
         )
 
@@ -106,7 +110,10 @@ class AnalysisRequestViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet)
         )
         ar = (
             AnalysisRequest.objects
-            .select_related('patient', 'created_by', 'confirmed_by', 'cancelled_by')
+            .select_related(
+                'patient', 'partner_organization',
+                'created_by', 'confirmed_by', 'cancelled_by',
+            )
             .prefetch_related('items')
             .get(id=ar.id)
         )
@@ -117,7 +124,10 @@ class AnalysisRequestViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet)
 
     def partial_update(self, request, *args, **kwargs):
         ar = _get_request_or_404(kwargs['pk'])
-        serializer = AnalysisRequestUpdateSerializer(data=request.data)
+        serializer = AnalysisRequestUpdateSerializer(
+            data=request.data,
+            context={'instance': ar},
+        )
         serializer.is_valid(raise_exception=True)
         ar = AnalysisRequestService.update(
             analysis_request=ar,
@@ -137,7 +147,10 @@ class AnalysisRequestViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet)
         )
         ar = (
             AnalysisRequest.objects
-            .select_related('patient', 'created_by', 'confirmed_by', 'cancelled_by')
+            .select_related(
+                'patient', 'partner_organization',
+                'created_by', 'confirmed_by', 'cancelled_by',
+            )
             .prefetch_related('items')
             .get(id=ar.id)
         )

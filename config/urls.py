@@ -38,6 +38,7 @@ urlpatterns = [
         path('stock/',     include('apps.stock.urls')),
         path('suppliers/',    include('apps.suppliers.urls')),
         # path('procurement/',  include('apps.procurement.urls')),
+        path('partners/',     include('apps.partners.urls')),
         path('alerts/',       include('apps.alerts.urls')),
         path('dashboard/',    include('apps.dashboard.urls')),
         # path('audit/',        include('apps.audit.urls')),

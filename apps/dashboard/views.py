@@ -8,6 +8,7 @@ no N+1 patterns, no per-row service calls.
     GET /overview/      — lightweight summary across all domains
     GET /patients/      — patient registration metrics
     GET /requests/      — request lifecycle + execution mode stats
+    GET /partners/      — partner organization analytics + revenue
     GET /results/       — result validation / publication pipeline
     GET /stock/         — inventory health indicators
     GET /alerts/        — open alert counts by type and severity
@@ -67,7 +68,7 @@ class DashboardOverviewView(APIView):
     def get(self, request):
         from apps.alerts.models import AlertSeverity, InventoryAlert, OPEN_STATUSES
         from apps.patients.models import Patient
-        from apps.requests.models import AnalysisRequest, RequestStatus
+        from apps.requests.models import AnalysisRequest, RequestStatus, SourceType
         from apps.results.models import ExamResult, ResultStatus
         from apps.stock.models import StockItem, StockLot
         from apps.suppliers.models import PurchaseOrder, RECEIVABLE_STATUSES
@@ -90,6 +91,10 @@ class DashboardOverviewView(APIView):
         ).count()
         req_month = AnalysisRequest.objects.filter(
             created_at__date__gte=start_of_month,
+        ).count()
+        req_total = AnalysisRequest.objects.count()
+        req_partner = AnalysisRequest.objects.filter(
+            source_type=SourceType.PARTNER_ORGANIZATION,
         ).count()
 
         # ---- results ----
@@ -143,6 +148,9 @@ class DashboardOverviewView(APIView):
             'requests': {
                 'active': req_active,
                 'created_this_month': req_month,
+                'total': req_total,
+                'from_partners': req_partner,
+                'from_direct': req_total - req_partner,
             },
             'results': {
                 'pending_validation': pending_validation,
@@ -219,6 +227,7 @@ class DashboardRequestsView(APIView):
         )
 
         req_base = AnalysisRequest.objects.all()
+        total = sum(req_status.values())
 
         # Execution mode breakdown across all items
         exec_mode = dict(
@@ -235,9 +244,25 @@ class DashboardRequestsView(APIView):
             .annotate(count=Count('id'))
         )
 
+        # Source type breakdown
+        by_source_type = dict(
+            req_base
+            .values('source_type')
+            .annotate(count=Count('id'))
+            .values_list('source_type', 'count')
+        )
+
+        # Billing mode breakdown
+        by_billing_mode = dict(
+            req_base
+            .values('billing_mode')
+            .annotate(count=Count('id'))
+            .values_list('billing_mode', 'count')
+        )
+
         return Response({
             'by_status': req_status,
-            'total': sum(req_status.values()),
+            'total': total,
             'created_today': req_base.filter(
                 created_at__date=today,
             ).count(),
@@ -247,10 +272,137 @@ class DashboardRequestsView(APIView):
             'created_this_month': req_base.filter(
                 created_at__date__gte=start_of_month,
             ).count(),
+            'by_source_type': by_source_type,
+            'by_billing_mode': by_billing_mode,
             'items': {
                 'by_status': item_status,
                 'by_execution_mode': exec_mode,
             },
+        })
+
+
+# ---------------------------------------------------------------------------
+# Partners
+# ---------------------------------------------------------------------------
+
+class DashboardPartnersView(APIView):
+    """
+    Partner organization analytics: request volume, exam volume, revenue,
+    and the direct-vs-partner ratio.
+    """
+    permission_classes = [IsAnyStaff]
+
+    def get(self, request):
+        from apps.partners.models import PartnerOrganization
+        from apps.requests.models import (
+            AnalysisRequest,
+            AnalysisRequestItem,
+            RequestStatus,
+            SourceType,
+        )
+
+        today, _, start_of_month = _period_boundaries()
+        confirmed_statuses = [
+            RequestStatus.CONFIRMED,
+            RequestStatus.IN_PROGRESS,
+            RequestStatus.COMPLETED,
+        ]
+
+        # ---- ratio: direct vs partner (all-time, confirmed+) ----
+        confirmed_qs = AnalysisRequest.objects.filter(
+            status__in=confirmed_statuses,
+        )
+        total_confirmed = confirmed_qs.count()
+        partner_confirmed = confirmed_qs.filter(
+            source_type=SourceType.PARTNER_ORGANIZATION,
+        ).count()
+        direct_confirmed = total_confirmed - partner_confirmed
+
+        # ---- top partners by request volume (this month) ----
+        partner_requests_month = list(
+            AnalysisRequest.objects
+            .filter(
+                source_type=SourceType.PARTNER_ORGANIZATION,
+                partner_organization__isnull=False,
+                created_at__date__gte=start_of_month,
+            )
+            .values(
+                'partner_organization_id',
+                partner_code=F('partner_organization__code'),
+                partner_name=F('partner_organization__name'),
+            )
+            .annotate(request_count=Count('id'))
+            .order_by('-request_count')[:20]
+        )
+
+        # ---- exam volume per partner (confirmed+ items, this month) ----
+        partner_items_month = list(
+            AnalysisRequestItem.objects
+            .filter(
+                analysis_request__source_type=SourceType.PARTNER_ORGANIZATION,
+                analysis_request__partner_organization__isnull=False,
+                analysis_request__status__in=confirmed_statuses,
+                analysis_request__created_at__date__gte=start_of_month,
+            )
+            .values(
+                partner_id=F('analysis_request__partner_organization_id'),
+                partner_code=F('analysis_request__partner_organization__code'),
+                partner_name=F('analysis_request__partner_organization__name'),
+            )
+            .annotate(
+                exam_count=Count('id'),
+                total_billed=Coalesce(
+                    Sum('billed_price'),
+                    Value(Decimal('0')),
+                    output_field=DecimalField(),
+                ),
+            )
+            .order_by('-exam_count')[:20]
+        )
+
+        # ---- aggregate revenue by partner (confirmed+, all-time) ----
+        partner_revenue = list(
+            AnalysisRequestItem.objects
+            .filter(
+                analysis_request__source_type=SourceType.PARTNER_ORGANIZATION,
+                analysis_request__partner_organization__isnull=False,
+                analysis_request__status__in=confirmed_statuses,
+                billed_price__isnull=False,
+            )
+            .values(
+                partner_id=F('analysis_request__partner_organization_id'),
+                partner_code=F('analysis_request__partner_organization__code'),
+                partner_name=F('analysis_request__partner_organization__name'),
+            )
+            .annotate(
+                total_billed=Coalesce(
+                    Sum('billed_price'),
+                    Value(Decimal('0')),
+                    output_field=DecimalField(),
+                ),
+                exam_count=Count('id'),
+            )
+            .order_by('-total_billed')[:20]
+        )
+
+        # Serialize Decimals to strings for JSON
+        for row in partner_items_month:
+            row['total_billed'] = str(row['total_billed'])
+        for row in partner_revenue:
+            row['total_billed'] = str(row['total_billed'])
+
+        return Response({
+            'ratio': {
+                'total_confirmed': total_confirmed,
+                'direct': direct_confirmed,
+                'partner': partner_confirmed,
+            },
+            'active_partners': PartnerOrganization.objects.filter(
+                is_active=True,
+            ).count(),
+            'requests_by_partner_this_month': partner_requests_month,
+            'exams_by_partner_this_month': partner_items_month,
+            'revenue_by_partner': partner_revenue,
         })
 
 

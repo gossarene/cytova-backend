@@ -117,6 +117,11 @@ class AnalysisRequestService:
         ar = AnalysisRequest(
             patient_id=validated_data['patient_id'],
             notes=validated_data.get('notes', ''),
+            source_type=validated_data.get('source_type', 'DIRECT_PATIENT'),
+            partner_organization_id=validated_data.get('partner_organization_id'),
+            external_reference=validated_data.get('external_reference', ''),
+            billing_mode=validated_data.get('billing_mode', 'DIRECT_PAYMENT'),
+            source_notes=validated_data.get('source_notes', ''),
             created_by=created_by,
         )
         ar.save()
@@ -137,6 +142,9 @@ class AnalysisRequestService:
             diff={'after': {
                 'request_number': ar.request_number,
                 'patient_id': str(ar.patient_id),
+                'source_type': ar.source_type,
+                'partner_organization_id': str(ar.partner_organization_id) if ar.partner_organization_id else None,
+                'billing_mode': ar.billing_mode,
                 'items_count': len(items_data),
             }},
             request=request,
@@ -224,12 +232,20 @@ class AnalysisRequestService:
         analysis_request.save(update_fields=list(validated_data.keys()) + ['updated_at'])
         after = {k: getattr(analysis_request, k) for k in validated_data}
 
+        # Ensure all values are JSON-serializable (UUIDs → str)
+        def _safe(v):
+            from uuid import UUID
+            return str(v) if isinstance(v, UUID) else v
+
         _audit(
             actor=updated_by,
             action=AuditAction.UPDATE,
             entity_type='AnalysisRequest',
             entity_id=analysis_request.id,
-            diff={'before': before, 'after': after},
+            diff={
+                'before': {k: _safe(v) for k, v in before.items()},
+                'after': {k: _safe(v) for k, v in after.items()},
+            },
             request=request,
         )
 

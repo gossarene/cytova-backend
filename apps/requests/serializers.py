@@ -5,9 +5,10 @@ from rest_framework import serializers
 
 from apps.patients.models import Patient
 from apps.catalog.models import ExamDefinition
+from apps.partners.models import PartnerOrganization
 from .models import (
     AnalysisRequest, AnalysisRequestItem, ExamTraceability,
-    RequestStatus, ItemStatus, ExecutionMode,
+    RequestStatus, ItemStatus, ExecutionMode, SourceType, BillingMode,
 )
 
 
@@ -99,12 +100,17 @@ class AnalysisRequestListSerializer(serializers.ModelSerializer):
     created_by_email = serializers.CharField(
         source='created_by.email', read_only=True, default=None,
     )
+    partner_organization_name = serializers.CharField(
+        source='partner_organization.name', read_only=True, default=None,
+    )
 
     class Meta:
         model = AnalysisRequest
         fields = [
             'id', 'request_number', 'patient_id', 'patient_name',
-            'status', 'items_count', 'created_by_email', 'created_at',
+            'status', 'source_type', 'billing_mode',
+            'partner_organization_id', 'partner_organization_name',
+            'items_count', 'created_by_email', 'created_at',
         ]
 
     def get_patient_name(self, obj):
@@ -131,12 +137,21 @@ class AnalysisRequestDetailSerializer(serializers.ModelSerializer):
     created_by_email = serializers.CharField(
         source='created_by.email', read_only=True, default=None,
     )
+    partner_organization_name = serializers.CharField(
+        source='partner_organization.name', read_only=True, default=None,
+    )
+    partner_organization_code = serializers.CharField(
+        source='partner_organization.code', read_only=True, default=None,
+    )
 
     class Meta:
         model = AnalysisRequest
         fields = [
             'id', 'request_number', 'patient_id',
             'status', 'notes',
+            'source_type', 'billing_mode',
+            'partner_organization_id', 'partner_organization_name',
+            'partner_organization_code', 'external_reference', 'source_notes',
             'confirmed_at', 'confirmed_by_email',
             'cancelled_at', 'cancelled_by_email',
             'created_by_email',
@@ -198,9 +213,34 @@ class AnalysisRequestCreateSerializer(serializers.Serializer):
     notes = serializers.CharField(required=False, allow_blank=True, default='')
     items = AnalysisRequestItemCreateSerializer(many=True, required=False, default=list)
 
+    # Source tracking
+    source_type = serializers.ChoiceField(
+        choices=SourceType.choices, default=SourceType.DIRECT_PATIENT,
+    )
+    partner_organization_id = serializers.UUIDField(
+        required=False, allow_null=True, default=None,
+    )
+    external_reference = serializers.CharField(
+        max_length=100, required=False, allow_blank=True, default='',
+    )
+    billing_mode = serializers.ChoiceField(
+        choices=BillingMode.choices, default=BillingMode.DIRECT_PAYMENT,
+    )
+    source_notes = serializers.CharField(
+        required=False, allow_blank=True, default='',
+    )
+
     def validate_patient_id(self, value):
         if not Patient.objects.filter(id=value, is_active=True).exists():
             raise serializers.ValidationError('Patient not found or inactive.')
+        return value
+
+    def validate_partner_organization_id(self, value):
+        if value is not None:
+            if not PartnerOrganization.objects.filter(id=value, is_active=True).exists():
+                raise serializers.ValidationError(
+                    'Partner organization not found or inactive.'
+                )
         return value
 
     def validate_items(self, value):
@@ -211,7 +251,106 @@ class AnalysisRequestCreateSerializer(serializers.Serializer):
             )
         return value
 
+    def validate(self, attrs):
+        source_type = attrs.get('source_type', SourceType.DIRECT_PATIENT)
+        partner_id = attrs.get('partner_organization_id')
+        billing_mode = attrs.get('billing_mode', BillingMode.DIRECT_PAYMENT)
+
+        if source_type == SourceType.DIRECT_PATIENT:
+            if partner_id is not None:
+                raise serializers.ValidationError({
+                    'partner_organization_id': (
+                        'Must be null when source_type is DIRECT_PATIENT.'
+                    ),
+                })
+            if billing_mode == BillingMode.PARTNER_BILLING:
+                raise serializers.ValidationError({
+                    'billing_mode': (
+                        'PARTNER_BILLING is not valid for DIRECT_PATIENT requests.'
+                    ),
+                })
+
+        if source_type == SourceType.PARTNER_ORGANIZATION:
+            if partner_id is None:
+                raise serializers.ValidationError({
+                    'partner_organization_id': (
+                        'Required when source_type is PARTNER_ORGANIZATION.'
+                    ),
+                })
+
+        return attrs
+
 
 class AnalysisRequestUpdateSerializer(serializers.Serializer):
-    """Only notes can be changed after creation; item list is managed separately."""
+    """
+    Updatable fields on a DRAFT request.
+    Source fields can be changed while DRAFT; item list is managed separately.
+    """
     notes = serializers.CharField(required=False, allow_blank=True)
+    source_type = serializers.ChoiceField(
+        choices=SourceType.choices, required=False,
+    )
+    partner_organization_id = serializers.UUIDField(
+        required=False, allow_null=True,
+    )
+    external_reference = serializers.CharField(
+        max_length=100, required=False, allow_blank=True,
+    )
+    billing_mode = serializers.ChoiceField(
+        choices=BillingMode.choices, required=False,
+    )
+    source_notes = serializers.CharField(required=False, allow_blank=True)
+
+    def validate_partner_organization_id(self, value):
+        if value is not None:
+            if not PartnerOrganization.objects.filter(id=value, is_active=True).exists():
+                raise serializers.ValidationError(
+                    'Partner organization not found or inactive.'
+                )
+        return value
+
+    def validate(self, attrs):
+        # Cross-field validation needs the instance context to fill defaults
+        instance = self.context.get('instance')
+        source_type = attrs.get(
+            'source_type',
+            getattr(instance, 'source_type', None),
+        )
+        partner_id = attrs.get('partner_organization_id', _UNSET)
+        billing_mode = attrs.get(
+            'billing_mode',
+            getattr(instance, 'billing_mode', None),
+        )
+
+        # Resolve partner_id: if not in payload, use current instance value
+        if partner_id is _UNSET:
+            partner_id = getattr(instance, 'partner_organization_id', None) if instance else None
+        # If explicitly set to None in the payload, it's None
+
+        if source_type == SourceType.DIRECT_PATIENT:
+            if partner_id is not None:
+                raise serializers.ValidationError({
+                    'partner_organization_id': (
+                        'Must be null when source_type is DIRECT_PATIENT.'
+                    ),
+                })
+            if billing_mode == BillingMode.PARTNER_BILLING:
+                raise serializers.ValidationError({
+                    'billing_mode': (
+                        'PARTNER_BILLING is not valid for DIRECT_PATIENT requests.'
+                    ),
+                })
+
+        if source_type == SourceType.PARTNER_ORGANIZATION:
+            if partner_id is None:
+                raise serializers.ValidationError({
+                    'partner_organization_id': (
+                        'Required when source_type is PARTNER_ORGANIZATION.'
+                    ),
+                })
+
+        return attrs
+
+
+# Sentinel for distinguishing "not in payload" from explicit null
+_UNSET = object()

@@ -50,6 +50,16 @@ class ExecutionMode(models.TextChoices):
     REJECTED      = 'REJECTED',      'Rejected'
 
 
+class SourceType(models.TextChoices):
+    DIRECT_PATIENT       = 'DIRECT_PATIENT',       'Direct Patient'
+    PARTNER_ORGANIZATION = 'PARTNER_ORGANIZATION', 'Partner Organization'
+
+
+class BillingMode(models.TextChoices):
+    DIRECT_PAYMENT  = 'DIRECT_PAYMENT',  'Direct Payment'
+    PARTNER_BILLING = 'PARTNER_BILLING', 'Partner Billing'
+
+
 # ---------------------------------------------------------------------------
 # AnalysisRequest
 # ---------------------------------------------------------------------------
@@ -85,6 +95,41 @@ class AnalysisRequest(BaseModel):
     )
     notes = models.TextField(blank=True, default='')
 
+    # ---- Source tracking ----
+    source_type = models.CharField(
+        max_length=25,
+        choices=SourceType.choices,
+        default=SourceType.DIRECT_PATIENT,
+        db_index=True,
+        help_text='Where this request originated from.',
+    )
+    partner_organization = models.ForeignKey(
+        'partners.PartnerOrganization',
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='analysis_requests',
+        help_text='Required when source_type is PARTNER_ORGANIZATION.',
+    )
+    external_reference = models.CharField(
+        max_length=100,
+        blank=True,
+        default='',
+        help_text='Reference number from the partner (e.g. their internal order ID).',
+    )
+    billing_mode = models.CharField(
+        max_length=20,
+        choices=BillingMode.choices,
+        default=BillingMode.DIRECT_PAYMENT,
+        db_index=True,
+        help_text='How this request will be billed.',
+    )
+    source_notes = models.TextField(
+        blank=True,
+        default='',
+        help_text='Free-text notes related to the request source or billing.',
+    )
+
     confirmed_at = models.DateTimeField(null=True, blank=True)
     confirmed_by = models.ForeignKey(
         'users.StaffUser',
@@ -115,6 +160,7 @@ class AnalysisRequest(BaseModel):
         indexes = [
             models.Index(fields=['patient', 'status']),
             models.Index(fields=['status', 'created_at']),
+            models.Index(fields=['source_type', 'partner_organization']),
         ]
 
     def __str__(self):
