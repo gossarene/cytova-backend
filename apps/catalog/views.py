@@ -120,7 +120,7 @@ class ExamDefinitionViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet):
         return ExamDefinition.objects.select_related('category', 'lab_settings').all()
 
     def get_permissions(self):
-        if self.action in ('list', 'retrieve', 'settings'):
+        if self.action in ('list', 'retrieve', 'exam_settings'):
             return [IsAnyStaff()]
         return [IsLabAdmin()]
 
@@ -173,7 +173,7 @@ class ExamDefinitionViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet):
         return Response(ExamDefinitionDetailSerializer(exam).data)
 
     @action(detail=True, methods=['get', 'put'], url_path='settings')
-    def settings(self, request, pk=None):
+    def exam_settings(self, request, pk=None):
         exam = self.get_object()
 
         if request.method == 'GET':
