@@ -85,6 +85,8 @@ TENANT_DOMAIN_MODEL = 'tenants.Domain'
 MIDDLEWARE = [
     # Tenant resolution must be the very first middleware.
     'common.middleware.CytovaTenantMiddleware',
+    # Subscription check must be immediately after tenant resolution.
+    'common.middleware.SubscriptionEnforcementMiddleware',
 
     'django.middleware.security.SecurityMiddleware',
     'corsheaders.middleware.CorsMiddleware',

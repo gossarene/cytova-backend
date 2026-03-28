@@ -7,14 +7,18 @@ All endpoints require PlatformAdminJWTAuthentication + IsPlatformAdmin.
 TenantViewSet:
     GET    /platform/tenants/              — list all tenants
     POST   /platform/tenants/              — provision new tenant
-    GET    /platform/tenants/{id}/         — tenant detail
+    GET    /platform/tenants/{id}/         — tenant detail (with subscription)
     PATCH  /platform/tenants/{id}/         — update name/plan
     POST   /platform/tenants/{id}/suspend/ — suspend tenant
     POST   /platform/tenants/{id}/activate/— reactivate tenant
 
 PlatformAdminLoginView:
     POST   /platform/auth/login/           — issue platform admin access token
+
+PlatformDashboardView:
+    GET    /platform/dashboard/            — platform-level statistics
 """
+from django.db.models import Count, F, Q
 from rest_framework import status
 from rest_framework.decorators import action
 from rest_framework.mixins import ListModelMixin, RetrieveModelMixin
@@ -24,8 +28,9 @@ from rest_framework.viewsets import GenericViewSet
 import django_filters
 
 from .authentication import PlatformAdminJWTAuthentication
-from .models import Tenant, Plan, PlatformAdmin
+from .models import Tenant, Plan, PlatformAdmin, Subscription, SubscriptionStatus
 from .permissions import IsPlatformAdmin
+from .platform_audit import PlatformAction, log_platform_action
 from .serializers import (
     TenantListSerializer,
     TenantDetailSerializer,
@@ -54,7 +59,7 @@ class TenantViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet):
     ordering_fields = ['name', 'subdomain', 'created_at', 'plan']
 
     def get_queryset(self):
-        return Tenant.objects.prefetch_related('domains').all()
+        return Tenant.objects.prefetch_related('domains', 'subscriptions__plan').all()
 
     def get_serializer_class(self):
         if self.action == 'list':
@@ -69,8 +74,21 @@ class TenantViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet):
         serializer = TenantCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         tenant = TenantService.provision_tenant(dict(serializer.validated_data))
+
+        log_platform_action(
+            request=request,
+            action=PlatformAction.CREATE,
+            entity_type='Tenant',
+            entity_id=tenant.id,
+            diff={'after': {
+                'name': tenant.name,
+                'subdomain': tenant.subdomain,
+                'plan': tenant.plan,
+            }},
+        )
+
         return Response(
-            TenantDetailSerializer(tenant, context={'request': request}).data,
+            TenantDetailSerializer(tenant).data,
             status=status.HTTP_201_CREATED,
         )
 
@@ -78,20 +96,49 @@ class TenantViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet):
         tenant = self.get_object()
         serializer = TenantUpdateSerializer(data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
+        before = {k: getattr(tenant, k) for k in serializer.validated_data}
         tenant = TenantService.update_tenant(tenant, dict(serializer.validated_data))
-        return Response(TenantDetailSerializer(tenant, context={'request': request}).data)
+        after = {k: getattr(tenant, k) for k in serializer.validated_data}
+
+        log_platform_action(
+            request=request,
+            action=PlatformAction.UPDATE,
+            entity_type='Tenant',
+            entity_id=tenant.id,
+            diff={'before': before, 'after': after},
+        )
+
+        return Response(TenantDetailSerializer(tenant).data)
 
     @action(detail=True, methods=['post'])
     def suspend(self, request, pk=None):
         tenant = self.get_object()
         tenant = TenantService.suspend_tenant(tenant)
-        return Response(TenantDetailSerializer(tenant, context={'request': request}).data)
+
+        log_platform_action(
+            request=request,
+            action=PlatformAction.SUSPEND,
+            entity_type='Tenant',
+            entity_id=tenant.id,
+            diff={'after': {'is_active': False}},
+        )
+
+        return Response(TenantDetailSerializer(tenant).data)
 
     @action(detail=True, methods=['post'])
     def activate(self, request, pk=None):
         tenant = self.get_object()
         tenant = TenantService.activate_tenant(tenant)
-        return Response(TenantDetailSerializer(tenant, context={'request': request}).data)
+
+        log_platform_action(
+            request=request,
+            action=PlatformAction.ACTIVATE,
+            entity_type='Tenant',
+            entity_id=tenant.id,
+            diff={'after': {'is_active': True}},
+        )
+
+        return Response(TenantDetailSerializer(tenant).data)
 
 
 class PlatformAdminLoginView(APIView):
@@ -155,6 +202,71 @@ class PlatformAdminLoginView(APIView):
                     'id': str(admin.id),
                     'email': admin.email,
                 },
+            },
+            'meta': None,
+            'errors': [],
+        })
+
+
+class PlatformDashboardView(APIView):
+    """
+    GET /platform/dashboard/
+
+    Platform-level overview statistics for the admin panel.
+    """
+    authentication_classes = [PlatformAdminJWTAuthentication]
+    permission_classes = [IsPlatformAdmin]
+
+    def get(self, request):
+        # Tenant counts
+        total_tenants = Tenant.objects.count()
+        active_tenants = Tenant.objects.filter(is_active=True).count()
+
+        # Subscription status breakdown
+        sub_by_status = dict(
+            Subscription.objects
+            .values('status')
+            .annotate(count=Count('id'))
+            .values_list('status', 'count')
+        )
+
+        # Tenants with no subscription at all
+        tenants_with_sub = Subscription.objects.values('tenant_id').distinct().count()
+        tenants_no_sub = total_tenants - tenants_with_sub
+
+        # Plan distribution (active/trial subscriptions only)
+        plan_distribution = dict(
+            Subscription.objects
+            .filter(status__in=[SubscriptionStatus.TRIAL, SubscriptionStatus.ACTIVE])
+            .values(plan_code=F('plan__code'))
+            .annotate(count=Count('id'))
+            .values_list('plan_code', 'count')
+        )
+
+        # Trials expiring soon (next 7 days)
+        from datetime import timedelta
+        from django.utils import timezone
+
+        now = timezone.now()
+        trials_expiring_soon = Subscription.objects.filter(
+            status=SubscriptionStatus.TRIAL,
+            trial_end_date__lte=now + timedelta(days=7),
+            trial_end_date__gt=now,
+        ).count()
+
+        return Response({
+            'data': {
+                'tenants': {
+                    'total': total_tenants,
+                    'active': active_tenants,
+                    'suspended': total_tenants - active_tenants,
+                },
+                'subscriptions': {
+                    'by_status': sub_by_status,
+                    'no_subscription': tenants_no_sub,
+                    'trials_expiring_soon': trials_expiring_soon,
+                },
+                'plan_distribution': plan_distribution,
             },
             'meta': None,
             'errors': [],
