@@ -26,7 +26,8 @@ def _in_tenant_schema():
 @pytest.fixture()
 def starter_plan():
     return SubscriptionPlan.objects.create(
-        code='STARTER', name='Starter', trial_days=14,
+        code='STARTER', name='Starter',
+        is_trial=True, trial_duration_days=14,
         monthly_price='29.00', yearly_price='290.00',
     )
 
@@ -34,7 +35,8 @@ def starter_plan():
 @pytest.fixture()
 def pro_plan():
     return SubscriptionPlan.objects.create(
-        code='PRO', name='Pro', trial_days=30,
+        code='PRO', name='Pro',
+        is_trial=False, trial_duration_days=None,
         monthly_price='99.00', yearly_price='990.00',
     )
 
@@ -72,7 +74,7 @@ class TestTrialCreation:
 
     def test_trial_duration_matches_plan(self, tenant_with_trial, starter_plan):
         _, sub = tenant_with_trial
-        expected_end = sub.started_at + timedelta(days=starter_plan.trial_days)
+        expected_end = sub.started_at + timedelta(days=starter_plan.trial_duration_days)
         delta = abs((sub.trial_end_date - expected_end).total_seconds())
         assert delta < 2  # within 2 seconds
 

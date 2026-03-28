@@ -17,7 +17,13 @@ class SubscriptionPlan(models.Model):
     Lives in the public schema. Managed by platform admins.
 
     `code` is the stable identifier used in API references and billing
-    integrations (e.g. STARTER, PRO, ENTERPRISE).
+    integrations (e.g. TRIAL, STARTER, PRO, ENTERPRISE).
+
+    `is_trial` marks the plan used for automatic signup trial subscriptions.
+    Exactly one active trial plan should exist at any time — the onboarding
+    flow resolves it via `SubscriptionPlan.objects.filter(is_trial=True, is_active=True)`.
+
+    `is_public` controls whether the plan is shown on the public pricing page.
 
     Pricing fields are informational for now — no payment processing yet.
     `features` is a JSON dict for frontend display and future feature gating.
@@ -26,6 +32,22 @@ class SubscriptionPlan(models.Model):
     code = models.CharField(max_length=30, unique=True, db_index=True)
     name = models.CharField(max_length=100)
     description = models.TextField(blank=True, default='')
+
+    is_trial = models.BooleanField(
+        default=False,
+        db_index=True,
+        help_text='If True, this plan is used for automatic trial subscriptions on signup.',
+    )
+    is_public = models.BooleanField(
+        default=True,
+        help_text='If True, this plan is visible on the public pricing page.',
+    )
+    trial_duration_days = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text='Trial duration in days. Required when is_trial=True. Null for paid plans.',
+    )
+
     monthly_price = models.DecimalField(
         max_digits=10, decimal_places=2, null=True, blank=True,
         help_text='Monthly price in base currency. Informational until billing is implemented.',
@@ -33,10 +55,6 @@ class SubscriptionPlan(models.Model):
     yearly_price = models.DecimalField(
         max_digits=10, decimal_places=2, null=True, blank=True,
         help_text='Yearly price in base currency. Informational until billing is implemented.',
-    )
-    trial_days = models.PositiveIntegerField(
-        default=14,
-        help_text='Default trial duration in days when a lab signs up on this plan.',
     )
     features = models.JSONField(
         default=dict,

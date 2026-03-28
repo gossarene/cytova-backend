@@ -17,7 +17,8 @@ class SubscriptionPlanListSerializer(serializers.ModelSerializer):
         model = SubscriptionPlan
         fields = [
             'id', 'code', 'name', 'description',
-            'monthly_price', 'yearly_price', 'trial_days',
+            'is_trial', 'is_public', 'trial_duration_days',
+            'monthly_price', 'yearly_price',
             'display_order', 'is_active', 'created_at',
         ]
 
@@ -27,7 +28,8 @@ class SubscriptionPlanDetailSerializer(serializers.ModelSerializer):
         model = SubscriptionPlan
         fields = [
             'id', 'code', 'name', 'description',
-            'monthly_price', 'yearly_price', 'trial_days',
+            'is_trial', 'is_public', 'trial_duration_days',
+            'monthly_price', 'yearly_price',
             'features', 'display_order', 'is_active',
             'created_at', 'updated_at',
         ]
@@ -37,6 +39,11 @@ class SubscriptionPlanCreateSerializer(serializers.Serializer):
     code = serializers.CharField(max_length=30)
     name = serializers.CharField(max_length=100)
     description = serializers.CharField(required=False, allow_blank=True, default='')
+    is_trial = serializers.BooleanField(required=False, default=False)
+    is_public = serializers.BooleanField(required=False, default=True)
+    trial_duration_days = serializers.IntegerField(
+        required=False, allow_null=True, default=None, min_value=1,
+    )
     monthly_price = serializers.DecimalField(
         max_digits=10, decimal_places=2, required=False, allow_null=True,
         min_value=Decimal('0'),
@@ -45,7 +52,6 @@ class SubscriptionPlanCreateSerializer(serializers.Serializer):
         max_digits=10, decimal_places=2, required=False, allow_null=True,
         min_value=Decimal('0'),
     )
-    trial_days = serializers.IntegerField(required=False, default=14, min_value=0)
     features = serializers.JSONField(required=False, default=dict)
     display_order = serializers.IntegerField(required=False, default=0)
 
@@ -57,10 +63,22 @@ class SubscriptionPlanCreateSerializer(serializers.Serializer):
             )
         return code
 
+    def validate(self, attrs):
+        if attrs.get('is_trial') and not attrs.get('trial_duration_days'):
+            raise serializers.ValidationError({
+                'trial_duration_days': 'Required when is_trial is True.',
+            })
+        return attrs
+
 
 class SubscriptionPlanUpdateSerializer(serializers.Serializer):
     name = serializers.CharField(max_length=100, required=False)
     description = serializers.CharField(required=False, allow_blank=True)
+    is_trial = serializers.BooleanField(required=False)
+    is_public = serializers.BooleanField(required=False)
+    trial_duration_days = serializers.IntegerField(
+        required=False, allow_null=True, min_value=1,
+    )
     monthly_price = serializers.DecimalField(
         max_digits=10, decimal_places=2, required=False, allow_null=True,
         min_value=Decimal('0'),
@@ -69,7 +87,6 @@ class SubscriptionPlanUpdateSerializer(serializers.Serializer):
         max_digits=10, decimal_places=2, required=False, allow_null=True,
         min_value=Decimal('0'),
     )
-    trial_days = serializers.IntegerField(required=False, min_value=0)
     features = serializers.JSONField(required=False)
     display_order = serializers.IntegerField(required=False)
 

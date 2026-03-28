@@ -36,7 +36,7 @@ def platform_admin():
 @pytest.fixture()
 def starter_plan():
     return SubscriptionPlan.objects.create(
-        code='STARTER', name='Starter', trial_days=14,
+        code='STARTER', name='Starter', is_trial=True, trial_duration_days=14,
     )
 
 
@@ -191,7 +191,7 @@ class TestPlatformAuditLogging:
         sub = sample_tenant.subscriptions.first()
 
         # Create a pro plan to switch to
-        pro = SubscriptionPlan.objects.create(code='PRO', name='Pro', trial_days=30)
+        pro = SubscriptionPlan.objects.create(code='PRO', name='Pro', trial_duration_days=None)
 
         response = client.post(
             f'/api/v1/platform/subscriptions/{sub.id}/change-plan/',

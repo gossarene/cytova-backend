@@ -35,7 +35,7 @@ def starter_plan():
     return SubscriptionPlan.objects.create(
         code='STARTER',
         name='Starter',
-        trial_days=14,
+        is_trial=True, trial_duration_days=14,
     )
 
 

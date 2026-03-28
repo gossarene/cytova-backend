@@ -3,18 +3,22 @@ Cytova — Laboratory Onboarding Service
 
 Handles the complete self-service signup flow:
 1. Create Tenant + Domain in the public schema
-2. Switch to the new tenant schema
-3. Create the initial LAB_ADMIN StaffUser
-4. Seed any default bootstrap data
-5. Log the onboarding event
+2. Resolve the default trial plan and create a Subscription
+3. Switch to the new tenant schema
+4. Create the initial LAB_ADMIN StaffUser
+5. Seed default bootstrap data
+6. Write audit logs (tenant + subscription + admin user)
 
-The entire operation is atomic at the DB level. If any step fails,
-the tenant schema and all data are rolled back.
+Note on atomicity: tenant.save() triggers DDL (CREATE SCHEMA) which
+auto-commits in PostgreSQL and cannot be rolled back. The post-DDL
+operations (domain, subscription, user, seed) run in a regular
+transaction context within the new schema. If any of those fail, the
+tenant+schema exist but are empty — a cleanup task can garbage-collect
+tenants with no admin user.
 """
 import logging
 
 from django.conf import settings
-from django.db import transaction
 from django.utils import timezone
 from django_tenants.utils import schema_context
 
@@ -25,12 +29,13 @@ logger = logging.getLogger(__name__)
 
 class OnboardingResult:
     """Value object returned by OnboardingService.signup()."""
-    __slots__ = ('tenant', 'domain', 'admin_user')
+    __slots__ = ('tenant', 'domain', 'admin_user', 'subscription')
 
-    def __init__(self, tenant, domain, admin_user):
+    def __init__(self, tenant, domain, admin_user, subscription):
         self.tenant = tenant
         self.domain = domain
         self.admin_user = admin_user
+        self.subscription = subscription
 
 
 class OnboardingService:
@@ -38,24 +43,19 @@ class OnboardingService:
     @staticmethod
     def signup(validated_data: dict) -> OnboardingResult:
         """
-        Full self-service signup flow.
-
-        This is NOT wrapped in @transaction.atomic because tenant.save()
-        triggers DDL (CREATE SCHEMA) which auto-commits in PostgreSQL.
-        Instead, we rely on the ordering of operations:
-        1. Create Tenant (DDL — auto-committed)
-        2. Create Domain
-        3. Switch to tenant schema and create the admin user + bootstrap
-
-        If step 3 fails, the tenant+domain still exist but have no users,
-        making the tenant effectively empty. A cleanup task can garbage-collect
-        empty tenants if needed.
+        Full self-service signup flow. See module docstring for details.
         """
+        from .subscription_service import SubscriptionService
+
         slug = validated_data['slug']
         schema_name = f'schema_{slug}'
         laboratory_name = validated_data['laboratory_name']
 
-        # ---- Step 1+2: Create Tenant + Domain in public schema ----
+        # ---- Step 1: Resolve trial plan BEFORE creating anything ----
+        # Fail fast if no trial plan is configured.
+        trial_plan = SubscriptionService.get_default_trial_plan()
+
+        # ---- Step 2: Create Tenant + Domain in public schema ----
         tenant = Tenant(
             schema_name=schema_name,
             name=laboratory_name,
@@ -67,16 +67,19 @@ class OnboardingService:
         tenant.save()  # DDL: CREATE SCHEMA + run migrations
 
         primary_domain_name = f'{slug}.{settings.CYTOVA_DOMAIN}'
-        domain = Domain.objects.create(
+        Domain.objects.create(
             domain=primary_domain_name,
             tenant=tenant,
             is_primary=True,
         )
 
-        # ---- Step 2b: Create trial subscription ----
-        OnboardingService._create_trial_subscription(tenant)
+        # ---- Step 3: Create trial subscription ----
+        subscription = SubscriptionService.create_trial(
+            tenant=tenant,
+            plan=trial_plan,
+        )
 
-        # ---- Step 3: Create admin user inside the tenant schema ----
+        # ---- Step 4: Create admin user inside the tenant schema ----
         with schema_context(schema_name):
             from apps.users.models import StaffUser, Role
 
@@ -90,45 +93,26 @@ class OnboardingService:
                 is_superuser=True,
             )
 
-            # ---- Step 4: Seed bootstrap data ----
+            # ---- Step 5: Seed bootstrap data ----
             OnboardingService._seed_defaults()
 
-            # ---- Step 5: Audit log (inside tenant schema) ----
-            OnboardingService._audit_onboarding(tenant, admin_user)
+            # ---- Step 6: Audit logs ----
+            OnboardingService._audit_onboarding(
+                tenant, admin_user, subscription,
+            )
 
         logger.info(
-            'Laboratory onboarded: name=%s slug=%s admin=%s',
+            'Laboratory onboarded: name=%s slug=%s admin=%s plan=%s trial_days=%d',
             laboratory_name, slug, admin_user.email,
+            trial_plan.code, trial_plan.trial_duration_days,
         )
 
         return OnboardingResult(
             tenant=tenant,
             domain=primary_domain_name,
             admin_user=admin_user,
+            subscription=subscription,
         )
-
-    @staticmethod
-    def _create_trial_subscription(tenant):
-        """
-        Create a trial subscription for the new tenant using the default
-        STARTER plan. If no plan exists yet, skip silently — the platform
-        admin can assign a subscription later.
-        """
-        from .models import SubscriptionPlan
-        from .subscription_service import SubscriptionService
-
-        plan = SubscriptionPlan.objects.filter(
-            code='STARTER', is_active=True,
-        ).first()
-        if plan is None:
-            # Graceful fallback: no plan configured yet.
-            # This happens in fresh deployments before seed data is created.
-            logger.warning(
-                'No STARTER plan found — skipping trial subscription for %s',
-                tenant.subdomain,
-            )
-            return
-        SubscriptionService.create_trial(tenant=tenant, plan=plan)
 
     @staticmethod
     def _seed_defaults():
@@ -165,9 +149,9 @@ class OnboardingService:
             )
 
     @staticmethod
-    def _audit_onboarding(tenant, admin_user):
+    def _audit_onboarding(tenant, admin_user, subscription):
         """
-        Write the initial audit log entry in the new tenant schema.
+        Write audit log entries in the new tenant schema.
         Called inside schema_context of the new tenant.
         """
         from apps.audit.models import AuditLog, AuditAction, ActorType
@@ -183,6 +167,9 @@ class OnboardingService:
                 'tenant_name': tenant.name,
                 'subdomain': tenant.subdomain,
                 'admin_email': admin_user.email,
-                'plan': tenant.plan,
+                'plan_code': subscription.plan.code,
+                'subscription_status': subscription.status,
+                'trial_end_date': str(subscription.trial_end_date),
+                'trial_duration_days': subscription.plan.trial_duration_days,
             },
         )

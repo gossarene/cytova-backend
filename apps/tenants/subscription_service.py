@@ -64,14 +64,41 @@ class SubscriptionPlanService:
 class SubscriptionService:
 
     @staticmethod
+    def get_default_trial_plan() -> SubscriptionPlan:
+        """
+        Resolve the default trial plan from the database.
+        Raises ValidationError if no active trial plan exists.
+        """
+        plan = SubscriptionPlan.objects.filter(
+            is_trial=True,
+            is_active=True,
+        ).first()
+        if plan is None:
+            raise ValidationError(
+                'No active trial plan found in the database. '
+                'Run: python manage.py seed_plans'
+            )
+        return plan
+
+    @staticmethod
     def create_trial(
         tenant: Tenant,
-        plan: SubscriptionPlan,
+        plan: SubscriptionPlan | None = None,
     ) -> Subscription:
         """
         Create a TRIAL subscription for a newly onboarded tenant.
-        Trial duration comes from the plan's trial_days field.
+
+        If `plan` is None, the default trial plan is resolved from the DB.
+        Trial duration comes from the plan's `trial_duration_days` field.
         """
+        if plan is None:
+            plan = SubscriptionService.get_default_trial_plan()
+
+        if not plan.trial_duration_days:
+            raise ValidationError(
+                f'Plan {plan.code} has no trial_duration_days set.'
+            )
+
         existing = Subscription.objects.filter(
             tenant=tenant,
             status__in=[SubscriptionStatus.TRIAL, SubscriptionStatus.ACTIVE],
@@ -82,7 +109,7 @@ class SubscriptionService:
             )
 
         now = timezone.now()
-        trial_end = now + timedelta(days=plan.trial_days)
+        trial_end = now + timedelta(days=plan.trial_duration_days)
 
         subscription = Subscription.objects.create(
             tenant=tenant,
@@ -93,8 +120,8 @@ class SubscriptionService:
         )
 
         logger.info(
-            'Trial subscription created: tenant=%s plan=%s trial_end=%s',
-            tenant.subdomain, plan.code, trial_end.date(),
+            'Trial subscription created: tenant=%s plan=%s trial_end=%s duration=%dd',
+            tenant.subdomain, plan.code, trial_end.date(), plan.trial_duration_days,
         )
 
         return subscription
