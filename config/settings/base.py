@@ -265,6 +265,8 @@ REST_FRAMEWORK = {
         'anon': '50/hour',
         'user': '1000/hour',
         'auth_login': '5/minute',
+        'auth_signup': '5/hour',
+        'slug_check': '30/hour',
     },
 }
 
@@ -378,3 +380,23 @@ SHOW_PUBLIC_IF_NO_TENANT_FOUND = config(
 # Inventory Alerts
 # ---------------------------------------------------------------------------
 ALERT_EXPIRY_WARNING_DAYS = config('ALERT_EXPIRY_WARNING_DAYS', default=30, cast=int)
+
+# ---------------------------------------------------------------------------
+# Platform / Dashboard
+# ---------------------------------------------------------------------------
+# Maximum rows returned by dashboard "top-N" queries (e.g. top partners).
+DASHBOARD_TOP_N_LIMIT = 20
+
+# Subscription enforcement — tenant paths exempt from subscription checks.
+# Auth endpoints must remain accessible so tenants can obtain tokens even
+# when their subscription is expired.
+SUBSCRIPTION_EXEMPT_PATH_PREFIXES = [
+    '/health/',
+    '/api/v1/auth/',
+]
+
+# Maximum alert IDs accepted in a single bulk-acknowledge request.
+ALERT_BULK_ACKNOWLEDGE_MAX = 200
+
+# Platform dashboard: trial expiry warning window (days).
+PLATFORM_TRIAL_WARNING_DAYS = 7

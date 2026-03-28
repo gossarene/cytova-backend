@@ -62,8 +62,16 @@ class BulkAcknowledgeSerializer(serializers.Serializer):
     alert_ids = serializers.ListField(
         child=serializers.UUIDField(),
         min_length=1,
-        max_length=200,
     )
+
+    def validate_alert_ids(self, value):
+        from django.conf import settings
+        max_ids = getattr(settings, 'ALERT_BULK_ACKNOWLEDGE_MAX', 200)
+        if len(value) > max_ids:
+            raise serializers.ValidationError(
+                f'Cannot acknowledge more than {max_ids} alerts at once.'
+            )
+        return value
 
 
 class AlertSummarySerializer(serializers.Serializer):

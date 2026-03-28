@@ -1,17 +1,19 @@
 """
 Cytova — Laboratory Onboarding Views (Public API)
 
-POST /api/v1/onboarding/signup/    — self-service laboratory signup
+POST /api/v1/onboarding/signup/      — self-service laboratory signup
+GET  /api/v1/onboarding/check-slug/  — slug availability check
 
-This endpoint is public (no authentication required) and rate-limited
-to prevent abuse. It creates a fully provisioned tenant with an admin
-user in a single request.
+Both endpoints are public (no authentication) and rate-limited via
+DRF throttle scopes configured in REST_FRAMEWORK['DEFAULT_THROTTLE_RATES']:
+    auth_signup  — signup requests per IP
+    slug_check   — slug availability checks per IP
 """
 import logging
 
 from rest_framework import status
 from rest_framework.response import Response
-from rest_framework.throttling import AnonRateThrottle
+from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
 from .onboarding_serializers import LaboratorySignupSerializer
@@ -20,23 +22,19 @@ from .onboarding_service import OnboardingService
 logger = logging.getLogger(__name__)
 
 
-class SignupRateThrottle(AnonRateThrottle):
-    """Strict rate limit for signup: 5 per hour per IP."""
-    rate = '5/hour'
-
-
 class LaboratorySignupView(APIView):
     """
     POST /api/v1/onboarding/signup/
 
     Public endpoint for laboratory self-registration.
-    Creates a Tenant, Domain, and initial LAB_ADMIN user.
+    Creates a Tenant, Domain, trial Subscription, and initial LAB_ADMIN user.
 
-    No authentication required. Rate-limited to 5 requests/hour per IP.
+    Rate limited via scope 'auth_signup' (configured in settings).
     """
     authentication_classes = []
     permission_classes = []
-    throttle_classes = [SignupRateThrottle]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'auth_signup'
 
     def post(self, request):
         serializer = LaboratorySignupSerializer(data=request.data)
@@ -81,11 +79,12 @@ class SlugAvailabilityView(APIView):
     GET /api/v1/onboarding/check-slug/?slug=my-lab
 
     Public endpoint to check if a subdomain slug is available.
-    Returns { "available": true/false, "slug": "normalized-slug" }.
+    Rate limited via scope 'slug_check' (configured in settings).
     """
     authentication_classes = []
     permission_classes = []
-    throttle_classes = [AnonRateThrottle]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'slug_check'
 
     def get(self, request):
         from apps.tenants.models import Tenant

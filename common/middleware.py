@@ -66,12 +66,8 @@ class SubscriptionEnforcementMiddleware:
         SUBSCRIPTION_MISSING    — no subscription record at all
     """
 
-    # Paths that are always allowed even without a subscription.
-    # Checked with startswith — keep them specific.
-    EXEMPT_PATH_PREFIXES = (
-        '/health/',
-        '/api/v1/auth/',
-    )
+    # Exempt paths loaded from settings at first use.
+    _exempt_prefixes = None
 
     _STATUS_TO_CODE = None  # Lazy-loaded to avoid import at module level
 
@@ -84,7 +80,7 @@ class SubscriptionEnforcementMiddleware:
             return self.get_response(request)
 
         # Skip exempt paths (auth endpoints needed to retrieve tokens)
-        if any(request.path.startswith(p) for p in self.EXEMPT_PATH_PREFIXES):
+        if any(request.path.startswith(p) for p in self._get_exempt_prefixes()):
             return self.get_response(request)
 
         tenant = getattr(request, 'tenant', None)
@@ -114,6 +110,18 @@ class SubscriptionEnforcementMiddleware:
             },
             status=403,
         )
+
+    @classmethod
+    def _get_exempt_prefixes(cls):
+        if cls._exempt_prefixes is None:
+            from django.conf import settings
+            cls._exempt_prefixes = tuple(
+                getattr(settings, 'SUBSCRIPTION_EXEMPT_PATH_PREFIXES', [
+                    '/health/',
+                    '/api/v1/auth/',
+                ])
+            )
+        return cls._exempt_prefixes
 
     def _resolve_error(self, tenant):
         """Determine the specific subscription error for the tenant."""

@@ -293,6 +293,7 @@ class DashboardPartnersView(APIView):
     permission_classes = [IsAnyStaff]
 
     def get(self, request):
+        from django.conf import settings as django_settings
         from apps.partners.models import PartnerOrganization
         from apps.requests.models import (
             AnalysisRequest,
@@ -302,6 +303,7 @@ class DashboardPartnersView(APIView):
         )
 
         today, _, start_of_month = _period_boundaries()
+        top_n = getattr(django_settings, 'DASHBOARD_TOP_N_LIMIT', 20)
         confirmed_statuses = [
             RequestStatus.CONFIRMED,
             RequestStatus.IN_PROGRESS,
@@ -332,7 +334,7 @@ class DashboardPartnersView(APIView):
                 partner_name=F('partner_organization__name'),
             )
             .annotate(request_count=Count('id'))
-            .order_by('-request_count')[:20]
+            .order_by('-request_count')[:top_n]
         )
 
         # ---- exam volume per partner (confirmed+ items, this month) ----
@@ -357,7 +359,7 @@ class DashboardPartnersView(APIView):
                     output_field=DecimalField(),
                 ),
             )
-            .order_by('-exam_count')[:20]
+            .order_by('-exam_count')[:top_n]
         )
 
         # ---- aggregate revenue by partner (confirmed+, all-time) ----
@@ -382,7 +384,7 @@ class DashboardPartnersView(APIView):
                 ),
                 exam_count=Count('id'),
             )
-            .order_by('-total_billed')[:20]
+            .order_by('-total_billed')[:top_n]
         )
 
         # Serialize Decimals to strings for JSON

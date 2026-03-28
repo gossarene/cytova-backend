@@ -243,14 +243,16 @@ class PlatformDashboardView(APIView):
             .values_list('plan_code', 'count')
         )
 
-        # Trials expiring soon (next 7 days)
+        # Trials expiring soon
         from datetime import timedelta
+        from django.conf import settings as django_settings
         from django.utils import timezone
 
         now = timezone.now()
+        warning_days = getattr(django_settings, 'PLATFORM_TRIAL_WARNING_DAYS', 7)
         trials_expiring_soon = Subscription.objects.filter(
             status=SubscriptionStatus.TRIAL,
-            trial_end_date__lte=now + timedelta(days=7),
+            trial_end_date__lte=now + timedelta(days=warning_days),
             trial_end_date__gt=now,
         ).count()
 
