@@ -9,7 +9,16 @@ class Role(models.TextChoices):
     BIOLOGIST = 'BIOLOGIST', 'Biologist'
     TECHNICIAN = 'TECHNICIAN', 'Technician'
     RECEPTIONIST = 'RECEPTIONIST', 'Receptionist'
-    VIEWER = 'VIEWER', 'Viewer'
+    BILLING_OFFICER = 'BILLING_OFFICER', 'Billing Officer'
+    INVENTORY_MANAGER = 'INVENTORY_MANAGER', 'Inventory Manager'
+    VIEWER_AUDITOR = 'VIEWER_AUDITOR', 'Viewer / Auditor'
+
+
+# Roles that only platform admins can assign (never delegated to tenant users)
+PLATFORM_ONLY_ROLES: frozenset[str] = frozenset()  # No tenant role is platform-only
+
+# All tenant-level role values for validation
+TENANT_ROLES: frozenset[str] = frozenset(r.value for r in Role)
 
 
 class StaffUserManager(BaseUserManager):
@@ -51,7 +60,7 @@ class StaffUser(AbstractBaseUser, PermissionsMixin):
     email = models.EmailField(unique=True)
     first_name = models.CharField(max_length=100)
     last_name = models.CharField(max_length=100)
-    role = models.CharField(max_length=20, choices=Role.choices)
+    role = models.CharField(max_length=30, choices=Role.choices)
 
     # Django internals
     is_active = models.BooleanField(default=True)
@@ -91,6 +100,56 @@ class StaffUser(AbstractBaseUser, PermissionsMixin):
     @property
     def is_lab_admin(self):
         return self.role == Role.LAB_ADMIN
+
+    def has_perm_code(self, code: str) -> bool:
+        """Check if this user has a specific permission code."""
+        from common.permission_checker import PermissionChecker
+        return PermissionChecker.has_permission(self, code)
+
+
+class OverrideType(models.TextChoices):
+    GRANT = 'GRANT', 'Grant'
+    REVOKE = 'REVOKE', 'Revoke'
+
+
+class UserPermissionOverride(models.Model):
+    """
+    Per-user permission override within a tenant.
+
+    Allows granting permissions beyond the user's role defaults,
+    or revoking specific permissions from the role defaults.
+
+    Managed by lab_admin only. Every change is audit-logged.
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(
+        StaffUser,
+        on_delete=models.CASCADE,
+        related_name='permission_overrides',
+    )
+    permission_code = models.CharField(max_length=80, db_index=True)
+    override_type = models.CharField(max_length=10, choices=OverrideType.choices)
+    granted_by = models.ForeignKey(
+        StaffUser,
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name='granted_overrides',
+    )
+    reason = models.CharField(max_length=255, blank=True, default='')
+    created_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        verbose_name = 'User Permission Override'
+        verbose_name_plural = 'User Permission Overrides'
+        constraints = [
+            models.UniqueConstraint(
+                fields=['user', 'permission_code'],
+                name='unique_user_permission_override',
+            ),
+        ]
+
+    def __str__(self):
+        return f'{self.override_type} {self.permission_code} for {self.user.email}'
 
 
 class PasswordResetToken(models.Model):

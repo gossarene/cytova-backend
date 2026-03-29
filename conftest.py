@@ -92,13 +92,46 @@ def technician():
 
 
 @pytest.fixture()
-def viewer():
+def viewer_auditor():
     return StaffUser.objects.create_user(
         email='viewer@testlab.io',
         password='testpass123!',
         first_name='Viewer',
         last_name='User',
-        role=Role.VIEWER,
+        role=Role.VIEWER_AUDITOR,
+    )
+
+
+@pytest.fixture()
+def biologist():
+    return StaffUser.objects.create_user(
+        email='bio@testlab.io',
+        password='testpass123!',
+        first_name='Bio',
+        last_name='User',
+        role=Role.BIOLOGIST,
+    )
+
+
+@pytest.fixture()
+def billing_officer():
+    return StaffUser.objects.create_user(
+        email='billing@testlab.io',
+        password='testpass123!',
+        first_name='Billing',
+        last_name='User',
+        role=Role.BILLING_OFFICER,
+    )
+
+
+@pytest.fixture()
+def inventory_manager():
+    return StaffUser.objects.create_user(
+        email='inventory@testlab.io',
+        password='testpass123!',
+        first_name='Inventory',
+        last_name='User',
+        role=Role.INVENTORY_MANAGER,
     )
 
 

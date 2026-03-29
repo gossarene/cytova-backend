@@ -266,6 +266,11 @@ class Domain(DomainMixin):
         return self.domain
 
 
+class PlatformRole(models.TextChoices):
+    PLATFORM_OWNER = 'PLATFORM_OWNER', 'Platform Owner'
+    PLATFORM_STAFF = 'PLATFORM_STAFF', 'Platform Staff'
+
+
 class PlatformAdminManager(BaseUserManager):
     def create(self, email, password=None, **extra_fields):
         if not email:
@@ -286,6 +291,11 @@ class PlatformAdmin(AbstractBaseUser):
     """
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     email = models.EmailField(unique=True)
+    role = models.CharField(
+        max_length=20,
+        choices=PlatformRole.choices,
+        default=PlatformRole.PLATFORM_STAFF,
+    )
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
@@ -301,6 +311,17 @@ class PlatformAdmin(AbstractBaseUser):
     def __str__(self):
         return self.email
 
+    @property
+    def is_platform_owner(self):
+        return self.role == PlatformRole.PLATFORM_OWNER
+
 
 # Import PlatformAuditLog so Django discovers it for migrations
 from .platform_audit import PlatformAuditLog, PlatformAction  # noqa: E402, F401
+
+__all__ = [
+    'SubscriptionPlan', 'SubscriptionStatus', 'Subscription',
+    'Plan', 'Tenant', 'Domain',
+    'PlatformRole', 'PlatformAdmin', 'PlatformAdminManager',
+    'PlatformAuditLog', 'PlatformAction',
+]

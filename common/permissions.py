@@ -107,3 +107,54 @@ class IsLabAdminOrReadOnly(BasePermission):
         if request.method in SAFE_METHODS:
             return True
         return request.user.role == Role.LAB_ADMIN
+
+
+# ---------------------------------------------------------------------------
+# Fine-grained permission classes (module.action based)
+# ---------------------------------------------------------------------------
+
+class HasPermission(BasePermission):
+    """
+    DRF permission class that checks one or more permission codes.
+
+    Grants access if the user has *any* of the specified permissions.
+
+    Usage:
+        permission_classes = [HasPermission('results.publish')]
+        permission_classes = [HasPermission('results.validate', 'results.publish')]
+    """
+
+    def __init__(self, *required_codes: str):
+        self.required_codes = required_codes
+
+    def has_permission(self, request, view):
+        if not (request.user and request.user.is_authenticated):
+            return False
+        from common.permission_checker import PermissionChecker
+        return PermissionChecker.has_any_permission(request.user, *self.required_codes)
+
+
+def RequiresPermission(*codes: str):
+    """
+    Factory that returns a BasePermission subclass for the given codes.
+
+    Grants access if the user has *any* of the specified permissions.
+    Designed for use in get_permissions() where you need to instantiate:
+
+        def get_permissions(self):
+            if self.action == 'publish':
+                return [RequiresPermission('results.publish')()]
+            return [RequiresPermission('results.view')()]
+    """
+    class _PermissionCheck(BasePermission):
+        message = f'Required permission: {", ".join(codes)}'
+
+        def has_permission(self, request, view):
+            if not (request.user and request.user.is_authenticated):
+                return False
+            from common.permission_checker import PermissionChecker
+            return PermissionChecker.has_any_permission(request.user, *codes)
+
+    _PermissionCheck.__name__ = f'Requires_{"__".join(codes)}'
+    _PermissionCheck.__qualname__ = _PermissionCheck.__name__
+    return _PermissionCheck

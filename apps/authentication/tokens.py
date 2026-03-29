@@ -27,4 +27,7 @@ class CytovaAccessToken(AccessToken):
         token = super().for_user(user)
         token['role'] = user.role
         token['email'] = user.email
+        # Include effective permissions for frontend convenience (informational only)
+        from common.permission_checker import PermissionChecker
+        token['permissions'] = sorted(PermissionChecker.get_effective_permissions(user))
         return token

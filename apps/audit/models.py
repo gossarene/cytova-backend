@@ -27,6 +27,8 @@ class AuditAction(models.TextChoices):
     DEACTIVATE = 'DEACTIVATE', 'Deactivate'
     TOKEN_REVOKED = 'TOKEN_REVOKED', 'Token Revoked'
     PASSWORD_RESET = 'PASSWORD_RESET', 'Password Reset'
+    ROLE_ASSIGN = 'ROLE_ASSIGN', 'Role Assign'
+    PERMISSION_OVERRIDE = 'PERMISSION_OVERRIDE', 'Permission Override'
 
 
 class AuditLog(models.Model):

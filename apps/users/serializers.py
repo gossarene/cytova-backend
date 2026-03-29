@@ -2,7 +2,7 @@
 Cytova — Users Serializers
 """
 from rest_framework import serializers
-from .models import StaffUser, Role
+from .models import StaffUser, Role, UserPermissionOverride
 
 
 class StaffUserListSerializer(serializers.ModelSerializer):
@@ -64,16 +64,21 @@ class StaffUserUpdateSerializer(serializers.Serializer):
 
 class MeSerializer(serializers.ModelSerializer):
     full_name = serializers.SerializerMethodField()
+    permissions = serializers.SerializerMethodField()
 
     class Meta:
         model = StaffUser
         fields = [
             'id', 'email', 'first_name', 'last_name', 'full_name',
-            'role', 'is_active', 'created_at', 'updated_at',
+            'role', 'is_active', 'created_at', 'updated_at', 'permissions',
         ]
 
     def get_full_name(self, obj):
         return obj.get_full_name()
+
+    def get_permissions(self, obj):
+        from common.permission_checker import PermissionChecker
+        return sorted(PermissionChecker.get_effective_permissions(obj))
 
 
 class MeUpdateSerializer(serializers.Serializer):
@@ -102,3 +107,40 @@ class MeUpdateSerializer(serializers.Serializer):
                     {'current_password': 'Current password is incorrect.'}
                 )
         return attrs
+
+
+# ---------------------------------------------------------------------------
+# RBAC serializers
+# ---------------------------------------------------------------------------
+
+class RoleAssignSerializer(serializers.Serializer):
+    """Validate a role assignment request."""
+    role = serializers.ChoiceField(choices=Role.choices)
+
+
+class PermissionOverrideSerializer(serializers.Serializer):
+    """Validate a permission override request (grant / revoke / remove)."""
+    action = serializers.ChoiceField(choices=['grant', 'revoke', 'remove'])
+    permission_code = serializers.CharField(max_length=80)
+    reason = serializers.CharField(max_length=255, required=False, default='')
+
+    def validate_permission_code(self, value):
+        from common.permissions_registry import PermissionRegistry
+        if not PermissionRegistry.is_valid(value):
+            raise serializers.ValidationError(f'Unknown permission: {value}')
+        return value
+
+
+class UserPermissionOverrideSerializer(serializers.ModelSerializer):
+    """Read-only serializer for displaying permission overrides."""
+    granted_by_email = serializers.SerializerMethodField()
+
+    class Meta:
+        model = UserPermissionOverride
+        fields = [
+            'id', 'permission_code', 'override_type',
+            'granted_by_email', 'reason', 'created_at',
+        ]
+
+    def get_granted_by_email(self, obj):
+        return obj.granted_by.email if obj.granted_by else None
