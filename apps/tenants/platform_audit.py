@@ -10,6 +10,8 @@ import uuid
 from django.db import models
 from django.utils import timezone
 
+from common.utils.serialization import json_safe
+
 
 class PlatformAction(models.TextChoices):
     CREATE     = 'CREATE',     'Create'
@@ -48,6 +50,8 @@ class PlatformAuditLog(models.Model):
     def save(self, *args, **kwargs):
         if not self._state.adding:
             raise PermissionError('Platform audit logs are immutable.')
+        if self.diff is not None:
+            self.diff = json_safe(self.diff)
         super().save(*args, **kwargs)
 
     def delete(self, *args, **kwargs):

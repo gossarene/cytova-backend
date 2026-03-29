@@ -139,7 +139,10 @@ class ExamDefinitionService:
             action=AuditAction.UPDATE,
             entity_type='ExamDefinition',
             entity_id=exam.id,
-            diff={'before': before, 'after': after},
+            diff={
+                'before': {k: str(v) if v is not None else None for k, v in before.items()},
+                'after': {k: str(v) if v is not None else None for k, v in after.items()},
+            },
             ip_address=getattr(request, 'audit_ip', None),
             user_agent=getattr(request, 'audit_user_agent', ''),
         )

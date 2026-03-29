@@ -2,6 +2,8 @@ import uuid
 from django.db import models
 from django.utils import timezone
 
+from common.utils.serialization import json_safe
+
 
 class ActorType(models.TextChoices):
     STAFF_USER = 'STAFF_USER', 'Staff User'
@@ -74,9 +76,11 @@ class AuditLog(models.Model):
         )
 
     def save(self, *args, **kwargs):
-        """Block updates. AuditLog entries are write-once."""
+        """Block updates. AuditLog entries are write-once. Auto-sanitize diff."""
         if self._state.adding is False:
             raise PermissionError('AuditLog entries are immutable and cannot be updated.')
+        if self.diff is not None:
+            self.diff = json_safe(self.diff)
         super().save(*args, **kwargs)
 
     def delete(self, *args, **kwargs):
