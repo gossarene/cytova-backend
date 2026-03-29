@@ -8,7 +8,7 @@ from apps.catalog.models import ExamDefinition
 from apps.partners.models import PartnerOrganization
 from .models import (
     AnalysisRequest, AnalysisRequestItem, ExamTraceability,
-    RequestStatus, ItemStatus, ExecutionMode, SourceType, BillingMode,
+    RequestStatus, ItemStatus, ExecutionMode, SourceType, BillingMode, PriceSource,
 )
 
 
@@ -60,7 +60,7 @@ class AnalysisRequestItemBriefSerializer(serializers.ModelSerializer):
             'id', 'exam_definition_id', 'exam_code', 'exam_name',
             'status', 'execution_mode', 'rejection_reason',
             'external_partner_name', 'notes',
-            'unit_price', 'billed_price',
+            'unit_price', 'billed_price', 'price_source',
             'created_at',
         ]
 
@@ -84,7 +84,7 @@ class AnalysisRequestItemSerializer(serializers.ModelSerializer):
             'exam_definition_id', 'exam_code', 'exam_name',
             'status', 'execution_mode', 'rejection_reason',
             'external_partner_name', 'notes',
-            'unit_price', 'billed_price', 'pricing_rule_id',
+            'unit_price', 'billed_price', 'price_source', 'pricing_rule_id',
             'traceability',
             'created_at', 'updated_at',
         ]
@@ -177,6 +177,11 @@ class AnalysisRequestItemCreateSerializer(serializers.Serializer):
         required=False, allow_blank=True, default='',
     )
     notes = serializers.CharField(required=False, allow_blank=True, default='')
+    billed_price = serializers.DecimalField(
+        max_digits=12, decimal_places=4, min_value=0,
+        required=False, allow_null=True, default=None,
+        help_text='Manual billed price override. Leave null to use auto-resolved price.',
+    )
 
     def validate_exam_definition_id(self, value):
         if not ExamDefinition.objects.filter(id=value, is_active=True).exists():
@@ -187,7 +192,7 @@ class AnalysisRequestItemCreateSerializer(serializers.Serializer):
 
 
 class AnalysisRequestItemUpdateSerializer(serializers.Serializer):
-    """Only operational metadata can be updated while the request is DRAFT."""
+    """Operational metadata + billed_price can be updated while request is DRAFT."""
     execution_mode = serializers.ChoiceField(
         choices=ExecutionMode.choices, required=False,
     )
@@ -198,6 +203,11 @@ class AnalysisRequestItemUpdateSerializer(serializers.Serializer):
         required=False, allow_blank=True,
     )
     notes = serializers.CharField(required=False, allow_blank=True)
+    billed_price = serializers.DecimalField(
+        max_digits=12, decimal_places=4, min_value=0,
+        required=False, allow_null=True,
+        help_text='Manual billed price override. Set null to re-resolve from rules.',
+    )
 
 
 class ItemRejectSerializer(serializers.Serializer):

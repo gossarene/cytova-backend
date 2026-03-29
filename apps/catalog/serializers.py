@@ -1,9 +1,8 @@
 """
 Cytova — Catalog Serializers
 """
-from django.utils import timezone
 from rest_framework import serializers
-from .models import ExamCategory, ExamDefinition, LabExamSettings, PricingRule, SampleType
+from .models import ExamCategory, ExamDefinition, LabExamSettings, PricingRule, PricingType, SampleType
 
 
 # ---------------------------------------------------------------------------
@@ -76,14 +75,15 @@ class LabExamSettingsWriteSerializer(serializers.Serializer):
 
 class ExamDefinitionListSerializer(serializers.ModelSerializer):
     category_name = serializers.CharField(source='category.name', read_only=True)
+    unit_price = serializers.DecimalField(max_digits=12, decimal_places=4, coerce_to_string=True)
     is_enabled = serializers.SerializerMethodField()
 
     class Meta:
         model = ExamDefinition
         fields = [
             'id', 'code', 'name', 'category_id', 'category_name',
-            'sample_type', 'turnaround_hours', 'is_active', 'is_enabled',
-            'created_at',
+            'sample_type', 'turnaround_hours', 'unit_price', 'is_active',
+            'is_enabled', 'created_at',
         ]
 
     def get_is_enabled(self, obj):
@@ -95,13 +95,14 @@ class ExamDefinitionListSerializer(serializers.ModelSerializer):
 
 class ExamDefinitionDetailSerializer(serializers.ModelSerializer):
     category = ExamCategoryListSerializer(read_only=True)
+    unit_price = serializers.DecimalField(max_digits=12, decimal_places=4, coerce_to_string=True)
     lab_settings = LabExamSettingsSerializer(read_only=True)
 
     class Meta:
         model = ExamDefinition
         fields = [
             'id', 'code', 'name', 'category', 'sample_type',
-            'turnaround_hours', 'description', 'is_active',
+            'turnaround_hours', 'description', 'unit_price', 'is_active',
             'lab_settings', 'created_at', 'updated_at',
         ]
 
@@ -113,6 +114,9 @@ class ExamDefinitionCreateSerializer(serializers.Serializer):
     sample_type = serializers.ChoiceField(choices=SampleType.choices)
     turnaround_hours = serializers.IntegerField(required=False, allow_null=True, min_value=1)
     description = serializers.CharField(required=False, allow_blank=True, default='')
+    unit_price = serializers.DecimalField(
+        max_digits=12, decimal_places=4, min_value=0, default=0,
+    )
 
     def validate_category_id(self, value):
         if not ExamCategory.objects.filter(id=value, is_active=True).exists():
@@ -137,6 +141,9 @@ class ExamDefinitionUpdateSerializer(serializers.Serializer):
     sample_type = serializers.ChoiceField(choices=SampleType.choices, required=False)
     turnaround_hours = serializers.IntegerField(required=False, allow_null=True, min_value=1)
     description = serializers.CharField(required=False, allow_blank=True)
+    unit_price = serializers.DecimalField(
+        max_digits=12, decimal_places=4, min_value=0, required=False,
+    )
 
     def validate_category_id(self, value):
         if not ExamCategory.objects.filter(id=value, is_active=True).exists():
@@ -149,16 +156,23 @@ class ExamDefinitionUpdateSerializer(serializers.Serializer):
 # ---------------------------------------------------------------------------
 
 class PricingRuleSerializer(serializers.ModelSerializer):
-    unit_price = serializers.DecimalField(max_digits=12, decimal_places=4, coerce_to_string=True)
-    billed_price = serializers.DecimalField(max_digits=12, decimal_places=4, coerce_to_string=True)
+    exam_definition_id = serializers.UUIDField(source='exam_definition.id', read_only=True)
+    exam_code = serializers.CharField(source='exam_definition.code', read_only=True)
+    exam_name = serializers.CharField(source='exam_definition.name', read_only=True)
+    value = serializers.DecimalField(max_digits=12, decimal_places=4, coerce_to_string=True)
+    partner_organization_name = serializers.CharField(
+        source='partner_organization.name', read_only=True, default=None,
+    )
     created_by = serializers.SerializerMethodField()
 
     class Meta:
         model = PricingRule
         fields = [
-            'id', 'unit_price', 'billed_price',
-            'effective_from', 'effective_to', 'insurance_code',
-            'created_by', 'created_at',
+            'id', 'exam_definition_id', 'exam_code', 'exam_name',
+            'partner_organization_id', 'partner_organization_name',
+            'source_type', 'pricing_type', 'value', 'priority',
+            'is_active', 'start_date', 'end_date', 'notes',
+            'created_by', 'created_at', 'updated_at',
         ]
 
     def get_created_by(self, obj):
@@ -168,17 +182,84 @@ class PricingRuleSerializer(serializers.ModelSerializer):
 
 
 class PricingRuleCreateSerializer(serializers.Serializer):
-    unit_price = serializers.DecimalField(max_digits=12, decimal_places=4, min_value=0)
-    billed_price = serializers.DecimalField(max_digits=12, decimal_places=4, min_value=0)
-    effective_from = serializers.DateField()
-    effective_to = serializers.DateField(required=False, allow_null=True)
-    insurance_code = serializers.CharField(max_length=50, required=False, allow_blank=True, default='')
+    exam_definition_id = serializers.UUIDField()
+    partner_organization_id = serializers.UUIDField(required=False, allow_null=True, default=None)
+    source_type = serializers.CharField(max_length=25, required=False, allow_blank=True, default='')
+    pricing_type = serializers.ChoiceField(
+        choices=PricingType.choices, default=PricingType.FIXED_PRICE,
+    )
+    value = serializers.DecimalField(max_digits=12, decimal_places=4, min_value=0)
+    priority = serializers.IntegerField(required=False, default=0)
+    is_active = serializers.BooleanField(required=False, default=True)
+    start_date = serializers.DateField(required=False, allow_null=True, default=None)
+    end_date = serializers.DateField(required=False, allow_null=True, default=None)
+    notes = serializers.CharField(required=False, allow_blank=True, default='')
+
+    def validate_exam_definition_id(self, value):
+        from .models import ExamDefinition
+        if not ExamDefinition.objects.filter(id=value, is_active=True).exists():
+            raise serializers.ValidationError('Exam definition not found or inactive.')
+        return value
+
+    def validate_partner_organization_id(self, value):
+        if value is not None:
+            from apps.partners.models import PartnerOrganization
+            if not PartnerOrganization.objects.filter(id=value, is_active=True).exists():
+                raise serializers.ValidationError('Partner organization not found or inactive.')
+        return value
+
+    def validate_source_type(self, value):
+        if value and value not in ('DIRECT_PATIENT', 'PARTNER_ORGANIZATION'):
+            raise serializers.ValidationError(
+                'Must be empty, DIRECT_PATIENT, or PARTNER_ORGANIZATION.'
+            )
+        return value
 
     def validate(self, attrs):
-        effective_from = attrs['effective_from']
-        effective_to = attrs.get('effective_to')
-        if effective_to is not None and effective_to <= effective_from:
+        start = attrs.get('start_date')
+        end = attrs.get('end_date')
+        if start and end and end < start:
             raise serializers.ValidationError(
-                {'effective_to': 'effective_to must be after effective_from.'}
+                {'end_date': 'end_date must be on or after start_date.'}
             )
+
+        pricing_type = attrs.get('pricing_type', PricingType.FIXED_PRICE)
+        value = attrs.get('value')
+        if pricing_type == PricingType.PERCENTAGE_DISCOUNT and value is not None:
+            from decimal import Decimal
+            if value > Decimal('100'):
+                raise serializers.ValidationError(
+                    {'value': 'Percentage discount cannot exceed 100.'}
+                )
+
+        return attrs
+
+
+class PricingRuleUpdateSerializer(serializers.Serializer):
+    """Updatable fields on an existing pricing rule."""
+    pricing_type = serializers.ChoiceField(choices=PricingType.choices, required=False)
+    value = serializers.DecimalField(max_digits=12, decimal_places=4, min_value=0, required=False)
+    priority = serializers.IntegerField(required=False)
+    is_active = serializers.BooleanField(required=False)
+    start_date = serializers.DateField(required=False, allow_null=True)
+    end_date = serializers.DateField(required=False, allow_null=True)
+    notes = serializers.CharField(required=False, allow_blank=True)
+
+    def validate(self, attrs):
+        start = attrs.get('start_date')
+        end = attrs.get('end_date')
+        if start and end and end < start:
+            raise serializers.ValidationError(
+                {'end_date': 'end_date must be on or after start_date.'}
+            )
+
+        pricing_type = attrs.get('pricing_type')
+        value = attrs.get('value')
+        if pricing_type == PricingType.PERCENTAGE_DISCOUNT and value is not None:
+            from decimal import Decimal
+            if value > Decimal('100'):
+                raise serializers.ValidationError(
+                    {'value': 'Percentage discount cannot exceed 100.'}
+                )
+
         return attrs

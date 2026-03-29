@@ -3,12 +3,14 @@ Cytova — Analysis Request Models
 
 AnalysisRequest
     A lab work order for a single patient. Lives in DRAFT until confirmed by
-    reception. Confirmation snapshots prices and locks the item list.
+    reception. Confirmation locks the item list.
     Hard delete is blocked — requests are medical records.
 
 AnalysisRequestItem
     One exam line within a request. Carries execution metadata (mode, partner,
-    rejection reason) and snapshotted prices (unit + billed) at confirmation.
+    rejection reason) and pricing (unit_price snapshotted from exam definition,
+    billed_price resolved from pricing rule or manual override, price_source
+    for traceability). Pricing is set at item creation, not confirmation.
     Hard delete is blocked at the model level; service layer removes items from
     DRAFT requests via queryset.delete().
 
@@ -58,6 +60,12 @@ class SourceType(models.TextChoices):
 class BillingMode(models.TextChoices):
     DIRECT_PAYMENT  = 'DIRECT_PAYMENT',  'Direct Payment'
     PARTNER_BILLING = 'PARTNER_BILLING', 'Partner Billing'
+
+
+class PriceSource(models.TextChoices):
+    DEFAULT_PRICE   = 'DEFAULT_PRICE',   'Default Price'
+    PRICING_RULE    = 'PRICING_RULE',    'Pricing Rule'
+    MANUAL_OVERRIDE = 'MANUAL_OVERRIDE', 'Manual Override'
 
 
 # ---------------------------------------------------------------------------
@@ -181,12 +189,13 @@ class AnalysisRequestItem(BaseModel):
     """
     One exam line within an analysis request.
 
-    Prices (unit_price, billed_price) are NULL in DRAFT and snapshotted from
-    the active PricingRule at confirmation. pricing_rule is a soft FK — kept
-    for traceability even if the rule is later closed.
+    Pricing is resolved at item creation time:
+    - ``unit_price`` is snapshotted from the exam definition's reference price.
+    - ``billed_price`` is computed from an applicable pricing rule, or defaults
+      to ``unit_price``, or can be overridden manually.
+    - ``price_source`` records how the billed price was determined.
 
-    Items with execution_mode=REJECTED are auto-transitioned to status=REJECTED
-    at request confirmation and receive zero prices.
+    Items with execution_mode=REJECTED receive zero prices.
 
     Note: although SUBCONTRACTED is a valid execution_mode for record-keeping,
     there is no active inter-laboratory workflow — all processing is internal.
@@ -217,12 +226,14 @@ class AnalysisRequestItem(BaseModel):
     external_partner_name = models.CharField(max_length=255, blank=True, default='')
     notes = models.TextField(blank=True, default='')
 
-    # Snapshotted at confirmation — NULL before that point
+    # Pricing — set at item creation, frozen at confirmation
     unit_price = models.DecimalField(
-        max_digits=12, decimal_places=4, null=True, blank=True,
+        max_digits=12, decimal_places=4, default=0,
+        help_text='Reference price snapshotted from ExamDefinition.unit_price at item creation.',
     )
     billed_price = models.DecimalField(
-        max_digits=12, decimal_places=4, null=True, blank=True,
+        max_digits=12, decimal_places=4, default=0,
+        help_text='Actual price charged. May differ from unit_price due to rule or manual override.',
     )
     pricing_rule = models.ForeignKey(
         'catalog.PricingRule',
@@ -230,6 +241,13 @@ class AnalysisRequestItem(BaseModel):
         null=True,
         blank=True,
         related_name='item_snapshots',
+        help_text='The pricing rule that was applied, if any. Kept for traceability.',
+    )
+    price_source = models.CharField(
+        max_length=20,
+        choices=PriceSource.choices,
+        default=PriceSource.DEFAULT_PRICE,
+        help_text='How the billed price was determined.',
     )
 
     class Meta:

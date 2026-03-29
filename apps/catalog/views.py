@@ -30,6 +30,7 @@ from .serializers import (
     LabExamSettingsWriteSerializer,
     PricingRuleCreateSerializer,
     PricingRuleSerializer,
+    PricingRuleUpdateSerializer,
 )
 from .services import ExamCategoryService, ExamDefinitionService, PricingRuleService
 
@@ -196,80 +197,76 @@ class ExamDefinitionViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet):
 
 
 # ---------------------------------------------------------------------------
-# PricingRule  (nested under exam: /exams/{exam_pk}/pricing/)
+# PricingRule
 # ---------------------------------------------------------------------------
 
 class PricingRuleViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet):
+    """
+    Top-level CRUD for pricing rules.
+
+    Also available nested under an exam at /exams/{exam_pk}/pricing-rules/
+    (read-only list, filtered by exam).
+    """
+    filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
+    ordering_fields = ['priority', 'created_at']
+    ordering = ['-priority', '-created_at']
 
     def get_permissions(self):
         if self.action in ('list', 'retrieve'):
             return [IsAnyStaff()]
         return [IsLabAdmin()]
 
-    def _get_exam(self, exam_pk):
-        try:
-            return ExamDefinition.objects.get(pk=exam_pk)
-        except ExamDefinition.DoesNotExist:
-            from rest_framework.exceptions import NotFound
-            raise NotFound('Exam definition not found.')
-
     def get_queryset(self):
+        qs = PricingRule.objects.select_related(
+            'exam_definition', 'partner_organization', 'created_by',
+        )
+        # Support nested route: /exams/{exam_pk}/pricing-rules/
         exam_pk = self.kwargs.get('exam_pk')
-        qs = PricingRule.objects.select_related('created_by')
         if exam_pk:
             qs = qs.filter(exam_definition_id=exam_pk)
         return qs
 
-    def list(self, request, *args, **kwargs):
-        self._get_exam(self.kwargs['exam_pk'])  # 404 if exam not found
-        return super().list(request, *args, **kwargs)
-
-    def retrieve(self, request, *args, **kwargs):
-        self._get_exam(self.kwargs['exam_pk'])
-        return super().retrieve(request, *args, **kwargs)
-
     def get_serializer_class(self):
         if self.action == 'create':
             return PricingRuleCreateSerializer
+        if self.action == 'partial_update':
+            return PricingRuleUpdateSerializer
         return PricingRuleSerializer
 
     def create(self, request, *args, **kwargs):
-        exam = self._get_exam(self.kwargs['exam_pk'])
         serializer = PricingRuleCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         rule = PricingRuleService.create(
-            exam=exam,
             validated_data=serializer.validated_data,
             created_by=request.user,
             request=request,
         )
+        rule = PricingRule.objects.select_related(
+            'exam_definition', 'partner_organization', 'created_by',
+        ).get(id=rule.id)
         return Response(
             PricingRuleSerializer(rule).data,
             status=status.HTTP_201_CREATED,
         )
 
-    @action(detail=True, methods=['post'], url_path='close')
-    def close(self, request, exam_pk=None, pk=None):
-        self._get_exam(exam_pk)
+    def partial_update(self, request, *args, **kwargs):
         rule = self.get_object()
-
-        effective_to = request.data.get('effective_to')
-        if not effective_to:
-            from rest_framework.exceptions import ValidationError
-            raise ValidationError({'effective_to': 'This field is required.'})
-
-        from rest_framework import serializers as drf_serializers
-        date_field = drf_serializers.DateField()
-        try:
-            effective_to = date_field.to_internal_value(effective_to)
-        except Exception:
-            from rest_framework.exceptions import ValidationError
-            raise ValidationError({'effective_to': 'Enter a valid date.'})
-
-        rule = PricingRuleService.close(
+        serializer = PricingRuleUpdateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        rule = PricingRuleService.update(
             rule=rule,
-            effective_to=effective_to,
-            closed_by=request.user,
+            validated_data=serializer.validated_data,
+            updated_by=request.user,
+            request=request,
+        )
+        return Response(PricingRuleSerializer(rule).data)
+
+    @action(detail=True, methods=['post'], url_path='deactivate')
+    def deactivate(self, request, pk=None, **kwargs):
+        rule = self.get_object()
+        rule = PricingRuleService.deactivate(
+            rule=rule,
+            deactivated_by=request.user,
             request=request,
         )
         return Response(PricingRuleSerializer(rule).data)

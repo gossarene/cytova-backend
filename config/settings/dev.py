@@ -39,6 +39,8 @@ REST_FRAMEWORK = {
         'anon': '1000/hour',
         'user': '10000/hour',
         'auth_login': '100/minute',
+        'auth_signup': '5/hour',
+        'slug_check': '30/hour',
     },
 }
 

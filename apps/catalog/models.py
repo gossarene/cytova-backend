@@ -16,10 +16,9 @@ LabExamSettings
     (enforced via OneToOneField). Created/replaced atomically via PUT.
 
 PricingRule
-    Time-bound pricing attached to an exam definition. Immutable after creation.
-    To revise a price: close the current rule (set effective_to) and add a new one.
-    No two active rules for the same exam may have overlapping date ranges.
-    Prices are snapshotted onto exam_items at request confirmation.
+    Contextual pricing rule targeting an exam definition, optionally scoped to a
+    partner organization and/or source type. Rules are resolved by specificity at
+    request item creation time. Supports fixed prices and percentage discounts.
 """
 import uuid
 from django.db import models
@@ -87,6 +86,12 @@ class ExamDefinition(BaseModel):
         help_text='Expected hours from sample receipt to result. Overridable per lab via LabExamSettings.',
     )
     description = models.TextField(blank=True, default='')
+    unit_price = models.DecimalField(
+        max_digits=12,
+        decimal_places=4,
+        default=0,
+        help_text='Reference/default catalog price for this exam.',
+    )
     is_active = models.BooleanField(default=True, db_index=True)
 
     class Meta:
@@ -151,50 +156,106 @@ class LabExamSettings(models.Model):
         return f'Settings for {self.exam_definition}'
 
 
-class PricingRule(models.Model):
-    """
-    Time-bound pricing for an exam definition.
+class PricingType(models.TextChoices):
+    FIXED_PRICE = 'FIXED_PRICE', 'Fixed Price'
+    PERCENTAGE_DISCOUNT = 'PERCENTAGE_DISCOUNT', 'Percentage Discount'
 
-    Immutable after creation — prices are frozen because they are snapshotted
-    onto exam_items at request confirmation. To revise: close the active rule
-    (POST /pricing/{id}/close/) and create a new one.
 
-    Application-layer validation ensures no two rules for the same exam overlap.
-    CHECK: effective_to IS NULL OR effective_to > effective_from.
+class PricingRule(BaseModel):
     """
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    Contextual pricing rule for an exam definition.
+
+    Rules are matched by specificity when resolving the billed price for a
+    request item:
+        1. exam + partner_organization  (most specific)
+        2. exam + source_type
+        3. exam only  (broadest)
+
+    Within the same specificity level, higher ``priority`` wins, then most
+    recently created as tiebreaker.
+
+    ``pricing_type`` determines how ``value`` is interpreted:
+        - FIXED_PRICE: ``value`` is the absolute billed price.
+        - PERCENTAGE_DISCOUNT: ``value`` is a percentage off the exam unit_price.
+
+    Optional date bounds (``start_date`` / ``end_date``) restrict the rule's
+    active period. Both default to NULL (always active). ``is_active`` provides
+    a quick on/off toggle.
+    """
     exam_definition = models.ForeignKey(
         ExamDefinition,
         on_delete=models.PROTECT,
         related_name='pricing_rules',
     )
-    unit_price = models.DecimalField(max_digits=12, decimal_places=4)
-    billed_price = models.DecimalField(max_digits=12, decimal_places=4)
-    effective_from = models.DateField()
-    effective_to = models.DateField(null=True, blank=True)
-    insurance_code = models.CharField(max_length=50, blank=True, default='')
+    partner_organization = models.ForeignKey(
+        'partners.PartnerOrganization',
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name='pricing_rules',
+        help_text='Set to target a specific partner. NULL = not partner-specific.',
+    )
+    source_type = models.CharField(
+        max_length=25,
+        blank=True,
+        default='',
+        help_text='DIRECT_PATIENT or PARTNER_ORGANIZATION. Empty = any source type.',
+    )
+    pricing_type = models.CharField(
+        max_length=25,
+        choices=PricingType.choices,
+        default=PricingType.FIXED_PRICE,
+    )
+    value = models.DecimalField(
+        max_digits=12,
+        decimal_places=4,
+        help_text=(
+            'For FIXED_PRICE: the absolute billed price. '
+            'For PERCENTAGE_DISCOUNT: the discount percentage (e.g. 10 = 10%% off).'
+        ),
+    )
+    priority = models.IntegerField(
+        default=0,
+        help_text='Higher value = higher priority within the same specificity level.',
+    )
+    is_active = models.BooleanField(default=True, db_index=True)
+    start_date = models.DateField(
+        null=True, blank=True,
+        help_text='Rule is active from this date (inclusive). NULL = no lower bound.',
+    )
+    end_date = models.DateField(
+        null=True, blank=True,
+        help_text='Rule is active until this date (inclusive). NULL = no upper bound.',
+    )
+    notes = models.TextField(blank=True, default='')
     created_by = models.ForeignKey(
         'users.StaffUser',
         on_delete=models.SET_NULL,
         null=True,
         related_name='created_pricing_rules',
     )
-    created_at = models.DateTimeField(default=timezone.now)
 
     class Meta:
         verbose_name = 'Pricing Rule'
         verbose_name_plural = 'Pricing Rules'
-        ordering = ['-effective_from']
+        ordering = ['-priority', '-created_at']
         indexes = [
-            models.Index(fields=['exam_definition', 'effective_from']),
+            models.Index(fields=['exam_definition', 'is_active']),
+            models.Index(fields=['partner_organization', 'is_active']),
         ]
 
     def __str__(self):
-        end = str(self.effective_to) if self.effective_to else 'open'
-        return f'{self.exam_definition.code} {self.effective_from}→{end}'
+        parts = [self.exam_definition.code]
+        if self.partner_organization_id:
+            parts.append(f'partner={self.partner_organization_id}')
+        if self.source_type:
+            parts.append(f'source={self.source_type}')
+        parts.append(f'{self.pricing_type}={self.value}')
+        return ' | '.join(parts)
 
-    def save(self, *args, **kwargs):
-        """Immutable after creation."""
-        if not self._state.adding:
-            raise PermissionError('Pricing rules are immutable. Close the current rule and create a new one.')
-        super().save(*args, **kwargs)
+    def clean(self):
+        from django.core.exceptions import ValidationError as DjangoValidationError
+        if self.start_date and self.end_date and self.end_date < self.start_date:
+            raise DjangoValidationError(
+                {'end_date': 'end_date must be on or after start_date.'}
+            )

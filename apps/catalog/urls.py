@@ -6,24 +6,15 @@ from .views import ExamCategoryViewSet, ExamDefinitionViewSet, PricingRuleViewSe
 router = DefaultRouter()
 router.register(r'categories', ExamCategoryViewSet, basename='examcategory')
 router.register(r'exams', ExamDefinitionViewSet, basename='examdefinition')
+router.register(r'pricing-rules', PricingRuleViewSet, basename='pricingrule')
 
-# Explicit nested URLs for pricing rules scoped to an exam
-pricing_urls = [
+# Nested read-only list for pricing rules scoped to an exam
+nested_pricing_urls = [
     path(
-        'exams/<uuid:exam_pk>/pricing/',
-        PricingRuleViewSet.as_view({'get': 'list', 'post': 'create'}),
-        name='pricingrule-list',
-    ),
-    path(
-        'exams/<uuid:exam_pk>/pricing/<uuid:pk>/',
-        PricingRuleViewSet.as_view({'get': 'retrieve'}),
-        name='pricingrule-detail',
-    ),
-    path(
-        'exams/<uuid:exam_pk>/pricing/<uuid:pk>/close/',
-        PricingRuleViewSet.as_view({'post': 'close'}),
-        name='pricingrule-close',
+        'exams/<uuid:exam_pk>/pricing-rules/',
+        PricingRuleViewSet.as_view({'get': 'list'}),
+        name='pricingrule-by-exam',
     ),
 ]
 
-urlpatterns = router.urls + pricing_urls
+urlpatterns = router.urls + nested_pricing_urls

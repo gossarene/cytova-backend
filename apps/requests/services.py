@@ -9,7 +9,7 @@ AnalysisRequestService:
     add_item         — append an item to a DRAFT request + traceability stub
     remove_item      — delete an item from a DRAFT request
     update           — update notes on a DRAFT request
-    confirm          — snapshot prices, transition items/request to CONFIRMED
+    confirm          — lock items, transition request to CONFIRMED
     cancel           — cancel a DRAFT or CONFIRMED request
 
 AnalysisRequestItemService:
@@ -20,19 +20,18 @@ AnalysisRequestItemService:
     _auto_advance    — (internal) advance request status after item terminal transition
 """
 import logging
-from datetime import date
 
 from django.db import transaction
-from django.db.models import Q
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 
 from apps.audit.models import AuditLog, AuditAction, ActorType
-from apps.catalog.models import PricingRule
+from apps.catalog.models import ExamDefinition
+from apps.catalog.services import PricingResolver
 from apps.users.models import StaffUser
 from .models import (
     AnalysisRequest, AnalysisRequestItem, ExamTraceability,
-    RequestStatus, ItemStatus, ExecutionMode,
+    RequestStatus, ItemStatus, ExecutionMode, PriceSource,
 )
 from .state_machine import RequestStateMachine, ItemStateMachine
 
@@ -58,20 +57,49 @@ def _audit(*, actor: StaffUser, action: str, entity_type: str, entity_id,
     )
 
 
-def _active_pricing_rule(exam_definition) -> PricingRule | None:
+def _resolve_item_pricing(item: AnalysisRequestItem, analysis_request: AnalysisRequest,
+                           manual_billed_price=None) -> None:
     """
-    Return the currently active pricing rule for an exam definition:
-      effective_from <= today  AND  (effective_to IS NULL OR effective_to > today)
-    Returns None if no such rule exists.
+    Set pricing fields on a newly created or updated item.
+
+    1. If execution_mode is REJECTED: unit_price=0, billed_price=0, no source.
+    2. If manual_billed_price is provided: use it, set source=MANUAL_OVERRIDE.
+    3. Else resolve from PricingRule: if found, compute billed_price, set source=PRICING_RULE.
+    4. Else fallback: billed_price = unit_price, source=DEFAULT_PRICE.
     """
-    today = date.today()
-    return (
-        PricingRule.objects
-        .filter(exam_definition=exam_definition, effective_from__lte=today)
-        .filter(Q(effective_to__isnull=True) | Q(effective_to__gt=today))
-        .order_by('-effective_from')
-        .first()
+    exam = item.exam_definition
+
+    if item.execution_mode == ExecutionMode.REJECTED:
+        item.unit_price = 0
+        item.billed_price = 0
+        item.pricing_rule = None
+        item.price_source = PriceSource.DEFAULT_PRICE
+        return
+
+    # Always snapshot the reference price
+    item.unit_price = exam.unit_price
+
+    if manual_billed_price is not None:
+        item.billed_price = manual_billed_price
+        item.pricing_rule = None
+        item.price_source = PriceSource.MANUAL_OVERRIDE
+        return
+
+    # Resolve contextual pricing rule
+    rule = PricingResolver.resolve(
+        exam_definition=exam,
+        partner_organization=analysis_request.partner_organization,
+        source_type=analysis_request.source_type,
     )
+
+    if rule:
+        item.billed_price = PricingResolver.compute_billed_price(rule, exam.unit_price)
+        item.pricing_rule = rule
+        item.price_source = PriceSource.PRICING_RULE
+    else:
+        item.billed_price = exam.unit_price
+        item.pricing_rule = None
+        item.price_source = PriceSource.DEFAULT_PRICE
 
 
 def _create_item_with_traceability(
@@ -80,7 +108,8 @@ def _create_item_with_traceability(
 ) -> AnalysisRequestItem:
     """
     Create an AnalysisRequestItem and its mandatory ExamTraceability stub
-    in a single operation. Must be called inside an atomic transaction.
+    in a single operation. Pricing is resolved immediately.
+    Must be called inside an atomic transaction.
     """
     item = AnalysisRequestItem(
         analysis_request=analysis_request,
@@ -90,6 +119,12 @@ def _create_item_with_traceability(
         external_partner_name=item_data.get('external_partner_name', ''),
         notes=item_data.get('notes', ''),
     )
+    # Need the exam_definition loaded for pricing
+    if not hasattr(item, '_exam_definition_cache'):
+        item.exam_definition = ExamDefinition.objects.get(id=item_data['exam_definition_id'])
+
+    manual_billed = item_data.get('billed_price')
+    _resolve_item_pricing(item, analysis_request, manual_billed_price=manual_billed)
     item.save()
     ExamTraceability.objects.create(item=item)
     return item
@@ -259,14 +294,13 @@ class AnalysisRequestService:
         request,
     ) -> AnalysisRequest:
         """
-        Lock the request and snapshot prices from active pricing rules.
+        Lock the request: transition DRAFT → CONFIRMED.
 
-        Rules:
-        - Request must be DRAFT with at least one item.
-        - Every INTERNAL/SUBCONTRACTED item must have an active pricing rule.
-        - Items with execution_mode=REJECTED receive zero prices and are
-          immediately transitioned to status=REJECTED.
-        - If every item ends up REJECTED the request is auto-completed.
+        Pricing is already set at item creation time. Confirmation:
+        - Validates at least one item exists.
+        - Transitions REJECTED-mode items to status=REJECTED with zero prices.
+        - Locks all item prices (no further changes allowed).
+        - Auto-completes the request if every item is terminal.
         """
         RequestStateMachine.transition(analysis_request, RequestStatus.CONFIRMED)
 
@@ -276,33 +310,17 @@ class AnalysisRequestService:
                 'Cannot confirm a request with no items. Add at least one exam.'
             )
 
-        missing_prices = []
         for item in items:
             if item.execution_mode == ExecutionMode.REJECTED:
                 item.status = ItemStatus.REJECTED
                 item.unit_price = 0
                 item.billed_price = 0
-                item.save(update_fields=['status', 'unit_price', 'billed_price', 'updated_at'])
-                continue
-
-            rule = _active_pricing_rule(item.exam_definition)
-            if rule is None:
-                missing_prices.append(item.exam_definition.code)
-                continue
-
-            item.unit_price = rule.unit_price
-            item.billed_price = rule.billed_price
-            item.pricing_rule = rule
-            item.status = ItemStatus.PENDING
-            item.save(update_fields=[
-                'unit_price', 'billed_price', 'pricing_rule', 'status', 'updated_at',
-            ])
-
-        if missing_prices:
-            raise ValidationError(
-                f'No active pricing rule found for: {", ".join(missing_prices)}. '
-                f'Add a pricing rule before confirming.'
-            )
+                item.price_source = PriceSource.DEFAULT_PRICE
+                item.pricing_rule = None
+                item.save(update_fields=[
+                    'status', 'unit_price', 'billed_price', 'price_source',
+                    'pricing_rule', 'updated_at',
+                ])
 
         analysis_request.confirmed_at = timezone.now()
         analysis_request.confirmed_by = confirmed_by
@@ -384,11 +402,32 @@ class AnalysisRequestItemService:
         if not validated_data:
             return item
 
-        before = {k: getattr(item, k) for k in validated_data}
+        before = {k: str(getattr(item, k)) for k in validated_data}
+
+        # Extract billed_price for special handling
+        manual_billed = validated_data.pop('billed_price', _UNSET)
+
+        # Apply simple field updates
         for field, value in validated_data.items():
             setattr(item, field, value)
-        item.save(update_fields=list(validated_data.keys()) + ['updated_at'])
-        after = {k: getattr(item, k) for k in validated_data}
+
+        # Re-resolve pricing if execution_mode changed, or handle manual override
+        needs_reprice = 'execution_mode' in validated_data
+        if manual_billed is not _UNSET:
+            # Explicit manual override (or null = re-resolve)
+            _resolve_item_pricing(
+                item, item.analysis_request,
+                manual_billed_price=manual_billed,
+            )
+        elif needs_reprice:
+            # execution_mode changed — re-resolve automatically
+            _resolve_item_pricing(item, item.analysis_request)
+
+        item.save()
+
+        after = {}
+        for k in list(validated_data.keys()) + (['billed_price'] if manual_billed is not _UNSET else []):
+            after[k] = str(getattr(item, k))
 
         _audit(
             actor=updated_by,
@@ -540,3 +579,7 @@ class AnalysisRequestItemService:
                             'reason': 'all_items_terminal'}},
             request=request,
         )
+
+
+# Sentinel for distinguishing "not in payload" from explicit null
+_UNSET = object()

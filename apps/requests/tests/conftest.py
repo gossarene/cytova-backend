@@ -2,9 +2,9 @@
 Shared fixtures for requests module tests.
 """
 import pytest
-from datetime import date
+from decimal import Decimal
 
-from apps.catalog.models import ExamCategory, ExamDefinition, PricingRule, SampleType
+from apps.catalog.models import ExamCategory, ExamDefinition, PricingRule, PricingType, SampleType
 from apps.partners.models import OrganizationType
 from apps.partners.services import PartnerOrganizationService
 from apps.patients.models import Patient
@@ -64,16 +64,16 @@ def exam_definition():
         code='CBC',
         name='Complete Blood Count',
         sample_type=SampleType.BLOOD,
+        unit_price=Decimal('50.0000'),
     )
 
 
 @pytest.fixture()
 def pricing_rule(exam_definition, lab_admin):
+    """Broad exam-only pricing rule for backward compatibility."""
     return PricingRule.objects.create(
         exam_definition=exam_definition,
-        unit_price='50.0000',
-        billed_price='75.0000',
-        effective_from=date(2020, 1, 1),
-        effective_to=None,
+        pricing_type=PricingType.FIXED_PRICE,
+        value=Decimal('75.0000'),
         created_by=lab_admin,
     )

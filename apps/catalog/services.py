@@ -4,17 +4,18 @@ Cytova — Catalog Service
 All catalog write operations that carry business logic live here.
 Views are kept thin; they validate input and delegate to the service.
 Audit logging covers create/update/deactivate for categories and exam definitions.
-Pricing rules and lab settings are audited on creation/replacement.
+Pricing rules are audited on creation/update/deactivation.
 """
 import logging
 from datetime import date
+from decimal import Decimal, ROUND_HALF_UP
 
 from django.db.models import Q
 from rest_framework.exceptions import ValidationError
 
 from apps.audit.models import AuditLog, AuditAction, ActorType
 from apps.users.models import StaffUser
-from .models import ExamCategory, ExamDefinition, LabExamSettings, PricingRule
+from .models import ExamCategory, ExamDefinition, LabExamSettings, PricingRule, PricingType
 
 logger = logging.getLogger(__name__)
 
@@ -206,56 +207,13 @@ class ExamDefinitionService:
 class PricingRuleService:
 
     @staticmethod
-    def _check_overlap(exam: ExamDefinition, effective_from: date, effective_to, exclude_id=None) -> None:
-        """
-        Raise ValidationError if the proposed date range overlaps any existing
-        rule for this exam.
-
-        Overlap condition between [A_from, A_to) and [B_from, B_to):
-            A_from < B_to_or_inf  AND  B_from < A_to_or_inf
-        """
-        qs = PricingRule.objects.filter(exam_definition=exam)
-        if exclude_id:
-            qs = qs.exclude(id=exclude_id)
-
-        for rule in qs:
-            rule_end = rule.effective_to
-            new_end = effective_to
-
-            a_start, a_end = rule.effective_from, rule_end
-            b_start, b_end = effective_from, new_end
-
-            # [a_start, a_end) overlaps [b_start, b_end) if:
-            # a_start < b_end (or b_end is open) AND b_start < a_end (or a_end is open)
-            a_before_b_end = (b_end is None) or (a_start < b_end)
-            b_before_a_end = (a_end is None) or (b_start < a_end)
-
-            if a_before_b_end and b_before_a_end:
-                raise ValidationError({
-                    'effective_from': (
-                        f'Date range overlaps with an existing pricing rule '
-                        f'({rule.effective_from} → {rule.effective_to or "open"}).'
-                    )
-                })
-
-    @staticmethod
     def create(
-        exam: ExamDefinition,
         validated_data: dict,
         created_by: StaffUser,
         request,
     ) -> PricingRule:
-        PricingRuleService._check_overlap(
-            exam,
-            validated_data['effective_from'],
-            validated_data.get('effective_to'),
-        )
-
-        rule = PricingRule(
-            exam_definition=exam,
-            created_by=created_by,
-            **validated_data,
-        )
+        rule = PricingRule(created_by=created_by, **validated_data)
+        rule.full_clean()
         rule.save()
 
         AuditLog.objects.create(
@@ -266,11 +224,12 @@ class PricingRuleService:
             entity_type='PricingRule',
             entity_id=rule.id,
             diff={'after': {
-                'exam_code': exam.code,
-                'unit_price': str(rule.unit_price),
-                'billed_price': str(rule.billed_price),
-                'effective_from': str(rule.effective_from),
-                'effective_to': str(rule.effective_to) if rule.effective_to else None,
+                'exam_code': rule.exam_definition.code,
+                'pricing_type': rule.pricing_type,
+                'value': str(rule.value),
+                'partner_organization_id': str(rule.partner_organization_id) if rule.partner_organization_id else None,
+                'source_type': rule.source_type or None,
+                'priority': rule.priority,
             }},
             ip_address=getattr(request, 'audit_ip', None),
             user_agent=getattr(request, 'audit_user_agent', ''),
@@ -279,33 +238,151 @@ class PricingRuleService:
         return rule
 
     @staticmethod
-    def close(rule: PricingRule, effective_to: date, closed_by: StaffUser, request) -> PricingRule:
-        """
-        Set effective_to to close an open-ended pricing rule.
-        The rule is otherwise immutable; this is the single allowed mutation.
-        """
-        if rule.effective_to is not None:
-            raise ValidationError({'effective_to': 'This pricing rule is already closed.'})
+    def update(
+        rule: PricingRule,
+        validated_data: dict,
+        updated_by: StaffUser,
+        request,
+    ) -> PricingRule:
+        if not validated_data:
+            return rule
 
-        if effective_to <= rule.effective_from:
-            raise ValidationError(
-                {'effective_to': 'effective_to must be after effective_from.'}
-            )
+        before = {}
+        for field in validated_data:
+            before[field] = getattr(rule, field)
 
-        # Bypass the model-level immutability guard via queryset update
-        PricingRule.objects.filter(id=rule.id).update(effective_to=effective_to)
-        rule.effective_to = effective_to
+        for field, value in validated_data.items():
+            setattr(rule, field, value)
+        rule.full_clean()
+        rule.save(update_fields=list(validated_data.keys()) + ['updated_at'])
+
+        after = {k: getattr(rule, k) for k in validated_data}
 
         AuditLog.objects.create(
             actor_type=ActorType.STAFF_USER,
-            actor_id=closed_by.id,
-            actor_email=closed_by.email,
+            actor_id=updated_by.id,
+            actor_email=updated_by.email,
             action=AuditAction.UPDATE,
             entity_type='PricingRule',
             entity_id=rule.id,
-            diff={'before': {'effective_to': None}, 'after': {'effective_to': str(effective_to)}},
+            diff={
+                'before': {k: str(v) if v is not None else None for k, v in before.items()},
+                'after': {k: str(v) if v is not None else None for k, v in after.items()},
+            },
             ip_address=getattr(request, 'audit_ip', None),
             user_agent=getattr(request, 'audit_user_agent', ''),
         )
 
         return rule
+
+    @staticmethod
+    def deactivate(rule: PricingRule, deactivated_by: StaffUser, request) -> PricingRule:
+        if not rule.is_active:
+            return rule
+
+        rule.is_active = False
+        rule.save(update_fields=['is_active', 'updated_at'])
+
+        AuditLog.objects.create(
+            actor_type=ActorType.STAFF_USER,
+            actor_id=deactivated_by.id,
+            actor_email=deactivated_by.email,
+            action=AuditAction.DEACTIVATE,
+            entity_type='PricingRule',
+            entity_id=rule.id,
+            diff={'after': {'is_active': False}},
+            ip_address=getattr(request, 'audit_ip', None),
+            user_agent=getattr(request, 'audit_user_agent', ''),
+        )
+
+        return rule
+
+
+# ---------------------------------------------------------------------------
+# PricingResolver — deterministic rule resolution
+# ---------------------------------------------------------------------------
+
+class PricingResolver:
+    """
+    Resolves the applicable pricing rule for an exam in a given context.
+
+    Resolution order (most specific first):
+        1. exam + partner_organization
+        2. exam + source_type
+        3. exam only (no partner, no source_type)
+
+    Within the same specificity level: highest ``priority``, then most recently
+    created. Returns None if no rule matches — caller falls back to the exam's
+    ``unit_price``.
+    """
+
+    @staticmethod
+    def _active_rules_qs(exam_definition):
+        """Base queryset: active rules for this exam within their date window."""
+        today = date.today()
+        return (
+            PricingRule.objects
+            .filter(exam_definition=exam_definition, is_active=True)
+            .filter(Q(start_date__isnull=True) | Q(start_date__lte=today))
+            .filter(Q(end_date__isnull=True) | Q(end_date__gte=today))
+        )
+
+    @staticmethod
+    def resolve(exam_definition, partner_organization=None, source_type=''):
+        """
+        Find the best matching pricing rule for the given context.
+
+        Returns the PricingRule instance or None.
+        """
+        base_qs = PricingResolver._active_rules_qs(exam_definition)
+        ordering = ['-priority', '-created_at']
+
+        # Level 1: exam + partner_organization (most specific)
+        if partner_organization is not None:
+            rule = (
+                base_qs
+                .filter(partner_organization=partner_organization)
+                .order_by(*ordering)
+                .first()
+            )
+            if rule:
+                return rule
+
+        # Level 2: exam + source_type (no partner)
+        if source_type:
+            rule = (
+                base_qs
+                .filter(partner_organization__isnull=True, source_type=source_type)
+                .order_by(*ordering)
+                .first()
+            )
+            if rule:
+                return rule
+
+        # Level 3: exam only (broadest)
+        rule = (
+            base_qs
+            .filter(partner_organization__isnull=True, source_type='')
+            .order_by(*ordering)
+            .first()
+        )
+        return rule
+
+    @staticmethod
+    def compute_billed_price(rule, unit_price):
+        """
+        Compute the billed price from a rule and the exam's unit_price.
+
+        Returns a Decimal rounded to 4 decimal places.
+        """
+        if rule.pricing_type == PricingType.FIXED_PRICE:
+            return rule.value
+
+        if rule.pricing_type == PricingType.PERCENTAGE_DISCOUNT:
+            discount = unit_price * rule.value / Decimal('100')
+            return (unit_price - discount).quantize(
+                Decimal('0.0001'), rounding=ROUND_HALF_UP,
+            )
+
+        # Unknown type — no adjustment
+        return unit_price
