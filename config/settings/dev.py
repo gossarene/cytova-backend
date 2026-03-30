@@ -31,10 +31,14 @@ SIMPLE_JWT = {
 }
 
 # ---------------------------------------------------------------------------
-# Throttling — relaxed for development
+# Throttling — disabled in development (avoids Redis dependency)
+# The default cache backend uses Redis which may not be running locally.
+# Each throttle check attempts a Redis connection with a 5-second timeout,
+# causing ~8-10 second delays per request when Redis is unreachable.
 # ---------------------------------------------------------------------------
 REST_FRAMEWORK = {
     **REST_FRAMEWORK,  # noqa: F405
+    'DEFAULT_THROTTLE_CLASSES': [],  # Disable throttling entirely in dev
     'DEFAULT_THROTTLE_RATES': {
         'anon': '1000/hour',
         'user': '10000/hour',
@@ -42,6 +46,16 @@ REST_FRAMEWORK = {
         'auth_signup': '5/hour',
         'slug_check': '30/hour',
     },
+}
+
+# ---------------------------------------------------------------------------
+# Cache — use in-memory cache for development (no Redis dependency)
+# ---------------------------------------------------------------------------
+CACHES = {
+    'default': {
+        'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+        'LOCATION': 'cytova-dev',
+    }
 }
 
 # ---------------------------------------------------------------------------
