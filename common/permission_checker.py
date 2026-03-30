@@ -39,16 +39,19 @@ class PermissionChecker:
         from common.role_permissions import get_role_permissions
         base = set(get_role_permissions(user.role))
 
-        # Apply per-user overrides (single query)
-        if hasattr(user, 'permission_overrides'):
-            overrides = user.permission_overrides.values_list(
-                'permission_code', 'override_type',
-            )
-            for code, override_type in overrides:
-                if override_type == 'GRANT':
-                    base.add(code)
-                elif override_type == 'REVOKE':
-                    base.discard(code)
+        # Apply per-user overrides.
+        # If permission_overrides was prefetched on the queryset, .all()
+        # reads from the prefetch cache with zero DB queries. If not
+        # prefetched, this triggers a single DB query (then cached on
+        # the user instance via _CACHE_ATTR for the request lifetime).
+        try:
+            for override in user.permission_overrides.all():
+                if override.override_type == 'GRANT':
+                    base.add(override.permission_code)
+                elif override.override_type == 'REVOKE':
+                    base.discard(override.permission_code)
+        except Exception:
+            pass  # Defensive: anonymous user or missing relation
 
         result = frozenset(base)
         setattr(user, PermissionChecker._CACHE_ATTR, result)

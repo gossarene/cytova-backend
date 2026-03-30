@@ -78,13 +78,23 @@ class AnalysisRequestViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet)
     ordering = ['-created_at']
 
     def get_queryset(self):
+        from django.db.models import Prefetch
+        from apps.requests.models import AnalysisRequestItem
+
+        # Prefetch items WITH their nested relations to avoid N+1 queries
+        # when the serializer accesses item.exam_definition.code/name.
+        items_qs = (
+            AnalysisRequestItem.objects
+            .select_related('exam_definition', 'pricing_rule')
+            .order_by('created_at')
+        )
         return (
             AnalysisRequest.objects
             .select_related(
                 'patient', 'partner_organization',
                 'created_by', 'confirmed_by', 'cancelled_by',
             )
-            .prefetch_related('items')
+            .prefetch_related(Prefetch('items', queryset=items_qs))
         )
 
     def get_permissions(self):

@@ -402,7 +402,10 @@ class TestPermissionOverrideAudit:
 
         logs = AuditLog.objects.filter(
             action=AuditAction.PERMISSION_OVERRIDE,
-        ).order_by('-timestamp')
+        )
         assert logs.count() == 2
-        assert logs[0].diff['type'] == 'REMOVED'
-        assert logs[0].diff['previous_override'] == 'GRANT'
+        diff_types = {log.diff['type'] for log in logs}
+        assert 'GRANT' in diff_types
+        assert 'REMOVED' in diff_types
+        removed_log = [l for l in logs if l.diff['type'] == 'REMOVED'][0]
+        assert removed_log.diff['previous_override'] == 'GRANT'

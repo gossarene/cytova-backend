@@ -28,6 +28,11 @@ class AuthService:
     @staticmethod
     def login(user: StaffUser, request) -> dict:
         """Issue access + refresh tokens and write LOGIN audit record."""
+        # Prefetch permission overrides before token generation to avoid
+        # a lazy query inside PermissionChecker.get_effective_permissions().
+        from django.db.models import prefetch_related_objects
+        prefetch_related_objects([user], 'permission_overrides')
+
         refresh = RefreshToken.for_user(user)
         access = CytovaAccessToken.for_user(user)
 
@@ -76,7 +81,7 @@ class AuthService:
         Re-fetches the user to embed the latest role in the access token.
         """
         user_id = old_refresh_token[jwt_settings.USER_ID_CLAIM]
-        user = StaffUser.objects.get(id=user_id)
+        user = StaffUser.objects.prefetch_related('permission_overrides').get(id=user_id)
 
         old_refresh_token.blacklist()
 

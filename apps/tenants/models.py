@@ -239,13 +239,28 @@ class Tenant(TenantMixin):
 
     @property
     def active_subscription(self):
-        """Returns the current usable subscription, or None."""
-        return (
+        """
+        Returns the current usable subscription, or None.
+
+        Performance: the SubscriptionEnforcementMiddleware caches the result
+        on the tenant instance (_cached_active_subscription) so downstream
+        code that accesses this property within the same request avoids a
+        repeat DB query.
+        """
+        cached = getattr(self, '_cached_active_subscription', None)
+        if cached is not None:
+            return cached
+        # Sentinel to distinguish "cached None" (no subscription) from "not cached"
+        if hasattr(self, '_cached_active_subscription'):
+            return None
+        result = (
             self.subscriptions
             .filter(status__in=[SubscriptionStatus.TRIAL, SubscriptionStatus.ACTIVE])
             .select_related('plan')
             .first()
         )
+        self._cached_active_subscription = result
+        return result
 
 
 class Domain(DomainMixin):

@@ -47,7 +47,12 @@ class UserViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet):
     ordering_fields = ['last_name', 'first_name', 'created_at', 'role']
 
     def get_queryset(self):
-        return StaffUser.objects.select_related('created_by').all()
+        return (
+            StaffUser.objects
+            .select_related('created_by')
+            .prefetch_related('permission_overrides')
+            .all()
+        )
 
     def get_serializer_class(self):
         if self.action == 'list':

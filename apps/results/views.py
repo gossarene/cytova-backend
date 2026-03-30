@@ -93,6 +93,12 @@ class ExamResultViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet):
     ordering = ['-created_at']
 
     def get_queryset(self):
+        from django.db.models import Prefetch
+        from apps.results.models import ResultFile
+
+        # Prefetch files WITH uploaded_by to avoid N+1 when serializer
+        # accesses file.uploaded_by.email in ResultFileSerializer.
+        files_qs = ResultFile.objects.select_related('uploaded_by')
         return (
             ExamResult.objects
             .select_related(
@@ -100,7 +106,7 @@ class ExamResultViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet):
                 'item__analysis_request',
                 'created_by', 'validated_by', 'published_by',
             )
-            .prefetch_related('files')
+            .prefetch_related(Prefetch('files', queryset=files_qs))
         )
 
     def get_permissions(self):

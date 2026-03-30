@@ -65,6 +65,10 @@ class SubscriptionEnforcementMiddleware:
         SUBSCRIPTION_SUSPENDED  — admin or payment suspension
         SUBSCRIPTION_CANCELLED  — permanently cancelled
         SUBSCRIPTION_MISSING    — no subscription record at all
+
+    Performance: the subscription result is cached on the tenant instance
+    for the duration of the request, avoiding repeated DB queries from
+    downstream code that accesses tenant.active_subscription.
     """
 
     # Exempt paths loaded from settings at first use.
@@ -88,10 +92,11 @@ class SubscriptionEnforcementMiddleware:
         if tenant is None:
             return self.get_response(request)
 
-        # Check subscription
+        # Check subscription — cache on tenant instance to avoid repeat queries
         subscription = tenant.active_subscription
+        tenant._cached_active_subscription = subscription
+
         if subscription is not None and subscription.is_usable:
-            # Attach subscription to request for downstream use
             request.subscription = subscription
             return self.get_response(request)
 
