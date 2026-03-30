@@ -5,6 +5,7 @@ CytovaTenantMiddleware              — Tenant resolution (wraps django-tenants)
 SubscriptionEnforcementMiddleware   — Block access when subscription is not usable
 AuditContextMiddleware              — Request metadata capture for audit logging
 """
+
 import json
 import logging
 
