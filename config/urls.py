@@ -36,8 +36,10 @@ urlpatterns = [
         path('requests/',  include('apps.requests.urls')),
         path('results/',   include('apps.results.urls')),
         path('stock/',     include('apps.stock.urls')),
+        # Procurement domain — unified supplier + purchase order + reception routing
+        path('procurement/',  include('apps.procurement.urls')),
+        # Legacy: /suppliers/ still available for backward compatibility
         path('suppliers/',    include('apps.suppliers.urls')),
-        # path('procurement/',  include('apps.procurement.urls')),
         path('partners/',     include('apps.partners.urls')),
         path('alerts/',       include('apps.alerts.urls')),
         path('dashboard/',    include('apps.dashboard.urls')),

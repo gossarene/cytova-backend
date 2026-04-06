@@ -55,6 +55,7 @@ TENANT_APPS = [
     'apps.results',
     'apps.stock',
     'apps.suppliers',
+    'apps.procurement',  # Thin routing app — no models, re-exports suppliers views
     'apps.partners',
     'apps.alerts',
     'apps.dashboard',
@@ -86,7 +87,7 @@ MIDDLEWARE = [
     # Tenant resolution must be the very first middleware.
     'common.middleware.CytovaTenantMiddleware',
     # Subscription check must be immediately after tenant resolution.
-    # 'common.middleware.SubscriptionEnforcementMiddleware',
+    'common.middleware.SubscriptionEnforcementMiddleware',
 
     'django.middleware.security.SecurityMiddleware',
     'corsheaders.middleware.CorsMiddleware',
