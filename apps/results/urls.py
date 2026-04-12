@@ -1,10 +1,10 @@
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 
-from .views import ExamResultViewSet, ResultFileViewSet
+from .views import ResultVersionViewSet, ResultFileViewSet
 
 router = DefaultRouter()
-router.register(r'', ExamResultViewSet, basename='examresult')
+router.register(r'', ResultVersionViewSet, basename='resultversion')
 
 # Explicit nested URLs for files — kept separate for clean access control
 file_urls = [

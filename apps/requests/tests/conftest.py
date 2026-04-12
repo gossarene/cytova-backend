@@ -13,7 +13,8 @@ from apps.patients.models import Patient
 @pytest.fixture()
 def patient(lab_admin):
     return Patient.objects.create(
-        national_id='NID-TEST-001',
+        document_type='NATIONAL_ID_CARD',
+        document_number='NID-TEST-001',
         first_name='John',
         last_name='Doe',
         date_of_birth='1990-01-15',

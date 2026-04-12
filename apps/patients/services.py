@@ -29,7 +29,8 @@ class PatientService:
             entity_type='Patient',
             entity_id=patient.id,
             diff={'after': {
-                'national_id': patient.national_id,
+                'document_type': patient.document_type,
+                'document_number': patient.document_number,
                 'first_name': patient.first_name,
                 'last_name': patient.last_name,
             }},

@@ -15,8 +15,14 @@ from rest_framework.response import Response
 from rest_framework.viewsets import GenericViewSet
 
 from common.permissions import IsLabAdmin, IsAnyStaff
-from .filters import ExamCategoryFilter, ExamDefinitionFilter
-from .models import ExamCategory, ExamDefinition, PricingRule
+from .filters import (
+    ExamCategoryFilter, ExamDefinitionFilter, ExamFamilyFilter,
+    ExamSubFamilyFilter, TubeTypeFilter, ExamTechniqueFilter,
+)
+from .models import (
+    ExamCategory, ExamFamily, ExamSubFamily, TubeType, ExamTechnique,
+    ExamDefinition, PricingRule, SampleType,
+)
 from .serializers import (
     ExamCategoryCreateSerializer,
     ExamCategoryDetailSerializer,
@@ -26,13 +32,31 @@ from .serializers import (
     ExamDefinitionDetailSerializer,
     ExamDefinitionListSerializer,
     ExamDefinitionUpdateSerializer,
+    ExamFamilyListSerializer,
+    ExamFamilyDetailSerializer,
+    ExamFamilyCreateSerializer,
+    ExamFamilyUpdateSerializer,
+    ExamSubFamilyListSerializer,
+    ExamSubFamilyDetailSerializer,
+    ExamSubFamilyCreateSerializer,
+    ExamSubFamilyUpdateSerializer,
+    TubeTypeListSerializer,
+    TubeTypeCreateSerializer,
+    TubeTypeUpdateSerializer,
+    ExamTechniqueListSerializer,
+    ExamTechniqueCreateSerializer,
+    ExamTechniqueUpdateSerializer,
+    SampleTypeSerializer,
     LabExamSettingsSerializer,
     LabExamSettingsWriteSerializer,
     PricingRuleCreateSerializer,
     PricingRuleSerializer,
     PricingRuleUpdateSerializer,
 )
-from .services import ExamCategoryService, ExamDefinitionService, PricingRuleService
+from .services import (
+    ExamCategoryService, ExamDefinitionService, PricingRuleService,
+    ExamFamilyService, ExamSubFamilyService, TubeTypeService, ExamTechniqueService,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +132,333 @@ class ExamCategoryViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet):
 
 
 # ---------------------------------------------------------------------------
+# Reference-data viewsets
+#
+# These four viewsets (Family / SubFamily / TubeType / Technique) are
+# deliberately shaped identically to ExamCategoryViewSet: list + retrieve from
+# mixins, write actions hand-rolled so every create/update/deactivate goes
+# through a service that writes an AuditLog. The small amount of repetition
+# is a feature — it keeps audit semantics, permission wiring and response
+# shape trivially auditable. A shared ``BaseRefViewSet`` would save a dozen
+# lines but hide exactly the pieces (permissions, service routing, read
+# serializer after write) that a reviewer needs to verify quickly.
+# ---------------------------------------------------------------------------
+
+
+class ExamFamilyViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet):
+    queryset = ExamFamily.objects.all()
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filterset_class = ExamFamilyFilter
+    search_fields = ['name']
+    ordering_fields = ['display_order', 'name', 'created_at']
+    ordering = ['display_order', 'name']
+
+    def get_permissions(self):
+        if self.action in ('list', 'retrieve'):
+            return [IsAnyStaff()]
+        return [IsLabAdmin()]
+
+    def get_serializer_class(self):
+        if self.action == 'retrieve':
+            return ExamFamilyDetailSerializer
+        if self.action == 'create':
+            return ExamFamilyCreateSerializer
+        if self.action == 'partial_update':
+            return ExamFamilyUpdateSerializer
+        return ExamFamilyListSerializer
+
+    def create(self, request, *args, **kwargs):
+        serializer = ExamFamilyCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        family = ExamFamilyService.create(
+            validated_data=serializer.validated_data,
+            created_by=request.user,
+            request=request,
+        )
+        return Response(
+            ExamFamilyDetailSerializer(family).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+    def partial_update(self, request, *args, **kwargs):
+        family = self.get_object()
+        serializer = ExamFamilyUpdateSerializer(
+            data=request.data,
+            context={'instance': family},
+        )
+        serializer.is_valid(raise_exception=True)
+        family = ExamFamilyService.update(
+            family=family,
+            validated_data=serializer.validated_data,
+            updated_by=request.user,
+            request=request,
+        )
+        return Response(ExamFamilyDetailSerializer(family).data)
+
+    @action(detail=True, methods=['post'], url_path='deactivate')
+    def deactivate(self, request, pk=None):
+        family = self.get_object()
+        family = ExamFamilyService.deactivate(
+            family=family,
+            deactivated_by=request.user,
+            request=request,
+        )
+        return Response(ExamFamilyDetailSerializer(family).data)
+
+    @action(detail=True, methods=['post'], url_path='reactivate')
+    def reactivate(self, request, pk=None):
+        family = self.get_object()
+        family = ExamFamilyService.reactivate(
+            family=family,
+            reactivated_by=request.user,
+            request=request,
+        )
+        return Response(ExamFamilyDetailSerializer(family).data)
+
+
+class ExamSubFamilyViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet):
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filterset_class = ExamSubFamilyFilter
+    search_fields = ['name']
+    ordering_fields = ['name', 'created_at']
+    ordering = ['name']
+
+    def get_queryset(self):
+        # select_related keeps the dropdown list path free of N+1 when the
+        # family_name is denormalised into the list serializer.
+        return ExamSubFamily.objects.select_related('family').all()
+
+    def get_permissions(self):
+        if self.action in ('list', 'retrieve'):
+            return [IsAnyStaff()]
+        return [IsLabAdmin()]
+
+    def get_serializer_class(self):
+        if self.action == 'retrieve':
+            return ExamSubFamilyDetailSerializer
+        if self.action == 'create':
+            return ExamSubFamilyCreateSerializer
+        if self.action == 'partial_update':
+            return ExamSubFamilyUpdateSerializer
+        return ExamSubFamilyListSerializer
+
+    def create(self, request, *args, **kwargs):
+        serializer = ExamSubFamilyCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        sub = ExamSubFamilyService.create(
+            validated_data=serializer.validated_data,
+            created_by=request.user,
+            request=request,
+        )
+        sub = ExamSubFamily.objects.select_related('family').get(pk=sub.pk)
+        return Response(
+            ExamSubFamilyDetailSerializer(sub).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+    def partial_update(self, request, *args, **kwargs):
+        sub = self.get_object()
+        serializer = ExamSubFamilyUpdateSerializer(
+            data=request.data,
+            context={'instance': sub},
+        )
+        serializer.is_valid(raise_exception=True)
+        sub = ExamSubFamilyService.update(
+            sub=sub,
+            validated_data=serializer.validated_data,
+            updated_by=request.user,
+            request=request,
+        )
+        sub = ExamSubFamily.objects.select_related('family').get(pk=sub.pk)
+        return Response(ExamSubFamilyDetailSerializer(sub).data)
+
+    @action(detail=True, methods=['post'], url_path='deactivate')
+    def deactivate(self, request, pk=None):
+        sub = self.get_object()
+        sub = ExamSubFamilyService.deactivate(
+            sub=sub,
+            deactivated_by=request.user,
+            request=request,
+        )
+        return Response(ExamSubFamilyDetailSerializer(sub).data)
+
+    @action(detail=True, methods=['post'], url_path='reactivate')
+    def reactivate(self, request, pk=None):
+        sub = self.get_object()
+        sub = ExamSubFamilyService.reactivate(
+            sub=sub,
+            reactivated_by=request.user,
+            request=request,
+        )
+        sub = ExamSubFamily.objects.select_related('family').get(pk=sub.pk)
+        return Response(ExamSubFamilyDetailSerializer(sub).data)
+
+
+class TubeTypeViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet):
+    queryset = TubeType.objects.all()
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filterset_class = TubeTypeFilter
+    search_fields = ['name']
+    ordering_fields = ['name', 'created_at']
+    ordering = ['name']
+
+    def get_permissions(self):
+        if self.action in ('list', 'retrieve'):
+            return [IsAnyStaff()]
+        return [IsLabAdmin()]
+
+    def get_serializer_class(self):
+        if self.action == 'create':
+            return TubeTypeCreateSerializer
+        if self.action == 'partial_update':
+            return TubeTypeUpdateSerializer
+        return TubeTypeListSerializer
+
+    def create(self, request, *args, **kwargs):
+        serializer = TubeTypeCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        tube = TubeTypeService.create(
+            validated_data=serializer.validated_data,
+            created_by=request.user,
+            request=request,
+        )
+        return Response(
+            TubeTypeListSerializer(tube).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+    def partial_update(self, request, *args, **kwargs):
+        tube = self.get_object()
+        serializer = TubeTypeUpdateSerializer(
+            data=request.data,
+            context={'instance': tube},
+        )
+        serializer.is_valid(raise_exception=True)
+        tube = TubeTypeService.update(
+            tube=tube,
+            validated_data=serializer.validated_data,
+            updated_by=request.user,
+            request=request,
+        )
+        return Response(TubeTypeListSerializer(tube).data)
+
+    @action(detail=True, methods=['post'], url_path='deactivate')
+    def deactivate(self, request, pk=None):
+        tube = self.get_object()
+        tube = TubeTypeService.deactivate(
+            tube=tube,
+            deactivated_by=request.user,
+            request=request,
+        )
+        return Response(TubeTypeListSerializer(tube).data)
+
+    @action(detail=True, methods=['post'], url_path='reactivate')
+    def reactivate(self, request, pk=None):
+        tube = self.get_object()
+        tube = TubeTypeService.reactivate(
+            tube=tube,
+            reactivated_by=request.user,
+            request=request,
+        )
+        return Response(TubeTypeListSerializer(tube).data)
+
+
+class ExamTechniqueViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet):
+    queryset = ExamTechnique.objects.all()
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filterset_class = ExamTechniqueFilter
+    search_fields = ['name']
+    ordering_fields = ['name', 'created_at']
+    ordering = ['name']
+
+    def get_permissions(self):
+        if self.action in ('list', 'retrieve'):
+            return [IsAnyStaff()]
+        return [IsLabAdmin()]
+
+    def get_serializer_class(self):
+        if self.action == 'create':
+            return ExamTechniqueCreateSerializer
+        if self.action == 'partial_update':
+            return ExamTechniqueUpdateSerializer
+        return ExamTechniqueListSerializer
+
+    def create(self, request, *args, **kwargs):
+        serializer = ExamTechniqueCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        tech = ExamTechniqueService.create(
+            validated_data=serializer.validated_data,
+            created_by=request.user,
+            request=request,
+        )
+        return Response(
+            ExamTechniqueListSerializer(tech).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+    def partial_update(self, request, *args, **kwargs):
+        tech = self.get_object()
+        serializer = ExamTechniqueUpdateSerializer(
+            data=request.data,
+            context={'instance': tech},
+        )
+        serializer.is_valid(raise_exception=True)
+        tech = ExamTechniqueService.update(
+            tech=tech,
+            validated_data=serializer.validated_data,
+            updated_by=request.user,
+            request=request,
+        )
+        return Response(ExamTechniqueListSerializer(tech).data)
+
+    @action(detail=True, methods=['post'], url_path='deactivate')
+    def deactivate(self, request, pk=None):
+        tech = self.get_object()
+        tech = ExamTechniqueService.deactivate(
+            tech=tech,
+            deactivated_by=request.user,
+            request=request,
+        )
+        return Response(ExamTechniqueListSerializer(tech).data)
+
+    @action(detail=True, methods=['post'], url_path='reactivate')
+    def reactivate(self, request, pk=None):
+        tech = self.get_object()
+        tech = ExamTechniqueService.reactivate(
+            tech=tech,
+            reactivated_by=request.user,
+            request=request,
+        )
+        return Response(ExamTechniqueListSerializer(tech).data)
+
+
+class SampleTypeViewSet(GenericViewSet):
+    """
+    Read-only reference listing of the SampleType taxonomy.
+
+    Sample types are a fixed clinical enumeration — not free-form lab metadata
+    like tube types. They live in ``SampleType.choices`` so the model-level
+    constraint, the ORM filters, and the OpenAPI schema stay in sync. This
+    endpoint exposes them as a flat ``[{value, label}]`` list so the frontend
+    can populate dropdowns consistently with the other reference endpoints,
+    without having to hardcode the enum itself.
+
+    Changing this taxonomy is intentionally a code change: it must go through
+    migration review because it affects exam definitions, traceability, and
+    reporting. Hence no write endpoints.
+    """
+    permission_classes = [IsAnyStaff]
+    serializer_class = SampleTypeSerializer
+
+    def get_queryset(self):
+        return []
+
+    def list(self, request, *args, **kwargs):
+        payload = [{'value': v, 'label': l} for v, l in SampleType.choices]
+        return Response(SampleTypeSerializer(payload, many=True).data)
+
+
+# ---------------------------------------------------------------------------
 # ExamDefinition
 # ---------------------------------------------------------------------------
 
@@ -118,7 +469,9 @@ class ExamDefinitionViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet):
     ordering_fields = ['code', 'name', 'created_at']
 
     def get_queryset(self):
-        return ExamDefinition.objects.select_related('category', 'lab_settings').all()
+        return ExamDefinition.objects.select_related(
+            'category', 'family', 'sub_family', 'tube_type', 'technique', 'lab_settings',
+        ).all()
 
     def get_permissions(self):
         if self.action in ('list', 'retrieve', 'exam_settings'):
@@ -142,7 +495,9 @@ class ExamDefinitionViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet):
             created_by=request.user,
             request=request,
         )
-        exam = ExamDefinition.objects.select_related('category', 'lab_settings').get(id=exam.id)
+        exam = ExamDefinition.objects.select_related(
+            'category', 'family', 'sub_family', 'tube_type', 'technique', 'lab_settings',
+        ).get(id=exam.id)
         return Response(
             ExamDefinitionDetailSerializer(exam).data,
             status=status.HTTP_201_CREATED,
@@ -150,7 +505,10 @@ class ExamDefinitionViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet):
 
     def partial_update(self, request, *args, **kwargs):
         exam = self.get_object()
-        serializer = ExamDefinitionUpdateSerializer(data=request.data)
+        serializer = ExamDefinitionUpdateSerializer(
+            data=request.data,
+            context={'instance': exam},
+        )
         serializer.is_valid(raise_exception=True)
         if not serializer.validated_data:
             return Response(ExamDefinitionDetailSerializer(exam).data)
@@ -160,7 +518,9 @@ class ExamDefinitionViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet):
             updated_by=request.user,
             request=request,
         )
-        exam = ExamDefinition.objects.select_related('category', 'lab_settings').get(id=exam.id)
+        exam = ExamDefinition.objects.select_related(
+            'category', 'family', 'sub_family', 'tube_type', 'technique', 'lab_settings',
+        ).get(id=exam.id)
         return Response(ExamDefinitionDetailSerializer(exam).data)
 
     @action(detail=True, methods=['post'], url_path='deactivate')

@@ -1,16 +1,17 @@
 """
-Cytova — Exam Result State Machine
+Cytova — Result Version State Machine
 
-Enforces legal status transitions for ExamResult.
+Enforces legal status transitions for ResultVersion.
 All status changes MUST go through ResultStateMachine.transition() —
 never set .status directly in views or services.
 
 Transition graph:
-    DRAFT → PENDING_VALIDATION  (submit for validation)
-    PENDING_VALIDATION → VALIDATED   (biologist approves)
-    PENDING_VALIDATION → DRAFT       (biologist rejects → back for revision)
-    VALIDATED → PUBLISHED            (publish — IRREVERSIBLE)
-    PUBLISHED → ∅                    (terminal, no further transitions)
+    DRAFT → SUBMITTED          (technician submits for review)
+    SUBMITTED → VALIDATED      (biologist approves)
+    SUBMITTED → REJECTED       (biologist rejects — terminal for this version)
+    VALIDATED → PUBLISHED      (publish — IRREVERSIBLE)
+    REJECTED → ∅               (terminal — create a new version instead)
+    PUBLISHED → ∅              (terminal, no further transitions)
 
 CLAUDE.md constraint:
     "Result publishing is irreversible. Once an ExamResult is published,
@@ -24,27 +25,24 @@ from .models import ResultStatus
 class ResultStateMachine:
     _TRANSITIONS: dict[str, set[str]] = {
         ResultStatus.DRAFT: {
-            ResultStatus.PENDING_VALIDATION,
+            ResultStatus.SUBMITTED,
         },
-        ResultStatus.PENDING_VALIDATION: {
+        ResultStatus.SUBMITTED: {
             ResultStatus.VALIDATED,
-            ResultStatus.DRAFT,
+            ResultStatus.REJECTED,
         },
         ResultStatus.VALIDATED: {
             ResultStatus.PUBLISHED,
         },
-        ResultStatus.PUBLISHED: set(),  # TERMINAL — no outgoing transitions
+        ResultStatus.REJECTED:  set(),
+        ResultStatus.PUBLISHED: set(),
     }
 
     @classmethod
     def transition(cls, result, new_status: str) -> None:
         """
-        Validate and apply a status transition on an ExamResult instance.
+        Validate and apply a status transition on a ResultVersion instance.
         Raises ValidationError if the transition is illegal.
-
-        Publishing to PUBLISHED is checked explicitly to surface a clear error
-        message (rather than the generic "no allowed transitions" message).
-
         The caller is responsible for saving the instance after this call.
         """
         if result.status == ResultStatus.PUBLISHED:

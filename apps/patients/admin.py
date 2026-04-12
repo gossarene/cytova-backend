@@ -16,20 +16,23 @@ class PortalAccountInline(admin.TabularInline):
 @admin.register(Patient)
 class PatientAdmin(admin.ModelAdmin):
     list_display = (
-        'national_id', 'last_name', 'first_name',
-        'date_of_birth', 'gender', 'is_active', 'created_at',
+        'document_number', 'document_type', 'last_name', 'first_name',
+        'date_of_birth', 'gender', 'nationality', 'is_active', 'created_at',
     )
-    list_filter = ('gender', 'is_active')
-    search_fields = ('national_id', 'first_name', 'last_name', 'email', 'phone')
+    list_filter = ('document_type', 'gender', 'is_active')
+    search_fields = ('document_number', 'first_name', 'last_name', 'email', 'phone')
     readonly_fields = ('id', 'created_by', 'created_at', 'updated_at')
     inlines = [PortalAccountInline]
 
     fieldsets = (
+        ('Identification', {
+            'fields': ('id', 'document_type', 'document_number', 'nationality'),
+        }),
         ('Identity', {
-            'fields': ('id', 'national_id', 'first_name', 'last_name', 'date_of_birth', 'gender'),
+            'fields': ('first_name', 'last_name', 'date_of_birth', 'gender'),
         }),
         ('Contact', {
-            'fields': ('phone', 'email', 'address'),
+            'fields': ('phone', 'email', 'city_of_residence', 'address'),
         }),
         ('Billing', {
             'fields': ('insurance_number',),
@@ -49,7 +52,7 @@ class PatientPortalAccountAdmin(admin.ModelAdmin):
     list_display = ('email', 'patient', 'is_active', 'created_at', 'last_login')
     list_filter = ('is_active',)
     readonly_fields = ('id', 'patient', 'email', 'created_by', 'created_at', 'updated_at', 'last_login')
-    search_fields = ('email', 'patient__first_name', 'patient__last_name', 'patient__national_id')
+    search_fields = ('email', 'patient__first_name', 'patient__last_name', 'patient__document_number')
 
     def has_add_permission(self, request):
         return False

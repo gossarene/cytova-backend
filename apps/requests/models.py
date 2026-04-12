@@ -32,18 +32,28 @@ from common.models import BaseModel
 # ---------------------------------------------------------------------------
 
 class RequestStatus(models.TextChoices):
-    DRAFT       = 'DRAFT',       'Draft'
-    CONFIRMED   = 'CONFIRMED',   'Confirmed'
-    IN_PROGRESS = 'IN_PROGRESS', 'In Progress'
-    COMPLETED   = 'COMPLETED',   'Completed'
-    CANCELLED   = 'CANCELLED',   'Cancelled'
+    DRAFT                   = 'DRAFT',                   'Draft'
+    CONFIRMED               = 'CONFIRMED',               'Confirmed'
+    COLLECTION_IN_PROGRESS  = 'COLLECTION_IN_PROGRESS',  'Collection In Progress'
+    IN_ANALYSIS             = 'IN_ANALYSIS',             'In Analysis'
+    AWAITING_REVIEW         = 'AWAITING_REVIEW',         'Awaiting Review'
+    RETEST_REQUIRED         = 'RETEST_REQUIRED',         'Retest Required'
+    READY_FOR_RELEASE       = 'READY_FOR_RELEASE',       'Ready For Release'
+    VALIDATED               = 'VALIDATED',               'Validated'
+    IN_PROGRESS             = 'IN_PROGRESS',             'In Progress'
+    COMPLETED               = 'COMPLETED',               'Completed'
+    CANCELLED               = 'CANCELLED',               'Cancelled'
 
 
 class ItemStatus(models.TextChoices):
-    PENDING     = 'PENDING',     'Pending'
-    IN_PROGRESS = 'IN_PROGRESS', 'In Progress'
-    COMPLETED   = 'COMPLETED',   'Completed'
-    REJECTED    = 'REJECTED',    'Rejected'
+    PENDING        = 'PENDING',        'Pending Collection'
+    COLLECTED      = 'COLLECTED',      'Collected'
+    RESULT_ENTERED = 'RESULT_ENTERED', 'Result Entered'
+    UNDER_REVIEW   = 'UNDER_REVIEW',   'Under Review'
+    VALIDATED      = 'VALIDATED',      'Validated'
+    IN_PROGRESS    = 'IN_PROGRESS',    'In Progress'
+    COMPLETED      = 'COMPLETED',      'Completed'
+    REJECTED       = 'REJECTED',       'Rejected'
 
 
 class ExecutionMode(models.TextChoices):
@@ -63,9 +73,10 @@ class BillingMode(models.TextChoices):
 
 
 class PriceSource(models.TextChoices):
-    DEFAULT_PRICE   = 'DEFAULT_PRICE',   'Default Price'
-    PRICING_RULE    = 'PRICING_RULE',    'Pricing Rule'
-    MANUAL_OVERRIDE = 'MANUAL_OVERRIDE', 'Manual Override'
+    DEFAULT_PRICE        = 'DEFAULT_PRICE',        'Default Price'
+    PARTNER_AGREED_PRICE = 'PARTNER_AGREED_PRICE', 'Partner Agreed Price'
+    PRICING_RULE         = 'PRICING_RULE',         'Pricing Rule'
+    MANUAL_OVERRIDE      = 'MANUAL_OVERRIDE',      'Manual Override'
 
 
 # ---------------------------------------------------------------------------
@@ -96,7 +107,7 @@ class AnalysisRequest(BaseModel):
         related_name='analysis_requests',
     )
     status = models.CharField(
-        max_length=20,
+        max_length=25,
         choices=RequestStatus.choices,
         default=RequestStatus.DRAFT,
         db_index=True,
@@ -250,6 +261,32 @@ class AnalysisRequestItem(BaseModel):
         help_text='How the billed price was determined.',
     )
 
+    # Specimen collection — populated when a technician marks the item
+    # as collected. These fields live on the item (not the traceability
+    # row) because collection is a per-item operational milestone and
+    # the traceability model is reserved for sample receipt / analysis
+    # completion timestamps. The request-level status is derived from
+    # these values rather than stored redundantly.
+    collected_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text='When the specimen for this item was collected.',
+    )
+    collected_by = models.ForeignKey(
+        'users.StaffUser',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='collected_items',
+        help_text='Staff user who marked the item as collected.',
+    )
+    collection_notes = models.TextField(
+        blank=True,
+        default='',
+        help_text='Optional operational notes captured at collection time.',
+    )
+
     class Meta:
         verbose_name = 'Analysis Request Item'
         verbose_name_plural = 'Analysis Request Items'
@@ -322,3 +359,118 @@ class ExamTraceability(models.Model):
 
     def __str__(self):
         return f'Traceability for {self.item}'
+
+
+# ---------------------------------------------------------------------------
+# Request Labels
+# ---------------------------------------------------------------------------
+
+class RequestLabelBatch(BaseModel):
+    """
+    One-per-request printable label generation batch.
+
+    Current lifecycle rule: **generate once and reuse.** The
+    ``OneToOneField`` to ``AnalysisRequest`` enforces this at the DB
+    level — once a batch exists for a request, calling the label
+    generation endpoint returns the same batch verbatim. This is
+    deliberately the safest professional default: once physical labels
+    have been printed and stuck onto specimen tubes, producing new
+    barcodes would open a traceability gap. A future "force regenerate"
+    capability can be added as a distinct action when the operational
+    need is real, with its own audit trail.
+
+    Hard delete is blocked — label batches are traceability records.
+    """
+    analysis_request = models.OneToOneField(
+        AnalysisRequest,
+        on_delete=models.PROTECT,
+        related_name='label_batch',
+    )
+    generated_by = models.ForeignKey(
+        'users.StaffUser',
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name='generated_label_batches',
+    )
+    generated_at = models.DateTimeField(default=timezone.now, db_index=True)
+    label_count = models.PositiveSmallIntegerField(
+        help_text='Total labels in this batch (distinct families + fixed extras).',
+    )
+    family_count = models.PositiveSmallIntegerField(
+        help_text='Distinct exam families counted at generation time (audit).',
+    )
+    pdf_file_key = models.CharField(
+        max_length=500,
+        blank=True,
+        default='',
+        help_text='Internal storage key for the rendered PDF. Never exposed to clients as-is.',
+    )
+
+    class Meta:
+        verbose_name = 'Request Label Batch'
+        verbose_name_plural = 'Request Label Batches'
+        ordering = ['-generated_at']
+
+    def __str__(self):
+        return f'{self.analysis_request.request_number} \u2192 {self.label_count} labels'
+
+    def delete(self, *args, **kwargs):
+        raise PermissionError(
+            'Request label batches cannot be deleted — they are traceability records.'
+        )
+
+
+class RequestLabel(BaseModel):
+    """
+    One label row inside a batch.
+
+    ``barcode_value`` is the canonical, **system-wide unique** identifier
+    printed on the physical label and scanned throughout downstream
+    workflow — the unique + indexed constraint means any scan in any
+    module can resolve back in O(1) to the label, the batch, and the
+    parent analysis request, preserving full traceability.
+
+    Hard delete is blocked — labels are traceability records.
+    """
+    batch = models.ForeignKey(
+        RequestLabelBatch,
+        on_delete=models.CASCADE,
+        related_name='labels',
+    )
+    barcode_value = models.CharField(
+        max_length=64,
+        unique=True,
+        db_index=True,
+        help_text='System-wide unique identifier printed on the label and scanned in workflow.',
+    )
+    label_index = models.PositiveSmallIntegerField(
+        help_text='1-based position of this label within the batch.',
+    )
+    family_name = models.CharField(
+        max_length=150,
+        blank=True,
+        default='',
+        help_text='Exam family this label is pinned to; empty for the fixed extras.',
+    )
+
+    class Meta:
+        verbose_name = 'Request Label'
+        verbose_name_plural = 'Request Labels'
+        ordering = ['batch', 'label_index']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['batch', 'label_index'],
+                name='unique_label_index_per_batch',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['batch', 'label_index']),
+        ]
+
+    def __str__(self):
+        return f'{self.barcode_value} ({self.label_index}/{self.batch.label_count})'
+
+    def delete(self, *args, **kwargs):
+        raise PermissionError(
+            'Request labels cannot be deleted — they are traceability records.'
+        )

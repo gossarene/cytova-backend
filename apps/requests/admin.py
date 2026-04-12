@@ -29,7 +29,7 @@ class AnalysisRequestAdmin(admin.ModelAdmin):
     )
     list_filter = ('status', 'source_type', 'billing_mode')
     search_fields = ('request_number', 'patient__first_name', 'patient__last_name',
-                     'patient__national_id', 'external_reference',
+                     'patient__document_number', 'external_reference',
                      'partner_organization__code', 'partner_organization__name')
     readonly_fields = (
         'id', 'request_number', 'patient', 'status',

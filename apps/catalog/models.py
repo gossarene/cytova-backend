@@ -1,24 +1,30 @@
 """
 Cytova — Catalog Models
 
-ExamCategory
-    Flat grouping of exam definitions (Hematology, Biochemistry, etc.).
-    Ordered by display_order then name. Name is unique within the tenant.
+ExamFamily
+    Primary classification of exam definitions (Hematology, Biochemistry, etc.).
+    Replaces the former ExamCategory concept with lab-standard terminology.
+
+ExamSubFamily
+    Optional secondary classification within a family.
+
+TubeType
+    Specimen collection tube type (EDTA, Citrate, Dry, etc.).
+
+ExamTechnique
+    Laboratory technique used to perform the analysis (PCR, Immunoassay, etc.).
 
 ExamDefinition
-    Reusable template for one type of exam: code, sample type, turnaround time.
+    Reusable template for one type of exam: code, sample type, family,
+    tube type, technique, fasting requirement, turnaround time.
     Code is unique within the tenant and is immutable once referenced by an
     exam item. Hard delete is blocked — use deactivation.
 
 LabExamSettings
-    Per-lab customisation of an exam definition: reference range, turnaround
-    override, enabled flag, internal notes. One record per exam per tenant
-    (enforced via OneToOneField). Created/replaced atomically via PUT.
+    Per-lab customisation of an exam definition.
 
 PricingRule
-    Contextual pricing rule targeting an exam definition, optionally scoped to a
-    partner organization and/or source type. Rules are resolved by specificity at
-    request item creation time. Supports fixed prices and percentage discounts.
+    Contextual pricing rule targeting an exam definition.
 """
 import uuid
 from django.db import models
@@ -38,10 +44,87 @@ class SampleType(models.TextChoices):
     OTHER = 'OTHER', 'Other'
 
 
+# ---------------------------------------------------------------------------
+# Reference models (lookup tables)
+# ---------------------------------------------------------------------------
+
+class ExamFamily(BaseModel):
+    """Primary exam classification (replaces ExamCategory)."""
+    name = models.CharField(max_length=150, unique=True)
+    description = models.TextField(blank=True, default='')
+    display_order = models.IntegerField(default=0, db_index=True)
+    is_active = models.BooleanField(default=True, db_index=True)
+
+    class Meta:
+        verbose_name = 'Exam Family'
+        verbose_name_plural = 'Exam Families'
+        ordering = ['display_order', 'name']
+
+    def __str__(self):
+        return self.name
+
+
+class ExamSubFamily(BaseModel):
+    """Optional secondary classification within a family."""
+    family = models.ForeignKey(
+        ExamFamily,
+        on_delete=models.CASCADE,
+        related_name='sub_families',
+    )
+    name = models.CharField(max_length=150)
+    is_active = models.BooleanField(default=True, db_index=True)
+
+    class Meta:
+        verbose_name = 'Exam Sub-Family'
+        verbose_name_plural = 'Exam Sub-Families'
+        ordering = ['family__display_order', 'name']
+        constraints = [
+            models.UniqueConstraint(fields=['family', 'name'], name='unique_subfamily_per_family'),
+        ]
+
+    def __str__(self):
+        return f'{self.family.name} > {self.name}'
+
+
+class TubeType(BaseModel):
+    """Specimen collection tube type."""
+    name = models.CharField(max_length=100, unique=True)
+    description = models.TextField(blank=True, default='')
+    is_active = models.BooleanField(default=True, db_index=True)
+
+    class Meta:
+        verbose_name = 'Tube Type'
+        verbose_name_plural = 'Tube Types'
+        ordering = ['name']
+
+    def __str__(self):
+        return self.name
+
+
+class ExamTechnique(BaseModel):
+    """Laboratory technique used to perform an analysis."""
+    name = models.CharField(max_length=150, unique=True)
+    description = models.TextField(blank=True, default='')
+    is_active = models.BooleanField(default=True, db_index=True)
+
+    class Meta:
+        verbose_name = 'Exam Technique'
+        verbose_name_plural = 'Exam Techniques'
+        ordering = ['name']
+
+    def __str__(self):
+        return self.name
+
+
+# ---------------------------------------------------------------------------
+# Legacy model kept for backward compatibility during migration
+# ---------------------------------------------------------------------------
+
 class ExamCategory(BaseModel):
     """
-    Thematic grouping for exam definitions.
-    Ordering is controlled by display_order (ascending), then name.
+    DEPRECATED — replaced by ExamFamily.
+    Kept temporarily so existing migrations and FK references remain valid
+    until full data migration is complete.
     """
     name = models.CharField(max_length=150, unique=True)
     description = models.TextField(blank=True, default='')
@@ -57,22 +140,63 @@ class ExamCategory(BaseModel):
         return self.name
 
 
+# ---------------------------------------------------------------------------
+# ExamDefinition
+# ---------------------------------------------------------------------------
+
 class ExamDefinition(BaseModel):
     """
     Reusable descriptor for one exam type.
 
     `code` is a short identifier used in external reporting and integrations.
     It is unique within the tenant and must not change once an exam item
-    references this definition (enforced at service layer).
+    references this definition.
 
-    Hard delete is blocked — deactivate instead. The PROTECT on the category FK
-    prevents deleting a category that has exams.
+    Hard delete is blocked — deactivate instead.
     """
+    # Legacy FK — kept until data migration removes it
     category = models.ForeignKey(
         ExamCategory,
         on_delete=models.PROTECT,
         related_name='exams',
+        null=True,
+        blank=True,
     )
+
+    # New structured classification
+    family = models.ForeignKey(
+        ExamFamily,
+        on_delete=models.PROTECT,
+        related_name='exam_definitions',
+        null=True,
+        blank=True,
+    )
+    sub_family = models.ForeignKey(
+        ExamSubFamily,
+        on_delete=models.SET_NULL,
+        related_name='exams',
+        null=True,
+        blank=True,
+    )
+    tube_type = models.ForeignKey(
+        TubeType,
+        on_delete=models.SET_NULL,
+        related_name='exams',
+        null=True,
+        blank=True,
+    )
+    technique = models.ForeignKey(
+        ExamTechnique,
+        on_delete=models.SET_NULL,
+        related_name='exams',
+        null=True,
+        blank=True,
+    )
+    fasting_required = models.BooleanField(
+        default=False,
+        help_text='Whether the patient must fast before specimen collection.',
+    )
+
     code = models.CharField(max_length=50, unique=True, db_index=True)
     name = models.CharField(max_length=255)
     sample_type = models.CharField(
@@ -83,7 +207,7 @@ class ExamDefinition(BaseModel):
     turnaround_hours = models.PositiveIntegerField(
         null=True,
         blank=True,
-        help_text='Expected hours from sample receipt to result. Overridable per lab via LabExamSettings.',
+        help_text='Expected hours from sample receipt to result.',
     )
     description = models.TextField(blank=True, default='')
     unit_price = models.DecimalField(
@@ -97,48 +221,32 @@ class ExamDefinition(BaseModel):
     class Meta:
         verbose_name = 'Exam Definition'
         verbose_name_plural = 'Exam Definitions'
-        ordering = ['category__display_order', 'name']
+        ordering = ['family__display_order', 'name']
 
     def __str__(self):
         return f'[{self.code}] {self.name}'
 
     def delete(self, *args, **kwargs):
-        """Block hard delete. Service layer enforces deactivation-only via API."""
         raise PermissionError(
             'Exam definitions cannot be deleted. Use deactivation instead.'
         )
 
 
-class LabExamSettings(models.Model):
-    """
-    Per-tenant customisation of an exam definition.
+# ---------------------------------------------------------------------------
+# LabExamSettings (unchanged)
+# ---------------------------------------------------------------------------
 
-    Acts as an extension record: the base definition holds canonical values;
-    this record holds lab-specific overrides. Created via PUT (upsert semantics).
-    No created_at — updated_at captures the last modification timestamp.
-    """
+class LabExamSettings(models.Model):
+    """Per-tenant customisation of an exam definition."""
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     exam_definition = models.OneToOneField(
         ExamDefinition,
         on_delete=models.CASCADE,
         related_name='lab_settings',
     )
-    reference_range = models.CharField(
-        max_length=100,
-        blank=True,
-        default='',
-        help_text='Lab-specific normal range, e.g. "3.5–5.0 mmol/L".',
-    )
-    turnaround_hours_override = models.PositiveIntegerField(
-        null=True,
-        blank=True,
-        help_text='Overrides exam_definition.turnaround_hours for this lab.',
-    )
-    is_enabled = models.BooleanField(
-        default=True,
-        db_index=True,
-        help_text='Set to False to hide this exam from this lab\'s ordering workflow.',
-    )
+    reference_range = models.CharField(max_length=100, blank=True, default='')
+    turnaround_hours_override = models.PositiveIntegerField(null=True, blank=True)
+    is_enabled = models.BooleanField(default=True, db_index=True)
     internal_notes = models.TextField(blank=True, default='')
     updated_by = models.ForeignKey(
         'users.StaffUser',
@@ -156,32 +264,17 @@ class LabExamSettings(models.Model):
         return f'Settings for {self.exam_definition}'
 
 
+# ---------------------------------------------------------------------------
+# PricingRule (unchanged)
+# ---------------------------------------------------------------------------
+
 class PricingType(models.TextChoices):
     FIXED_PRICE = 'FIXED_PRICE', 'Fixed Price'
     PERCENTAGE_DISCOUNT = 'PERCENTAGE_DISCOUNT', 'Percentage Discount'
 
 
 class PricingRule(BaseModel):
-    """
-    Contextual pricing rule for an exam definition.
-
-    Rules are matched by specificity when resolving the billed price for a
-    request item:
-        1. exam + partner_organization  (most specific)
-        2. exam + source_type
-        3. exam only  (broadest)
-
-    Within the same specificity level, higher ``priority`` wins, then most
-    recently created as tiebreaker.
-
-    ``pricing_type`` determines how ``value`` is interpreted:
-        - FIXED_PRICE: ``value`` is the absolute billed price.
-        - PERCENTAGE_DISCOUNT: ``value`` is a percentage off the exam unit_price.
-
-    Optional date bounds (``start_date`` / ``end_date``) restrict the rule's
-    active period. Both default to NULL (always active). ``is_active`` provides
-    a quick on/off toggle.
-    """
+    """Contextual pricing rule for an exam definition."""
     exam_definition = models.ForeignKey(
         ExamDefinition,
         on_delete=models.PROTECT,
@@ -193,40 +286,18 @@ class PricingRule(BaseModel):
         null=True,
         blank=True,
         related_name='pricing_rules',
-        help_text='Set to target a specific partner. NULL = not partner-specific.',
     )
-    source_type = models.CharField(
-        max_length=25,
-        blank=True,
-        default='',
-        help_text='DIRECT_PATIENT or PARTNER_ORGANIZATION. Empty = any source type.',
-    )
+    source_type = models.CharField(max_length=25, blank=True, default='')
     pricing_type = models.CharField(
         max_length=25,
         choices=PricingType.choices,
         default=PricingType.FIXED_PRICE,
     )
-    value = models.DecimalField(
-        max_digits=12,
-        decimal_places=4,
-        help_text=(
-            'For FIXED_PRICE: the absolute billed price. '
-            'For PERCENTAGE_DISCOUNT: the discount percentage (e.g. 10 = 10%% off).'
-        ),
-    )
-    priority = models.IntegerField(
-        default=0,
-        help_text='Higher value = higher priority within the same specificity level.',
-    )
+    value = models.DecimalField(max_digits=12, decimal_places=4)
+    priority = models.IntegerField(default=0)
     is_active = models.BooleanField(default=True, db_index=True)
-    start_date = models.DateField(
-        null=True, blank=True,
-        help_text='Rule is active from this date (inclusive). NULL = no lower bound.',
-    )
-    end_date = models.DateField(
-        null=True, blank=True,
-        help_text='Rule is active until this date (inclusive). NULL = no upper bound.',
-    )
+    start_date = models.DateField(null=True, blank=True)
+    end_date = models.DateField(null=True, blank=True)
     notes = models.TextField(blank=True, default='')
     created_by = models.ForeignKey(
         'users.StaffUser',

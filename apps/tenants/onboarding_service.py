@@ -120,16 +120,21 @@ class OnboardingService:
         Create default data in the newly provisioned tenant schema.
         Called inside schema_context of the new tenant.
         """
-        from apps.catalog.models import ExamCategory
+        from apps.catalog.models import ExamCategory, ExamFamily
 
-        default_categories = [
+        default_families = [
             ('Hematology', 1),
             ('Biochemistry', 2),
             ('Microbiology', 3),
             ('Immunology', 4),
             ('Parasitology', 5),
         ]
-        for name, order in default_categories:
+        for name, order in default_families:
+            ExamFamily.objects.get_or_create(
+                name=name,
+                defaults={'display_order': order},
+            )
+            # Legacy category kept for backward compatibility
             ExamCategory.objects.get_or_create(
                 name=name,
                 defaults={'display_order': order},

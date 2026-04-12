@@ -69,7 +69,7 @@ class DashboardOverviewView(APIView):
         from apps.alerts.models import AlertSeverity, InventoryAlert, OPEN_STATUSES
         from apps.patients.models import Patient
         from apps.requests.models import AnalysisRequest, RequestStatus, SourceType
-        from apps.results.models import ExamResult, ResultStatus
+        from apps.results.models import ResultVersion, ResultStatus
         from apps.stock.models import StockItem, StockLot
         from apps.suppliers.models import PurchaseOrder, RECEIVABLE_STATUSES
 
@@ -98,10 +98,11 @@ class DashboardOverviewView(APIView):
         ).count()
 
         # ---- results ----
-        pending_validation = ExamResult.objects.filter(
-            status=ResultStatus.PENDING_VALIDATION,
+        pending_validation = ResultVersion.objects.filter(
+            status=ResultStatus.SUBMITTED,
+            is_current=True,
         ).count()
-        published_month = ExamResult.objects.filter(
+        published_month = ResultVersion.objects.filter(
             published_at__date__gte=start_of_month,
         ).count()
 
@@ -416,22 +417,22 @@ class DashboardResultsView(APIView):
     permission_classes = [IsAnyStaff]
 
     def get(self, request):
-        from apps.results.models import ExamResult, ResultStatus
+        from apps.results.models import ResultVersion, ResultStatus
 
         today, start_of_week, start_of_month = _period_boundaries()
 
         status_breakdown = _status_breakdown(
-            ExamResult.objects
+            ResultVersion.objects
             .values('status')
             .annotate(count=Count('id'))
         )
 
-        abnormal_published = ExamResult.objects.filter(
+        abnormal_published = ResultVersion.objects.filter(
             status=ResultStatus.PUBLISHED,
             is_abnormal=True,
         ).count()
 
-        pub_base = ExamResult.objects.filter(
+        pub_base = ResultVersion.objects.filter(
             status=ResultStatus.PUBLISHED,
         )
 

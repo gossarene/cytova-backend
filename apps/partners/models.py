@@ -19,8 +19,15 @@ PartnerOrganization
 
     Hard delete is blocked — use deactivation. Partners are referenced
     from analysis requests and future billing records.
+
+PartnerExamPrice
+    Agreed price negotiated between a partner and the lab for a given
+    exam definition. Referenced by request creation (in a future step)
+    to resolve ``billed_price`` automatically when the request source is
+    PARTNER_ORGANIZATION.
 """
 from django.db import models
+from django.db.models import Q
 
 from common.models import BaseModel
 
@@ -97,3 +104,82 @@ class PartnerOrganization(BaseModel):
         raise PermissionError(
             'Partner organizations cannot be deleted. Use deactivation instead.'
         )
+
+
+class PartnerExamPrice(BaseModel):
+    """
+    Negotiated price for a specific (partner, exam_definition) pair.
+
+    Intended consumption (implementation lives in a future step):
+        - DIRECT_PATIENT requests → use ``ExamDefinition.unit_price``
+        - PARTNER_ORGANIZATION requests → if an ACTIVE PartnerExamPrice
+          exists for (partner, exam_definition), use its ``agreed_price``;
+          otherwise fall back to ``ExamDefinition.unit_price``
+
+    Historical integrity
+    --------------------
+    ``AnalysisRequestItem`` snapshots ``unit_price`` and ``billed_price``
+    into its own columns at item creation time. Changing ``agreed_price``
+    here therefore does **not** retroactively touch any existing request
+    item — only future requests pick up the new value. The guarantee is
+    enforced by the data model of requests, not by this module, which
+    means this reference table is free to evolve without extra
+    migration or backfill logic.
+
+    Uniqueness
+    ----------
+    At most **one active** row per (partner, exam_definition) pair. The
+    constraint is scoped to ``is_active=True`` (a partial unique index)
+    so deactivated rows accumulate as history — the lab can deactivate
+    an old agreed price and create a new one without losing the audit
+    trail, and can reactivate an older negotiation as long as no other
+    active row collides.
+    """
+    partner = models.ForeignKey(
+        PartnerOrganization,
+        on_delete=models.PROTECT,
+        related_name='exam_prices',
+    )
+    exam_definition = models.ForeignKey(
+        'catalog.ExamDefinition',
+        on_delete=models.PROTECT,
+        related_name='partner_prices',
+    )
+    agreed_price = models.DecimalField(
+        max_digits=12,
+        decimal_places=4,
+        help_text='Negotiated unit price applied to requests from this partner.',
+    )
+    notes = models.TextField(
+        blank=True,
+        default='',
+        help_text='Internal notes about the negotiation context or rationale.',
+    )
+    is_active = models.BooleanField(default=True, db_index=True)
+
+    class Meta:
+        verbose_name = 'Partner Exam Price'
+        verbose_name_plural = 'Partner Exam Prices'
+        ordering = ['-created_at']
+        constraints = [
+            # One active row per (partner, exam) pair. Deactivated rows
+            # are excluded so history can coexist with a fresh
+            # renegotiation. Enforced at the DB level — a race that
+            # slips past serializer validation still hits this.
+            models.UniqueConstraint(
+                fields=['partner', 'exam_definition'],
+                condition=Q(is_active=True),
+                name='unique_active_partner_exam_price',
+            ),
+            models.CheckConstraint(
+                check=Q(agreed_price__gte=0),
+                name='partner_exam_price_non_negative',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['partner', 'is_active']),
+            models.Index(fields=['exam_definition', 'is_active']),
+        ]
+
+    def __str__(self):
+        return f'{self.partner.code} → {self.exam_definition.code} @ {self.agreed_price}'

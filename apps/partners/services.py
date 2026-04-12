@@ -1,15 +1,19 @@
 """
 Cytova — Partner Organization Service
 
-All business logic and audit logging for partner organizations.
+All business logic and audit logging for partner organizations and their
+agreed pricing configurations.
 
 PartnerOrganizationService: create, update, deactivate
+PartnerExamPriceService: create, update, deactivate, reactivate
 """
 import logging
 
+from rest_framework.exceptions import ValidationError
+
 from apps.audit.models import AuditAction, AuditLog, ActorType
 from apps.users.models import StaffUser
-from .models import PartnerOrganization
+from .models import PartnerExamPrice, PartnerOrganization
 
 logger = logging.getLogger(__name__)
 
@@ -103,3 +107,149 @@ class PartnerOrganizationService:
         )
 
         return partner
+
+
+# ---------------------------------------------------------------------------
+# PartnerExamPrice
+#
+# Follows the same shape as the catalog reference services: create / update
+# / deactivate / reactivate, every write producing one AuditLog row. All
+# uniqueness and reactivation-conflict guards live here so the viewset
+# stays a thin HTTP wrapper and the data model's partial unique constraint
+# is the last line of defense (race-safe).
+# ---------------------------------------------------------------------------
+
+class PartnerExamPriceService:
+    ENTITY = 'PartnerExamPrice'
+
+    @staticmethod
+    def create(
+        partner: PartnerOrganization,
+        validated_data: dict,
+        created_by: StaffUser,
+        request,
+    ) -> PartnerExamPrice:
+        price = PartnerExamPrice(
+            partner=partner,
+            exam_definition_id=validated_data['exam_definition_id'],
+            agreed_price=validated_data['agreed_price'],
+            notes=validated_data.get('notes', ''),
+        )
+        price.save()
+
+        _audit(
+            actor=created_by,
+            action=AuditAction.CREATE,
+            entity_type=PartnerExamPriceService.ENTITY,
+            entity_id=price.id,
+            diff={'after': {
+                'partner_id': str(partner.id),
+                'exam_definition_id': str(price.exam_definition_id),
+                'agreed_price': str(price.agreed_price),
+            }},
+            request=request,
+        )
+        return price
+
+    @staticmethod
+    def update(
+        price: PartnerExamPrice,
+        validated_data: dict,
+        updated_by: StaffUser,
+        request,
+    ) -> PartnerExamPrice:
+        """
+        Partial update of the negotiated price or notes. Changing
+        ``agreed_price`` here never touches existing ``AnalysisRequestItem``
+        rows — those snapshot ``billed_price`` at creation time, so the
+        historical-integrity guarantee is enforced by the request data
+        model, not by this service.
+        """
+        if not validated_data:
+            return price
+
+        before = {k: getattr(price, k) for k in validated_data}
+
+        for field, value in validated_data.items():
+            setattr(price, field, value)
+        price.save(update_fields=list(validated_data.keys()) + ['updated_at'])
+
+        after = {k: getattr(price, k) for k in validated_data}
+
+        _audit(
+            actor=updated_by,
+            action=AuditAction.UPDATE,
+            entity_type=PartnerExamPriceService.ENTITY,
+            entity_id=price.id,
+            diff={
+                'before': {k: str(v) if v is not None else None for k, v in before.items()},
+                'after': {k: str(v) if v is not None else None for k, v in after.items()},
+            },
+            request=request,
+        )
+        return price
+
+    @staticmethod
+    def deactivate(
+        price: PartnerExamPrice,
+        deactivated_by: StaffUser,
+        request,
+    ) -> PartnerExamPrice:
+        if not price.is_active:
+            return price
+
+        price.is_active = False
+        price.save(update_fields=['is_active', 'updated_at'])
+
+        _audit(
+            actor=deactivated_by,
+            action=AuditAction.DEACTIVATE,
+            entity_type=PartnerExamPriceService.ENTITY,
+            entity_id=price.id,
+            diff={'after': {'is_active': False}},
+            request=request,
+        )
+        return price
+
+    @staticmethod
+    def reactivate(
+        price: PartnerExamPrice,
+        reactivated_by: StaffUser,
+        request,
+    ) -> PartnerExamPrice:
+        """
+        Flip an inactive row back to active. Rejects the call if another
+        active row already exists for the same (partner, exam) pair —
+        otherwise the partial unique constraint at the DB level would
+        raise an IntegrityError. This gives the caller a clean 400 with
+        an actionable message instead of a 500.
+        """
+        if price.is_active:
+            return price
+
+        conflict = PartnerExamPrice.objects.filter(
+            partner_id=price.partner_id,
+            exam_definition_id=price.exam_definition_id,
+            is_active=True,
+        ).exclude(pk=price.pk).exists()
+        if conflict:
+            raise ValidationError({
+                'is_active': (
+                    'Another active agreed price already exists for this '
+                    'partner and exam. Deactivate it first before '
+                    'reactivating this row.'
+                ),
+            })
+
+        price.is_active = True
+        price.save(update_fields=['is_active', 'updated_at'])
+
+        _audit(
+            actor=reactivated_by,
+            action=AuditAction.REACTIVATE,
+            entity_type=PartnerExamPriceService.ENTITY,
+            entity_id=price.id,
+            diff={'before': {'is_active': False}, 'after': {'is_active': True}},
+            request=request,
+        )
+        return price

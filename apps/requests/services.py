@@ -27,12 +27,12 @@ from rest_framework.exceptions import ValidationError
 
 from apps.audit.models import AuditLog, AuditAction, ActorType
 from apps.catalog.models import ExamDefinition
-from apps.catalog.services import PricingResolver
 from apps.users.models import StaffUser
 from .models import (
     AnalysisRequest, AnalysisRequestItem, ExamTraceability,
     RequestStatus, ItemStatus, ExecutionMode, PriceSource,
 )
+from .pricing import RequestPricingResolver
 from .state_machine import RequestStateMachine, ItemStateMachine
 
 logger = logging.getLogger(__name__)
@@ -62,10 +62,21 @@ def _resolve_item_pricing(item: AnalysisRequestItem, analysis_request: AnalysisR
     """
     Set pricing fields on a newly created or updated item.
 
-    1. If execution_mode is REJECTED: unit_price=0, billed_price=0, no source.
-    2. If manual_billed_price is provided: use it, set source=MANUAL_OVERRIDE.
-    3. Else resolve from PricingRule: if found, compute billed_price, set source=PRICING_RULE.
-    4. Else fallback: billed_price = unit_price, source=DEFAULT_PRICE.
+    The decision tree for the 3-step request workflow is:
+
+    1. ``execution_mode == REJECTED`` → zero prices, source=DEFAULT_PRICE.
+       Rejected items bill zero regardless of any other configuration.
+    2. ``manual_billed_price`` provided (legacy draft-edit escape hatch) →
+       use it, source=MANUAL_OVERRIDE. The new 3-step flow does not pass
+       this path; it exists only for the legacy direct-item-edit API.
+    3. Otherwise → delegate to ``RequestPricingResolver``. The resolver
+       enforces the authoritative rules:
+           - DIRECT_PATIENT      → billed = unit_price
+           - PARTNER_ORGANIZATION → billed = agreed_price if any else unit_price
+
+    Note: ``PricingRule`` (catalog-level rule system) is intentionally NOT
+    consulted here. The new workflow treats ``PartnerExamPrice`` as the
+    single commercial-pricing reference for partner sources.
     """
     exam = item.exam_definition
 
@@ -76,30 +87,25 @@ def _resolve_item_pricing(item: AnalysisRequestItem, analysis_request: AnalysisR
         item.price_source = PriceSource.DEFAULT_PRICE
         return
 
-    # Always snapshot the reference price
-    item.unit_price = exam.unit_price
-
     if manual_billed_price is not None:
+        item.unit_price = exam.unit_price
         item.billed_price = manual_billed_price
         item.pricing_rule = None
         item.price_source = PriceSource.MANUAL_OVERRIDE
         return
 
-    # Resolve contextual pricing rule
-    rule = PricingResolver.resolve(
-        exam_definition=exam,
-        partner_organization=analysis_request.partner_organization,
+    # Default path — the new resolver. One resolver call per item is fine
+    # here; bulk paths (preview, inline create) batch their lookups at the
+    # service-method level.
+    [resolved] = RequestPricingResolver.resolve(
         source_type=analysis_request.source_type,
+        partner=analysis_request.partner_organization,
+        exams=[exam],
     )
-
-    if rule:
-        item.billed_price = PricingResolver.compute_billed_price(rule, exam.unit_price)
-        item.pricing_rule = rule
-        item.price_source = PriceSource.PRICING_RULE
-    else:
-        item.billed_price = exam.unit_price
-        item.pricing_rule = None
-        item.price_source = PriceSource.DEFAULT_PRICE
+    item.unit_price = resolved.unit_price
+    item.billed_price = resolved.billed_price
+    item.pricing_rule = None
+    item.price_source = resolved.price_source
 
 
 def _create_item_with_traceability(
@@ -137,15 +143,49 @@ def _create_item_with_traceability(
 class AnalysisRequestService:
 
     @staticmethod
+    def preview_pricing(
+        source_type: str,
+        partner,
+        exam_ids: list,
+    ) -> list:
+        """
+        Resolve pricing for a set of exams under a given source WITHOUT
+        persisting anything. Used by the Step 3 recap to surface the same
+        values the final ``create`` call will snapshot.
+
+        The guarantee "preview matches final" is structural: both code
+        paths call ``RequestPricingResolver`` with the same inputs, so
+        they cannot drift.
+        """
+        return RequestPricingResolver.resolve_for_ids(
+            source_type=source_type,
+            partner=partner,
+            exam_ids=exam_ids,
+        )
+
+    @staticmethod
     @transaction.atomic
     def create(
         validated_data: dict,
         created_by: StaffUser,
         request,
+        confirm_after: bool = False,
     ) -> AnalysisRequest:
         """
-        Create a DRAFT analysis request with optional inline items.
-        request_number is assigned immediately after the first save.
+        Create an analysis request with optional inline items.
+
+        By default the result is in ``DRAFT`` status — compatible with
+        legacy draft-edit flows where items are added incrementally and
+        the client confirms later via ``POST /requests/:id/confirm/``.
+
+        When ``confirm_after=True`` the request is created AND transitioned
+        to ``CONFIRMED`` in the same atomic transaction, reusing the
+        existing ``AnalysisRequestService.confirm`` code path. This is the
+        mode used by the 3-step creation wizard whose final button
+        semantically means "commit this request". The decorator's
+        atomicity guarantees that a failure during confirmation rolls
+        back the whole create+confirm pair — there is no half-created
+        draft orphan if the confirm step raises.
         """
         items_data = validated_data.pop('items', [])
 
@@ -184,6 +224,19 @@ class AnalysisRequestService:
             }},
             request=request,
         )
+
+        if confirm_after:
+            # Reuse the existing confirm service verbatim so the audit
+            # trail contains one CREATE entry followed by one CONFIRM
+            # entry, and so any future change to confirm's rules (item
+            # locking, state-machine coherence, auto-complete, etc.)
+            # automatically applies to the 3-step flow without needing
+            # a second code path to keep in sync.
+            ar = AnalysisRequestService.confirm(
+                analysis_request=ar,
+                confirmed_by=created_by,
+                request=request,
+            )
 
         return ar
 
@@ -381,6 +434,50 @@ class AnalysisRequestService:
 
         return analysis_request
 
+    @staticmethod
+    @transaction.atomic
+    def finalize_validation(
+        analysis_request: AnalysisRequest,
+        finalized_by: StaffUser,
+        request,
+    ) -> AnalysisRequest:
+        """
+        Explicit biologist action to finalize the request after all
+        items have been individually validated.
+
+        Only allowed when the request is in READY_FOR_RELEASE.
+        Transitions the request to VALIDATED, which locks it against
+        further review modifications.
+        """
+        if analysis_request.status != RequestStatus.READY_FOR_RELEASE:
+            raise ValidationError(
+                'Request can only be finalized when all items are '
+                'validated and the request is in Ready For Release state '
+                f'(current: {analysis_request.status}).'
+            )
+
+        RequestStateMachine.transition(
+            analysis_request, RequestStatus.VALIDATED,
+        )
+        analysis_request.save(update_fields=['status', 'updated_at'])
+
+        _audit(
+            actor=finalized_by,
+            action=AuditAction.VALIDATE,
+            entity_type='AnalysisRequest',
+            entity_id=analysis_request.id,
+            diff={
+                'before': {'status': RequestStatus.READY_FOR_RELEASE},
+                'after': {
+                    'status': RequestStatus.VALIDATED,
+                    'finalized_by': str(finalized_by.id),
+                },
+            },
+            request=request,
+        )
+
+        return analysis_request
+
 
 # ---------------------------------------------------------------------------
 # AnalysisRequestItemService
@@ -544,7 +641,179 @@ class AnalysisRequestItemService:
         )
 
         AnalysisRequestItemService._auto_advance(item.analysis_request, rejected_by, request)
+        # A rejection before collection can change the "all active
+        # items collected" count, so re-derive the request-level
+        # status the same way mark_collected would.
+        AnalysisRequestItemService._refresh_collection_status(
+            item.analysis_request, actor=rejected_by, request=request,
+        )
         return item
+
+    @staticmethod
+    @transaction.atomic
+    def mark_collected(
+        item: AnalysisRequestItem,
+        collected_by: StaffUser,
+        request,
+        collection_notes: str = '',
+    ) -> AnalysisRequestItem:
+        """
+        Mark an analysis request item as collected.
+
+        Conceptual permission: ``requests.collection_mark`` — enforced
+        in the view layer by ``IsTechnicianOrAbove``, the class-based
+        equivalent in this project's RBAC system.
+
+        Semantics:
+            - PENDING → COLLECTED (via the state machine)
+            - Writes ``collected_at`` + ``collected_by`` as a permanent
+              traceability record.
+            - Triggers a centralized refresh of the parent request's
+              status via ``_refresh_collection_status``.
+
+        Idempotency:
+            - If the item is already COLLECTED, the call is a safe
+              no-op and returns the item unchanged. No duplicate audit
+              entry, no overwrite of the original ``collected_at`` /
+              ``collected_by``.
+
+        Guardrails:
+            - Only items whose parent request is in a collection-eligible
+              state (CONFIRMED or COLLECTION_IN_PROGRESS) may be
+              collected. Drafts, cancelled, already-in-analysis, or
+              fully-completed requests reject.
+            - Only items in PENDING status may be marked collected.
+              Items already in IN_PROGRESS, COMPLETED, or REJECTED
+              cannot be walked back to COLLECTED — that would rewrite
+              the traceability chain.
+        """
+        ar = item.analysis_request
+
+        # Idempotency check FIRST — a re-invocation on an
+        # already-collected item must be a safe no-op regardless of
+        # the current request status. For a single-item request the
+        # first call transitions the parent to IN_ANALYSIS, so without
+        # this ordering the second call would fail the request-state
+        # guard below even though the item itself has not moved.
+        if item.status == ItemStatus.COLLECTED:
+            return item
+
+        if ar.status not in {
+            RequestStatus.CONFIRMED,
+            RequestStatus.COLLECTION_IN_PROGRESS,
+        }:
+            raise ValidationError(
+                'Specimens can only be collected while the request is '
+                'CONFIRMED or COLLECTION_IN_PROGRESS '
+                f"(current status: {ar.status}).",
+            )
+
+        if item.status != ItemStatus.PENDING:
+            raise ValidationError(
+                f'Only pending items can be marked as collected '
+                f"(item status: {item.status}).",
+            )
+
+        ItemStateMachine.transition(item, ItemStatus.COLLECTED)
+        item.collected_at = timezone.now()
+        item.collected_by = collected_by
+        if collection_notes:
+            item.collection_notes = collection_notes
+        item.save(update_fields=[
+            'status', 'collected_at', 'collected_by',
+            'collection_notes', 'updated_at',
+        ])
+
+        _audit(
+            actor=collected_by,
+            action=AuditAction.UPDATE,
+            entity_type='AnalysisRequestItem',
+            entity_id=item.id,
+            diff={
+                'before': {'status': ItemStatus.PENDING},
+                'after': {
+                    'status': ItemStatus.COLLECTED,
+                    'collected_at': item.collected_at.isoformat(),
+                    'collected_by': str(collected_by.id),
+                },
+            },
+            request=request,
+        )
+
+        AnalysisRequestItemService._refresh_collection_status(
+            ar, actor=collected_by, request=request,
+        )
+        return item
+
+    @staticmethod
+    def _refresh_collection_status(
+        analysis_request: AnalysisRequest,
+        actor: StaffUser,
+        request,
+    ) -> None:
+        """
+        Derive the parent request's status from the current collection
+        progress of its items. This is the **single place** where the
+        request lifecycle rule
+        "`CONFIRMED` ↔ `COLLECTION_IN_PROGRESS` ↔ `IN_ANALYSIS`" lives,
+        so the rule cannot drift between code paths.
+
+        Rules (rejected items are excluded from both numerator and
+        denominator — they are operationally "done" and do not block
+        progress):
+
+            active = items where status != REJECTED
+            collected = items where status in (COLLECTED, IN_PROGRESS, COMPLETED)
+
+            if not active          → no change (nothing to analyse)
+            if all active collected → request → IN_ANALYSIS
+            if some collected      → request → COLLECTION_IN_PROGRESS
+            else                    → no change
+
+        A transition is only attempted if the target status is different
+        from the current one, so repeated calls on a stable population
+        are cheap no-ops.
+        """
+        items = list(analysis_request.items.all())
+        active = [i for i in items if i.status != ItemStatus.REJECTED]
+        if not active:
+            return
+
+        # Items that have reached or passed the collection milestone.
+        # All states beyond PENDING satisfy the "has been collected" predicate.
+        collected_or_beyond = {
+            ItemStatus.COLLECTED, ItemStatus.RESULT_ENTERED,
+            ItemStatus.UNDER_REVIEW, ItemStatus.VALIDATED,
+            ItemStatus.IN_PROGRESS, ItemStatus.COMPLETED,
+        }
+        collected = [i for i in active if i.status in collected_or_beyond]
+
+        def _transition_to(target: str) -> None:
+            if analysis_request.status == target:
+                return
+            prev = analysis_request.status
+            RequestStateMachine.transition(analysis_request, target)
+            analysis_request.save(update_fields=['status', 'updated_at'])
+            _audit(
+                actor=actor,
+                action=AuditAction.UPDATE,
+                entity_type='AnalysisRequest',
+                entity_id=analysis_request.id,
+                diff={
+                    'before': {'status': prev},
+                    'after': {
+                        'status': target,
+                        'reason': 'collection_progress',
+                    },
+                },
+                request=request,
+            )
+
+        if len(collected) == len(active):
+            _transition_to(RequestStatus.IN_ANALYSIS)
+        elif collected:
+            _transition_to(RequestStatus.COLLECTION_IN_PROGRESS)
+        # else: zero collected → stay put (CONFIRMED by contract)
 
     @staticmethod
     def _auto_advance(
@@ -562,7 +831,11 @@ class AnalysisRequestItemService:
             return
 
         has_active = analysis_request.items.filter(
-            status__in=[ItemStatus.PENDING, ItemStatus.IN_PROGRESS]
+            status__in=[
+                ItemStatus.PENDING, ItemStatus.COLLECTED,
+                ItemStatus.RESULT_ENTERED, ItemStatus.UNDER_REVIEW,
+                ItemStatus.VALIDATED, ItemStatus.IN_PROGRESS,
+            ]
         ).exists()
         if has_active:
             return

@@ -1,10 +1,11 @@
 import django_filters
-from .models import ExamResult, ResultStatus
+from .models import ResultVersion, ResultStatus
 
 
-class ExamResultFilter(django_filters.FilterSet):
+class ResultVersionFilter(django_filters.FilterSet):
     status = django_filters.ChoiceFilter(choices=ResultStatus.choices)
     is_abnormal = django_filters.BooleanFilter()
+    is_current = django_filters.BooleanFilter()
     item_id = django_filters.UUIDFilter(field_name='item_id')
     exam_definition_id = django_filters.UUIDFilter(
         field_name='item__exam_definition_id',
@@ -23,5 +24,5 @@ class ExamResultFilter(django_filters.FilterSet):
     )
 
     class Meta:
-        model = ExamResult
-        fields = ['status', 'is_abnormal', 'item_id']
+        model = ResultVersion
+        fields = ['status', 'is_abnormal', 'is_current', 'item_id']

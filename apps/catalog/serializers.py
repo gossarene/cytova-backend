@@ -2,11 +2,202 @@
 Cytova — Catalog Serializers
 """
 from rest_framework import serializers
-from .models import ExamCategory, ExamDefinition, LabExamSettings, PricingRule, PricingType, SampleType
+from .models import (
+    ExamCategory, ExamFamily, ExamSubFamily, TubeType, ExamTechnique,
+    ExamDefinition, LabExamSettings, PricingRule, PricingType, SampleType,
+)
 
 
 # ---------------------------------------------------------------------------
-# Exam Category
+# Reference model serializers
+# ---------------------------------------------------------------------------
+
+class ExamFamilyListSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ExamFamily
+        fields = ['id', 'name', 'description', 'display_order', 'is_active', 'created_at']
+
+
+class ExamFamilyDetailSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ExamFamily
+        fields = ['id', 'name', 'description', 'display_order', 'is_active', 'created_at', 'updated_at']
+
+
+class ExamFamilyCreateSerializer(serializers.Serializer):
+    name = serializers.CharField(max_length=150)
+    description = serializers.CharField(required=False, allow_blank=True, default='')
+    display_order = serializers.IntegerField(required=False, default=0)
+
+    def validate_name(self, value):
+        if ExamFamily.objects.filter(name=value).exists():
+            raise serializers.ValidationError('A family with this name already exists.')
+        return value
+
+
+class ExamFamilyUpdateSerializer(serializers.Serializer):
+    name = serializers.CharField(max_length=150, required=False)
+    description = serializers.CharField(required=False, allow_blank=True)
+    display_order = serializers.IntegerField(required=False)
+
+    def validate_name(self, value):
+        instance = self.context.get('instance')
+        qs = ExamFamily.objects.filter(name=value)
+        if instance:
+            qs = qs.exclude(pk=instance.pk)
+        if qs.exists():
+            raise serializers.ValidationError('A family with this name already exists.')
+        return value
+
+
+class ExamSubFamilyListSerializer(serializers.ModelSerializer):
+    """Compact list/dropdown serializer for sub-families."""
+    family_name = serializers.CharField(source='family.name', read_only=True)
+
+    class Meta:
+        model = ExamSubFamily
+        fields = ['id', 'family_id', 'family_name', 'name', 'is_active', 'created_at']
+
+
+# Backwards-compatible alias: historical code (e.g. ExamDefinitionDetailSerializer)
+# imports ExamSubFamilySerializer for nested representation.
+ExamSubFamilySerializer = ExamSubFamilyListSerializer
+
+
+class ExamSubFamilyDetailSerializer(serializers.ModelSerializer):
+    family_name = serializers.CharField(source='family.name', read_only=True)
+
+    class Meta:
+        model = ExamSubFamily
+        fields = [
+            'id', 'family_id', 'family_name', 'name',
+            'is_active', 'created_at', 'updated_at',
+        ]
+
+
+class ExamSubFamilyCreateSerializer(serializers.Serializer):
+    family_id = serializers.UUIDField()
+    name = serializers.CharField(max_length=150)
+
+    def validate_family_id(self, value):
+        if not ExamFamily.objects.filter(id=value, is_active=True).exists():
+            raise serializers.ValidationError('Family not found or inactive.')
+        return value
+
+    def validate(self, attrs):
+        if ExamSubFamily.objects.filter(family_id=attrs['family_id'], name=attrs['name']).exists():
+            raise serializers.ValidationError({
+                'name': 'A sub-family with this name already exists in this family.'
+            })
+        return attrs
+
+
+class ExamSubFamilyUpdateSerializer(serializers.Serializer):
+    """
+    Partial update. family_id is intentionally immutable — moving a sub-family
+    between families would break exam references silently. Clients who need to
+    reassign must deactivate + recreate.
+    """
+    name = serializers.CharField(max_length=150, required=False)
+
+    def validate_name(self, value):
+        instance = self.context.get('instance')
+        if not instance:
+            return value
+        qs = ExamSubFamily.objects.filter(
+            family_id=instance.family_id, name=value,
+        ).exclude(pk=instance.pk)
+        if qs.exists():
+            raise serializers.ValidationError(
+                'A sub-family with this name already exists in this family.'
+            )
+        return value
+
+
+class TubeTypeSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = TubeType
+        fields = ['id', 'name', 'description', 'is_active', 'created_at']
+
+
+# Naming parity with other reference entities.
+TubeTypeListSerializer = TubeTypeSerializer
+
+
+class TubeTypeCreateSerializer(serializers.Serializer):
+    name = serializers.CharField(max_length=100)
+    description = serializers.CharField(required=False, allow_blank=True, default='')
+
+    def validate_name(self, value):
+        if TubeType.objects.filter(name=value).exists():
+            raise serializers.ValidationError('A tube type with this name already exists.')
+        return value
+
+
+class TubeTypeUpdateSerializer(serializers.Serializer):
+    name = serializers.CharField(max_length=100, required=False)
+    description = serializers.CharField(required=False, allow_blank=True)
+
+    def validate_name(self, value):
+        instance = self.context.get('instance')
+        qs = TubeType.objects.filter(name=value)
+        if instance:
+            qs = qs.exclude(pk=instance.pk)
+        if qs.exists():
+            raise serializers.ValidationError('A tube type with this name already exists.')
+        return value
+
+
+class ExamTechniqueSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ExamTechnique
+        fields = ['id', 'name', 'description', 'is_active', 'created_at']
+
+
+# Naming parity with other reference entities.
+ExamTechniqueListSerializer = ExamTechniqueSerializer
+
+
+class ExamTechniqueCreateSerializer(serializers.Serializer):
+    name = serializers.CharField(max_length=150)
+    description = serializers.CharField(required=False, allow_blank=True, default='')
+
+    def validate_name(self, value):
+        if ExamTechnique.objects.filter(name=value).exists():
+            raise serializers.ValidationError('A technique with this name already exists.')
+        return value
+
+
+class ExamTechniqueUpdateSerializer(serializers.Serializer):
+    name = serializers.CharField(max_length=150, required=False)
+    description = serializers.CharField(required=False, allow_blank=True)
+
+    def validate_name(self, value):
+        instance = self.context.get('instance')
+        qs = ExamTechnique.objects.filter(name=value)
+        if instance:
+            qs = qs.exclude(pk=instance.pk)
+        if qs.exists():
+            raise serializers.ValidationError('A technique with this name already exists.')
+        return value
+
+
+class SampleTypeSerializer(serializers.Serializer):
+    """
+    Read-only serializer for sample types.
+
+    Sample types are a fixed clinical taxonomy enforced at the model level via
+    ``SampleType.choices``. They are exposed as a structured reference list so
+    the frontend can populate dropdowns consistently, but they are intentionally
+    not writable — adding/removing a value requires a migration + code review
+    (it affects exam definitions, traceability, and reporting).
+    """
+    value = serializers.CharField()
+    label = serializers.CharField()
+
+
+# ---------------------------------------------------------------------------
+# Legacy Exam Category (kept for backward compatibility)
 # ---------------------------------------------------------------------------
 
 class ExamCategoryListSerializer(serializers.ModelSerializer):
@@ -74,26 +265,44 @@ class LabExamSettingsWriteSerializer(serializers.Serializer):
 # ---------------------------------------------------------------------------
 
 class ExamDefinitionListSerializer(serializers.ModelSerializer):
-    category_name = serializers.CharField(source='category.name', read_only=True)
+    family_name = serializers.CharField(source='family.name', default=None, read_only=True)
+    sub_family_name = serializers.CharField(source='sub_family.name', default=None, read_only=True)
+    tube_type_name = serializers.CharField(source='tube_type.name', default=None, read_only=True)
+    technique_name = serializers.CharField(source='technique.name', default=None, read_only=True)
+    # Legacy field kept for frontend compatibility during transition
+    category_name = serializers.CharField(source='category.name', default=None, read_only=True)
     unit_price = serializers.DecimalField(max_digits=12, decimal_places=4, coerce_to_string=True)
     is_enabled = serializers.SerializerMethodField()
 
     class Meta:
         model = ExamDefinition
         fields = [
-            'id', 'code', 'name', 'category_id', 'category_name',
-            'sample_type', 'turnaround_hours', 'unit_price', 'is_active',
-            'is_enabled', 'created_at',
+            'id', 'code', 'name',
+            'family_id', 'family_name',
+            'sub_family_id', 'sub_family_name',
+            'tube_type_id', 'tube_type_name',
+            'technique_id', 'technique_name',
+            'fasting_required',
+            'sample_type', 'turnaround_hours', 'unit_price',
+            'is_active', 'is_enabled',
+            # Legacy
+            'category_id', 'category_name',
+            'created_at',
         ]
 
     def get_is_enabled(self, obj):
         try:
             return obj.lab_settings.is_enabled
         except LabExamSettings.DoesNotExist:
-            return True  # Default: enabled until explicitly disabled
+            return True
 
 
 class ExamDefinitionDetailSerializer(serializers.ModelSerializer):
+    family = ExamFamilyListSerializer(read_only=True)
+    sub_family = ExamSubFamilySerializer(read_only=True)
+    tube_type = TubeTypeSerializer(read_only=True)
+    technique = ExamTechniqueSerializer(read_only=True)
+    # Legacy
     category = ExamCategoryListSerializer(read_only=True)
     unit_price = serializers.DecimalField(max_digits=12, decimal_places=4, coerce_to_string=True)
     lab_settings = LabExamSettingsSerializer(read_only=True)
@@ -101,14 +310,24 @@ class ExamDefinitionDetailSerializer(serializers.ModelSerializer):
     class Meta:
         model = ExamDefinition
         fields = [
-            'id', 'code', 'name', 'category', 'sample_type',
-            'turnaround_hours', 'description', 'unit_price', 'is_active',
-            'lab_settings', 'created_at', 'updated_at',
+            'id', 'code', 'name',
+            'family', 'sub_family', 'tube_type', 'technique',
+            'fasting_required',
+            'sample_type', 'turnaround_hours', 'description',
+            'unit_price', 'is_active',
+            'lab_settings',
+            # Legacy
+            'category',
+            'created_at', 'updated_at',
         ]
 
 
 class ExamDefinitionCreateSerializer(serializers.Serializer):
-    category_id = serializers.UUIDField()
+    family_id = serializers.UUIDField()
+    sub_family_id = serializers.UUIDField(required=False, allow_null=True, default=None)
+    tube_type_id = serializers.UUIDField(required=False, allow_null=True, default=None)
+    technique_id = serializers.UUIDField(required=False, allow_null=True, default=None)
+    fasting_required = serializers.BooleanField(required=False, default=False)
     code = serializers.CharField(max_length=50)
     name = serializers.CharField(max_length=255)
     sample_type = serializers.ChoiceField(choices=SampleType.choices)
@@ -118,9 +337,24 @@ class ExamDefinitionCreateSerializer(serializers.Serializer):
         max_digits=12, decimal_places=4, min_value=0, default=0,
     )
 
-    def validate_category_id(self, value):
-        if not ExamCategory.objects.filter(id=value, is_active=True).exists():
-            raise serializers.ValidationError('Category not found or inactive.')
+    def validate_family_id(self, value):
+        if not ExamFamily.objects.filter(id=value, is_active=True).exists():
+            raise serializers.ValidationError('Family not found or inactive.')
+        return value
+
+    def validate_sub_family_id(self, value):
+        if value is not None and not ExamSubFamily.objects.filter(id=value, is_active=True).exists():
+            raise serializers.ValidationError('Sub-family not found or inactive.')
+        return value
+
+    def validate_tube_type_id(self, value):
+        if value is not None and not TubeType.objects.filter(id=value, is_active=True).exists():
+            raise serializers.ValidationError('Tube type not found or inactive.')
+        return value
+
+    def validate_technique_id(self, value):
+        if value is not None and not ExamTechnique.objects.filter(id=value, is_active=True).exists():
+            raise serializers.ValidationError('Technique not found or inactive.')
         return value
 
     def validate_code(self, value):
@@ -129,14 +363,28 @@ class ExamDefinitionCreateSerializer(serializers.Serializer):
             raise serializers.ValidationError('An exam with this code already exists.')
         return code
 
+    def validate(self, attrs):
+        # Coherence rule: if a sub_family is provided, it must belong to the
+        # selected family. family is required, sub_family is optional.
+        sub_family_id = attrs.get('sub_family_id')
+        if sub_family_id is not None:
+            family_id = attrs.get('family_id')
+            if not ExamSubFamily.objects.filter(
+                id=sub_family_id, family_id=family_id, is_active=True,
+            ).exists():
+                raise serializers.ValidationError({
+                    'sub_family_id': 'Sub-family does not belong to the selected family.',
+                })
+        return attrs
+
 
 class ExamDefinitionUpdateSerializer(serializers.Serializer):
-    """
-    code is intentionally excluded: it is immutable once referenced by an
-    exam item (data model constraint). Excluding it from the update path
-    prevents accidental mutation.
-    """
-    category_id = serializers.UUIDField(required=False)
+    """code is immutable. family replaces category for updates."""
+    family_id = serializers.UUIDField(required=False)
+    sub_family_id = serializers.UUIDField(required=False, allow_null=True)
+    tube_type_id = serializers.UUIDField(required=False, allow_null=True)
+    technique_id = serializers.UUIDField(required=False, allow_null=True)
+    fasting_required = serializers.BooleanField(required=False)
     name = serializers.CharField(max_length=255, required=False)
     sample_type = serializers.ChoiceField(choices=SampleType.choices, required=False)
     turnaround_hours = serializers.IntegerField(required=False, allow_null=True, min_value=1)
@@ -145,14 +393,71 @@ class ExamDefinitionUpdateSerializer(serializers.Serializer):
         max_digits=12, decimal_places=4, min_value=0, required=False,
     )
 
-    def validate_category_id(self, value):
-        if not ExamCategory.objects.filter(id=value, is_active=True).exists():
-            raise serializers.ValidationError('Category not found or inactive.')
+    def validate_family_id(self, value):
+        if not ExamFamily.objects.filter(id=value, is_active=True).exists():
+            raise serializers.ValidationError('Family not found or inactive.')
         return value
+
+    def validate_sub_family_id(self, value):
+        if value is not None and not ExamSubFamily.objects.filter(id=value, is_active=True).exists():
+            raise serializers.ValidationError('Sub-family not found or inactive.')
+        return value
+
+    def validate_tube_type_id(self, value):
+        if value is not None and not TubeType.objects.filter(id=value, is_active=True).exists():
+            raise serializers.ValidationError('Tube type not found or inactive.')
+        return value
+
+    def validate_technique_id(self, value):
+        if value is not None and not ExamTechnique.objects.filter(id=value, is_active=True).exists():
+            raise serializers.ValidationError('Technique not found or inactive.')
+        return value
+
+    def validate(self, attrs):
+        # Code is a stable business identifier — once an exam definition
+        # exists it may be referenced by analysis requests, reports, and
+        # external integrations, so renaming it silently is dangerous. We
+        # reject explicitly (400) when ``code`` is present in the raw payload
+        # instead of silently stripping it, so a client mis-using the endpoint
+        # gets immediate, auditable feedback instead of a fake success.
+        if 'code' in self.initial_data:
+            raise serializers.ValidationError({
+                'code': 'Code is immutable after creation and cannot be changed.',
+            })
+
+        # Coherence rule on the *resulting* (family, sub_family) pair after
+        # applying the partial payload to the current instance. The caller
+        # must supply context={'instance': exam} for this check to work on
+        # partial updates that only touch one side of the pair.
+        instance = self.context.get('instance')
+
+        if 'family_id' in attrs:
+            resulting_family_id = attrs['family_id']
+        else:
+            resulting_family_id = getattr(instance, 'family_id', None)
+
+        if 'sub_family_id' in attrs:
+            resulting_sub_family_id = attrs['sub_family_id']
+        else:
+            resulting_sub_family_id = getattr(instance, 'sub_family_id', None)
+
+        if resulting_sub_family_id is None:
+            return attrs
+
+        if not ExamSubFamily.objects.filter(
+            id=resulting_sub_family_id,
+            family_id=resulting_family_id,
+            is_active=True,
+        ).exists():
+            raise serializers.ValidationError({
+                'sub_family_id': 'Sub-family does not belong to the selected family.',
+            })
+
+        return attrs
 
 
 # ---------------------------------------------------------------------------
-# Pricing Rule
+# Pricing Rule (unchanged)
 # ---------------------------------------------------------------------------
 
 class PricingRuleSerializer(serializers.ModelSerializer):
@@ -196,7 +501,6 @@ class PricingRuleCreateSerializer(serializers.Serializer):
     notes = serializers.CharField(required=False, allow_blank=True, default='')
 
     def validate_exam_definition_id(self, value):
-        from .models import ExamDefinition
         if not ExamDefinition.objects.filter(id=value, is_active=True).exists():
             raise serializers.ValidationError('Exam definition not found or inactive.')
         return value
@@ -236,7 +540,6 @@ class PricingRuleCreateSerializer(serializers.Serializer):
 
 
 class PricingRuleUpdateSerializer(serializers.Serializer):
-    """Updatable fields on an existing pricing rule."""
     pricing_type = serializers.ChoiceField(choices=PricingType.choices, required=False)
     value = serializers.DecimalField(max_digits=12, decimal_places=4, min_value=0, required=False)
     priority = serializers.IntegerField(required=False)

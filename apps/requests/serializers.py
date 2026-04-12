@@ -8,6 +8,7 @@ from apps.catalog.models import ExamDefinition
 from apps.partners.models import PartnerOrganization
 from .models import (
     AnalysisRequest, AnalysisRequestItem, ExamTraceability,
+    RequestLabel, RequestLabelBatch,
     RequestStatus, ItemStatus, ExecutionMode, SourceType, BillingMode, PriceSource,
 )
 
@@ -54,6 +55,10 @@ class AnalysisRequestItemBriefSerializer(serializers.ModelSerializer):
         max_digits=12, decimal_places=4, coerce_to_string=True, read_only=True,
     )
 
+    collected_by_email = serializers.CharField(
+        source='collected_by.email', read_only=True, default=None,
+    )
+
     class Meta:
         model = AnalysisRequestItem
         fields = [
@@ -61,6 +66,7 @@ class AnalysisRequestItemBriefSerializer(serializers.ModelSerializer):
             'status', 'execution_mode', 'rejection_reason',
             'external_partner_name', 'notes',
             'unit_price', 'billed_price', 'price_source',
+            'collected_at', 'collected_by_email', 'collection_notes',
             'created_at',
         ]
 
@@ -76,6 +82,9 @@ class AnalysisRequestItemSerializer(serializers.ModelSerializer):
         max_digits=12, decimal_places=4, coerce_to_string=True, read_only=True,
     )
     traceability = ExamTraceabilitySerializer(read_only=True)
+    collected_by_email = serializers.CharField(
+        source='collected_by.email', read_only=True, default=None,
+    )
 
     class Meta:
         model = AnalysisRequestItem
@@ -85,6 +94,7 @@ class AnalysisRequestItemSerializer(serializers.ModelSerializer):
             'status', 'execution_mode', 'rejection_reason',
             'external_partner_name', 'notes',
             'unit_price', 'billed_price', 'price_source', 'pricing_rule_id',
+            'collected_at', 'collected_by_email', 'collection_notes',
             'traceability',
             'created_at', 'updated_at',
         ]
@@ -214,6 +224,14 @@ class ItemRejectSerializer(serializers.Serializer):
     rejection_reason = serializers.CharField(min_length=1)
 
 
+class ItemMarkCollectedSerializer(serializers.Serializer):
+    """Input for the ``mark-collected`` action. Notes are optional."""
+    collection_notes = serializers.CharField(
+        required=False, allow_blank=True, default='',
+        max_length=2000,
+    )
+
+
 # ---------------------------------------------------------------------------
 # AnalysisRequest — write
 # ---------------------------------------------------------------------------
@@ -239,6 +257,13 @@ class AnalysisRequestCreateSerializer(serializers.Serializer):
     source_notes = serializers.CharField(
         required=False, allow_blank=True, default='',
     )
+
+    # Lifecycle flag — when true, the request is created AND confirmed in
+    # a single atomic transaction (DRAFT → CONFIRMED via the existing
+    # state machine). Used by the 3-step creation wizard whose final
+    # button semantically means "commit this request". Default false so
+    # legacy clients that create drafts for later editing keep working.
+    confirm = serializers.BooleanField(required=False, default=False)
 
     def validate_patient_id(self, value):
         if not Patient.objects.filter(id=value, is_active=True).exists():
@@ -287,6 +312,16 @@ class AnalysisRequestCreateSerializer(serializers.Serializer):
                         'Required when source_type is PARTNER_ORGANIZATION.'
                     ),
                 })
+
+        # Confirm-on-create requires at least one item. Catching this at
+        # the serializer layer gives a field-scoped 400 ("items: ...")
+        # instead of a downstream state-machine error from ``confirm``.
+        if attrs.get('confirm') and not attrs.get('items'):
+            raise serializers.ValidationError({
+                'items': (
+                    'At least one exam item is required when confirm=true.'
+                ),
+            })
 
         return attrs
 
@@ -364,3 +399,127 @@ class AnalysisRequestUpdateSerializer(serializers.Serializer):
 
 # Sentinel for distinguishing "not in payload" from explicit null
 _UNSET = object()
+
+
+# ---------------------------------------------------------------------------
+# Pricing Preview — Step 3 recap
+# ---------------------------------------------------------------------------
+
+class PricingPreviewRequestSerializer(serializers.Serializer):
+    """
+    Input for the preview endpoint. Accepts only what the resolver needs —
+    ``source_type``, optional ``partner_organization_id``, and the list of
+    exam ids the user has selected so far. Deliberately DOES NOT accept a
+    patient id: pricing does not depend on the patient, so requiring one
+    at preview time would be an artificial coupling.
+    """
+    source_type = serializers.ChoiceField(choices=SourceType.choices)
+    partner_organization_id = serializers.UUIDField(
+        required=False, allow_null=True, default=None,
+    )
+    exam_definition_ids = serializers.ListField(
+        child=serializers.UUIDField(),
+        allow_empty=False,
+    )
+
+    def validate_partner_organization_id(self, value):
+        if value is not None:
+            if not PartnerOrganization.objects.filter(id=value, is_active=True).exists():
+                raise serializers.ValidationError(
+                    'Partner organization not found or inactive.'
+                )
+        return value
+
+    def validate_exam_definition_ids(self, value):
+        # Reject duplicates up-front so the resolver does not have to
+        # defend against them and the returned list stays 1:1 with input.
+        if len(value) != len({str(v) for v in value}):
+            raise serializers.ValidationError('Duplicate exam ids are not allowed.')
+        return value
+
+    def validate(self, attrs):
+        source_type = attrs['source_type']
+        partner_id = attrs.get('partner_organization_id')
+
+        if source_type == SourceType.PARTNER_ORGANIZATION and partner_id is None:
+            raise serializers.ValidationError({
+                'partner_organization_id': (
+                    'Required when source_type is PARTNER_ORGANIZATION.'
+                ),
+            })
+        if source_type == SourceType.DIRECT_PATIENT and partner_id is not None:
+            raise serializers.ValidationError({
+                'partner_organization_id': (
+                    'Must be null when source_type is DIRECT_PATIENT.'
+                ),
+            })
+        return attrs
+
+
+class ResolvedItemPriceSerializer(serializers.Serializer):
+    """
+    Output shape for one resolved line — mirrors the
+    ``ResolvedItemPrice`` dataclass used by ``RequestPricingResolver``.
+    """
+    exam_definition_id = serializers.UUIDField()
+    exam_code = serializers.CharField()
+    exam_name = serializers.CharField()
+    unit_price = serializers.DecimalField(
+        max_digits=12, decimal_places=4, coerce_to_string=True,
+    )
+    billed_price = serializers.DecimalField(
+        max_digits=12, decimal_places=4, coerce_to_string=True,
+    )
+    price_source = serializers.ChoiceField(choices=PriceSource.choices)
+
+
+# ---------------------------------------------------------------------------
+# Request Labels
+# ---------------------------------------------------------------------------
+
+class RequestLabelSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = RequestLabel
+        fields = ['id', 'barcode_value', 'label_index', 'family_name']
+
+
+class RequestLabelBatchSerializer(serializers.ModelSerializer):
+    """
+    Serializer for a label batch, including the ordered list of labels
+    and the API path of the protected download endpoint.
+
+    ``pdf_url`` is the **API-relative path** of the protected backend
+    download endpoint — NOT a raw ``/media/...`` path and NOT a public
+    pre-signed URL. Every download goes through an authenticated,
+    tenant-scoped backend action that streams the PDF. This guarantees
+    that a leaked URL alone cannot expose a sensitive lab document.
+
+    The shape is ``/requests/<uuid>/labels/download/`` (deliberately
+    without the ``/api/v1`` prefix) so the frontend axios client can
+    consume it directly: ``api.get(pdf_url, { responseType: 'blob' })``
+    will prepend its own base URL and automatically include the JWT
+    Authorization header.
+    """
+    labels = RequestLabelSerializer(many=True, read_only=True)
+    pdf_url = serializers.SerializerMethodField()
+    generated_by_email = serializers.CharField(
+        source='generated_by.email', read_only=True, default=None,
+    )
+
+    class Meta:
+        model = RequestLabelBatch
+        fields = [
+            'id',
+            'analysis_request_id',
+            'label_count',
+            'family_count',
+            'generated_at',
+            'generated_by_email',
+            'pdf_url',
+            'labels',
+        ]
+
+    def get_pdf_url(self, obj):
+        if not obj.pdf_file_key:
+            return None
+        return f'/requests/{obj.analysis_request_id}/labels/download/'

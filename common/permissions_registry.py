@@ -99,6 +99,7 @@ PATIENTS_VIEW = _r('patients.view', 'View patient records')
 PATIENTS_CREATE = _r('patients.create', 'Register new patients')
 PATIENTS_UPDATE = _r('patients.update', 'Update patient information')
 PATIENTS_DEACTIVATE = _r('patients.deactivate', 'Deactivate patient records')
+PATIENTS_UPDATE_IDENTITY = _r('patients.update_identity', 'Edit sensitive identity fields (document type and number)')
 PATIENTS_MANAGE_PORTAL = _r('patients.manage_portal', 'Create/remove patient portal accounts')
 
 # -- Catalog --
@@ -115,12 +116,15 @@ REQUESTS_CREATE = _r('requests.create', 'Create analysis requests')
 REQUESTS_UPDATE = _r('requests.update', 'Update analysis requests')
 REQUESTS_CONFIRM = _r('requests.confirm', 'Confirm analysis requests')
 REQUESTS_CANCEL = _r('requests.cancel', 'Cancel analysis requests')
+REQUESTS_FINALIZE = _r('requests.finalize_validation', 'Finalize request validation')
 
 # -- Results --
 RESULTS_VIEW = _r('results.view', 'View exam results')
 RESULTS_CREATE = _r('results.create', 'Enter exam results')
 RESULTS_UPDATE = _r('results.update', 'Update exam results')
+RESULTS_SUBMIT = _r('results.submit', 'Submit results for biologist review')
 RESULTS_VALIDATE = _r('results.validate', 'Validate exam results')
+RESULTS_REJECT = _r('results.reject', 'Reject exam results with reason')
 RESULTS_PUBLISH = _r('results.publish', 'Publish exam results (irreversible)')
 
 # -- Partners --

@@ -4,12 +4,12 @@ Cytova — Result Service
 All write operations that carry business logic live here.
 Views are thin: validate input → delegate to service.
 
-ResultService:
-    create              — create a DRAFT ExamResult for an item
-    update              — update result data (DRAFT only; PUBLISHED is immutable)
-    submit              — DRAFT → PENDING_VALIDATION
-    validate            — PENDING_VALIDATION → VALIDATED
-    reject_validation   — PENDING_VALIDATION → DRAFT (back for revision)
+ResultVersionService:
+    create_draft        — create a new DRAFT version for an item
+    update_draft        — update result data (DRAFT + is_current only)
+    submit              — DRAFT → SUBMITTED; item → UNDER_REVIEW
+    validate            — SUBMITTED → VALIDATED (biologist)
+    reject              — SUBMITTED → REJECTED; item → RESULT_ENTERED (biologist)
     publish             — VALIDATED → PUBLISHED (IRREVERSIBLE)
 
 ResultFileService:
@@ -19,24 +19,28 @@ ResultFileService:
 
 Security invariants:
     - PUBLISHED results reject all update, submit, validate, reject, and file-delete
-      operations at the service level (state machine enforces the same at model transitions).
+      operations at the service level (state machine enforces the same).
     - file_key is never returned by any service method — callers use get_download_url().
-    - Physical storage deletion failure is logged but does not abort the DB transaction
-      (orphaned storage objects are preferable to orphaned DB records).
+    - Physical storage deletion failure is logged but does not abort the DB transaction.
 """
 import logging
 
 from django.conf import settings
 from django.db import transaction
+from django.db.models import Max
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 
 from apps.audit.models import AuditLog, AuditAction, ActorType
 from apps.files.signed_urls import generate_download_url
 from apps.files.storage import delete_stored_file, store_result_file
+from apps.requests.models import (
+    AnalysisRequestItem, ItemStatus, RequestStatus,
+)
+from apps.requests.state_machine import RequestStateMachine, ItemStateMachine
 from apps.users.models import StaffUser
-from .models import ExamResult, ResultFile, ResultStatus
-from .state_machine import ResultStateMachine
+from .models import ResultVersion, ResultFile, ResultStatus
+from .state_machine import ResultStateMachine as VersionStateMachine
 
 logger = logging.getLogger(__name__)
 
@@ -60,221 +64,476 @@ def _audit(*, actor: StaffUser, action: str, entity_type: str, entity_id,
     )
 
 
+_RESULT_ENTRY_ELIGIBLE = {
+    ItemStatus.COLLECTED,
+    ItemStatus.RESULT_ENTERED,
+}
+
+
 # ---------------------------------------------------------------------------
-# ResultService
+# ResultVersionService
 # ---------------------------------------------------------------------------
 
-class ResultService:
+class ResultVersionService:
 
     @staticmethod
-    def create(
-        validated_data: dict,
-        created_by: StaffUser,
+    @transaction.atomic
+    def create_draft(
+        item: AnalysisRequestItem,
+        entered_by: StaffUser,
         request,
-    ) -> ExamResult:
+        result_value: str = '',
+        result_unit: str = '',
+        reference_range: str = '',
+        is_abnormal: bool = False,
+        comments: str = '',
+        internal_notes: str = '',
+        notes: str = '',
+    ) -> ResultVersion:
         """
-        Create a DRAFT ExamResult for the given item.
-        If reference_range is not supplied, it is auto-populated from the item's
-        LabExamSettings (if configured), then from ExamDefinition (no override).
-        """
-        item_id = validated_data.pop('item_id')
+        Create a new DRAFT result version for the given item.
 
-        # Resolve reference_range default from lab settings → exam definition
-        reference_range = validated_data.get('reference_range', '')
+        Preconditions:
+            - Item must be COLLECTED or RESULT_ENTERED.
+            - If a current version exists, it must be REJECTED (re-entry
+              after biologist rejection). A current DRAFT or SUBMITTED
+              version blocks creation — edit or submit the existing one.
+
+        Side effects:
+            - The previous current version (if any) is marked is_current=False.
+            - Item transitions to RESULT_ENTERED if currently COLLECTED.
+            - reference_range is auto-populated from LabExamSettings if blank.
+        """
+        if item.status not in _RESULT_ENTRY_ELIGIBLE:
+            raise ValidationError(
+                f'Result entry requires item status COLLECTED or RESULT_ENTERED '
+                f'(current: {item.status}).'
+            )
+
+        current = item.result_versions.filter(is_current=True).first()
+        if current and current.status not in {ResultStatus.REJECTED}:
+            raise ValidationError(
+                f'A {current.status} result version already exists for this item. '
+                f'Edit or submit the existing version before creating a new one.'
+            )
+
         if not reference_range:
-            from apps.requests.models import AnalysisRequestItem
-            item = AnalysisRequestItem.objects.select_related(
-                'exam_definition__lab_settings'
-            ).get(pk=item_id)
             try:
                 reference_range = item.exam_definition.lab_settings.reference_range
             except Exception:
                 reference_range = ''
-            validated_data['reference_range'] = reference_range
 
-        result = ExamResult(
-            item_id=item_id,
-            created_by=created_by,
-            **validated_data,
+        if current:
+            current.is_current = False
+            current.save(update_fields=['is_current', 'updated_at'])
+
+        max_version = (
+            item.result_versions.aggregate(m=Max('version_number'))['m'] or 0
         )
-        result.save()
+
+        version = ResultVersion(
+            item=item,
+            version_number=max_version + 1,
+            is_current=True,
+            status=ResultStatus.DRAFT,
+            result_value=result_value,
+            result_unit=result_unit,
+            reference_range=reference_range,
+            is_abnormal=is_abnormal,
+            comments=comments,
+            internal_notes=internal_notes,
+            notes=notes,
+            entered_by=entered_by,
+            entered_at=timezone.now(),
+        )
+        version.save()
+
+        if item.status == ItemStatus.COLLECTED:
+            ItemStateMachine.transition(item, ItemStatus.RESULT_ENTERED)
+            item.save(update_fields=['status', 'updated_at'])
 
         _audit(
-            actor=created_by,
+            actor=entered_by,
             action=AuditAction.CREATE,
-            entity_type='ExamResult',
-            entity_id=result.id,
+            entity_type='ResultVersion',
+            entity_id=version.id,
             diff={'after': {
-                'item_id': str(item_id),
+                'item_id': str(item.id),
+                'version_number': version.version_number,
                 'status': ResultStatus.DRAFT,
             }},
             request=request,
         )
 
-        return result
+        return version
 
     @staticmethod
-    def update(
-        result: ExamResult,
+    def update_draft(
+        version: ResultVersion,
         validated_data: dict,
         updated_by: StaffUser,
         request,
-    ) -> ExamResult:
-        """Update result data. Only allowed in DRAFT state."""
-        if result.status == ResultStatus.PUBLISHED:
-            raise ValidationError('Published results are immutable.')
-        if result.status != ResultStatus.DRAFT:
+    ) -> ResultVersion:
+        """Update result data. Only allowed on current DRAFT versions."""
+        if version.status != ResultStatus.DRAFT:
             raise ValidationError(
                 f'Results can only be edited in DRAFT state '
-                f'(current: {result.status}).'
+                f'(current: {version.status}).'
             )
+        if not version.is_current:
+            raise ValidationError('Only the current version can be edited.')
         if not validated_data:
-            return result
+            return version
 
-        before = {k: getattr(result, k) for k in validated_data}
+        before = {k: getattr(version, k) for k in validated_data}
         for field, value in validated_data.items():
-            setattr(result, field, value)
-        result.save(update_fields=list(validated_data.keys()) + ['updated_at'])
-        after = {k: getattr(result, k) for k in validated_data}
+            setattr(version, field, value)
+        version.save(update_fields=list(validated_data.keys()) + ['updated_at'])
+        after = {k: getattr(version, k) for k in validated_data}
 
         _audit(
             actor=updated_by,
             action=AuditAction.UPDATE,
-            entity_type='ExamResult',
-            entity_id=result.id,
+            entity_type='ResultVersion',
+            entity_id=version.id,
             diff={'before': before, 'after': after},
             request=request,
         )
 
-        return result
+        return version
 
     @staticmethod
-    def submit(
-        result: ExamResult,
-        submitted_by: StaffUser,
+    def update_review_comments(
+        version: ResultVersion,
+        validated_data: dict,
+        updated_by: StaffUser,
         request,
-    ) -> ExamResult:
+    ) -> ResultVersion:
         """
-        Transition DRAFT → PENDING_VALIDATION.
-        The result_value must be non-empty before submission.
+        Update patient-visible comments or validation notes on a
+        VALIDATED result version. Allowed only while the parent request
+        is still in READY_FOR_RELEASE (before the biologist finalizes).
+        Once the request is VALIDATED, no further edits are permitted.
         """
-        if not result.result_value.strip():
+        if version.status != ResultStatus.VALIDATED:
             raise ValidationError(
-                'result_value must be set before submitting for validation.'
+                'Review comments can only be edited on VALIDATED results.'
+            )
+        if not version.is_current:
+            raise ValidationError('Only the current version can be edited.')
+
+        ar = version.item.analysis_request
+        if ar.status not in {
+            RequestStatus.AWAITING_REVIEW,
+            RequestStatus.READY_FOR_RELEASE,
+        }:
+            raise ValidationError(
+                'Review comments can only be edited before the request '
+                'is finalized.'
             )
 
-        ResultStateMachine.transition(result, ResultStatus.PENDING_VALIDATION)
-        result.save(update_fields=['status', 'updated_at'])
+        allowed_fields = {'comments', 'validation_notes'}
+        update_fields = {k: v for k, v in validated_data.items()
+                         if k in allowed_fields}
+        if not update_fields:
+            return version
+
+        before = {k: getattr(version, k) for k in update_fields}
+        for field, value in update_fields.items():
+            setattr(version, field, value)
+        version.save(update_fields=list(update_fields.keys()) + ['updated_at'])
+        after = {k: getattr(version, k) for k in update_fields}
 
         _audit(
-            actor=submitted_by,
+            actor=updated_by,
             action=AuditAction.UPDATE,
-            entity_type='ExamResult',
-            entity_id=result.id,
-            diff={'before': {'status': ResultStatus.DRAFT},
-                  'after': {'status': ResultStatus.PENDING_VALIDATION}},
+            entity_type='ResultVersion',
+            entity_id=version.id,
+            diff={'before': before, 'after': after},
             request=request,
         )
 
-        return result
+        return version
 
     @staticmethod
+    @transaction.atomic
+    def submit(
+        version: ResultVersion,
+        submitted_by: StaffUser,
+        request,
+    ) -> ResultVersion:
+        """
+        Transition DRAFT → SUBMITTED.
+        The result_value must be non-empty before submission.
+        Item transitions to UNDER_REVIEW. Request may advance
+        to AWAITING_REVIEW if all active items are submitted or beyond.
+        """
+        if not version.is_current:
+            raise ValidationError('Only the current version can be submitted.')
+        if not version.result_value.strip():
+            raise ValidationError(
+                'result_value must be set before submitting for review.'
+            )
+
+        VersionStateMachine.transition(version, ResultStatus.SUBMITTED)
+        version.submitted_by = submitted_by
+        version.submitted_at = timezone.now()
+        version.save(update_fields=[
+            'status', 'submitted_by', 'submitted_at', 'updated_at',
+        ])
+
+        item = version.item
+        if item.status == ItemStatus.RESULT_ENTERED:
+            ItemStateMachine.transition(item, ItemStatus.UNDER_REVIEW)
+            item.save(update_fields=['status', 'updated_at'])
+
+        _audit(
+            actor=submitted_by,
+            action=AuditAction.SUBMIT,
+            entity_type='ResultVersion',
+            entity_id=version.id,
+            diff={
+                'before': {'status': ResultStatus.DRAFT},
+                'after': {
+                    'status': ResultStatus.SUBMITTED,
+                    'submitted_by': str(submitted_by.id),
+                },
+            },
+            request=request,
+        )
+
+        ResultVersionService._refresh_review_status(
+            item.analysis_request, actor=submitted_by, request=request,
+        )
+
+        return version
+
+    @staticmethod
+    @transaction.atomic
     def validate(
-        result: ExamResult,
+        version: ResultVersion,
         validation_notes: str,
         validated_by: StaffUser,
         request,
-    ) -> ExamResult:
-        """Transition PENDING_VALIDATION → VALIDATED."""
-        ResultStateMachine.transition(result, ResultStatus.VALIDATED)
+    ) -> ResultVersion:
+        """
+        Transition SUBMITTED → VALIDATED.
+        Item transitions to VALIDATED. Request may advance to
+        READY_FOR_RELEASE if all active items are validated.
+        """
+        if not version.is_current:
+            raise ValidationError('Only the current version can be validated.')
 
-        result.validated_by = validated_by
-        result.validated_at = timezone.now()
-        result.validation_notes = validation_notes
-        result.save(update_fields=[
+        ar = version.item.analysis_request
+        if ar.status == RequestStatus.VALIDATED:
+            raise ValidationError(
+                'The request has been finalized. No further review '
+                'modifications are allowed.'
+            )
+
+        VersionStateMachine.transition(version, ResultStatus.VALIDATED)
+
+        version.validated_by = validated_by
+        version.validated_at = timezone.now()
+        version.validation_notes = validation_notes
+        version.save(update_fields=[
             'status', 'validated_by', 'validated_at', 'validation_notes', 'updated_at',
         ])
+
+        item = version.item
+        if item.status == ItemStatus.UNDER_REVIEW:
+            ItemStateMachine.transition(item, ItemStatus.VALIDATED)
+            item.save(update_fields=['status', 'updated_at'])
 
         _audit(
             actor=validated_by,
             action=AuditAction.VALIDATE,
-            entity_type='ExamResult',
-            entity_id=result.id,
-            diff={'before': {'status': ResultStatus.PENDING_VALIDATION},
+            entity_type='ResultVersion',
+            entity_id=version.id,
+            diff={'before': {'status': ResultStatus.SUBMITTED},
                   'after': {'status': ResultStatus.VALIDATED,
                              'validated_by': str(validated_by.id)}},
             request=request,
         )
 
-        return result
+        ResultVersionService._refresh_review_status(
+            item.analysis_request, actor=validated_by, request=request,
+        )
+
+        return version
 
     @staticmethod
-    def reject_validation(
-        result: ExamResult,
-        validation_notes: str,
+    @transaction.atomic
+    def reject(
+        version: ResultVersion,
+        rejection_notes: str,
         rejected_by: StaffUser,
         request,
-    ) -> ExamResult:
+    ) -> ResultVersion:
         """
-        Transition PENDING_VALIDATION → DRAFT (back for revision).
-        Clears validation timestamps. validation_notes captures the rejection reason.
+        Transition SUBMITTED → REJECTED.
+        The rejected version stays as a historical record. The item
+        transitions back to RESULT_ENTERED so the technician can
+        create a new version.
         """
-        ResultStateMachine.transition(result, ResultStatus.DRAFT)
+        if not version.is_current:
+            raise ValidationError('Only the current version can be rejected.')
 
-        result.validation_notes = validation_notes
-        result.validated_by = None
-        result.validated_at = None
-        result.save(update_fields=[
-            'status', 'validation_notes', 'validated_by', 'validated_at', 'updated_at',
+        ar = version.item.analysis_request
+        if ar.status == RequestStatus.VALIDATED:
+            raise ValidationError(
+                'The request has been finalized. No further review '
+                'modifications are allowed.'
+            )
+
+        VersionStateMachine.transition(version, ResultStatus.REJECTED)
+
+        version.rejected_by = rejected_by
+        version.rejected_at = timezone.now()
+        version.rejection_notes = rejection_notes
+        version.save(update_fields=[
+            'status', 'rejected_by', 'rejected_at', 'rejection_notes', 'updated_at',
         ])
+
+        item = version.item
+        if item.status == ItemStatus.UNDER_REVIEW:
+            ItemStateMachine.transition(item, ItemStatus.RESULT_ENTERED)
+            item.save(update_fields=['status', 'updated_at'])
 
         _audit(
             actor=rejected_by,
             action=AuditAction.UPDATE,
-            entity_type='ExamResult',
-            entity_id=result.id,
-            diff={'before': {'status': ResultStatus.PENDING_VALIDATION},
-                  'after': {'status': ResultStatus.DRAFT,
-                             'validation_notes': validation_notes}},
+            entity_type='ResultVersion',
+            entity_id=version.id,
+            diff={'before': {'status': ResultStatus.SUBMITTED},
+                  'after': {'status': ResultStatus.REJECTED,
+                             'rejection_notes': rejection_notes}},
             request=request,
         )
 
-        return result
+        ResultVersionService._refresh_review_status(
+            item.analysis_request, actor=rejected_by, request=request,
+        )
+
+        return version
 
     @staticmethod
+    @transaction.atomic
     def publish(
-        result: ExamResult,
+        version: ResultVersion,
         published_by: StaffUser,
         request,
-    ) -> ExamResult:
+    ) -> ResultVersion:
         """
         Transition VALIDATED → PUBLISHED.
-
-        This transition is IRREVERSIBLE. The state machine permanently blocks
-        any further transitions from PUBLISHED, and the model-level delete()
-        is also blocked.
+        This transition is IRREVERSIBLE.
         """
-        ResultStateMachine.transition(result, ResultStatus.PUBLISHED)
+        if not version.is_current:
+            raise ValidationError('Only the current version can be published.')
 
-        result.published_by = published_by
-        result.published_at = timezone.now()
-        result.save(update_fields=[
+        VersionStateMachine.transition(version, ResultStatus.PUBLISHED)
+
+        version.published_by = published_by
+        version.published_at = timezone.now()
+        version.save(update_fields=[
             'status', 'published_by', 'published_at', 'updated_at',
         ])
 
         _audit(
             actor=published_by,
             action=AuditAction.PUBLISH,
-            entity_type='ExamResult',
-            entity_id=result.id,
+            entity_type='ResultVersion',
+            entity_id=version.id,
             diff={'before': {'status': ResultStatus.VALIDATED},
                   'after': {'status': ResultStatus.PUBLISHED,
                              'published_by': str(published_by.id),
-                             'published_at': str(result.published_at)}},
+                             'published_at': str(version.published_at)}},
             request=request,
         )
 
-        return result
+        return version
+
+    @staticmethod
+    def _refresh_review_status(
+        analysis_request,
+        actor: StaffUser,
+        request,
+    ) -> None:
+        """
+        Derive the request-level status from the aggregate state of all
+        items. This is the **single place** where the review-phase
+        lifecycle lives.
+
+        Operationally rejected items (execution_mode REJECTED at
+        confirmation) are excluded — they are permanently done.
+
+        Precedence (first match wins):
+
+            1. All active VALIDATED           → READY_FOR_RELEASE
+               (all items individually validated; biologist must
+               explicitly finalize before request becomes VALIDATED)
+            2. Any UNDER_REVIEW               → AWAITING_REVIEW
+            3. No UNDER_REVIEW, some
+               RESULT_ENTERED                 → RETEST_REQUIRED
+            4. Otherwise                      → IN_ANALYSIS
+
+        Note: VALIDATED (the request-level status) is only reachable
+        via the explicit ``finalize_validation`` action, never through
+        this automatic derivation.
+        """
+        analysis_request.refresh_from_db(fields=['status'])
+
+        eligible = {
+            RequestStatus.IN_ANALYSIS,
+            RequestStatus.AWAITING_REVIEW,
+            RequestStatus.RETEST_REQUIRED,
+            RequestStatus.READY_FOR_RELEASE,
+        }
+        if analysis_request.status not in eligible:
+            return
+
+        items = list(analysis_request.items.all())
+        active = [i for i in items if i.status != ItemStatus.REJECTED]
+        if not active:
+            return
+
+        def _transition_to(target: str) -> None:
+            if analysis_request.status == target:
+                return
+            prev = analysis_request.status
+            RequestStateMachine.transition(analysis_request, target)
+            analysis_request.save(update_fields=['status', 'updated_at'])
+            _audit(
+                actor=actor,
+                action=AuditAction.UPDATE,
+                entity_type='AnalysisRequest',
+                entity_id=analysis_request.id,
+                diff={
+                    'before': {'status': prev},
+                    'after': {'status': target, 'reason': 'review_progress'},
+                },
+                request=request,
+            )
+
+        statuses = {i.status for i in active}
+
+        # 1. Every active item validated → ready for biologist to finalize
+        if statuses == {ItemStatus.VALIDATED}:
+            _transition_to(RequestStatus.READY_FOR_RELEASE)
+            return
+
+        # 2. At least one item still under review → biologist work remains
+        if ItemStatus.UNDER_REVIEW in statuses:
+            _transition_to(RequestStatus.AWAITING_REVIEW)
+            return
+
+        # 3. No items under review, but some need re-entry → retest cycle
+        if ItemStatus.RESULT_ENTERED in statuses:
+            _transition_to(RequestStatus.RETEST_REQUIRED)
+            return
+
+        # 4. Analysis phase (results being entered, not yet submitted)
+        _transition_to(RequestStatus.IN_ANALYSIS)
 
 
 # ---------------------------------------------------------------------------
@@ -286,15 +545,11 @@ class ResultFileService:
     @staticmethod
     @transaction.atomic
     def upload(
-        result: ExamResult,
+        result: ResultVersion,
         file,
         uploaded_by: StaffUser,
         request,
     ) -> ResultFile:
-        """
-        Store a file and attach it to the given ExamResult.
-        Rejected for PUBLISHED results — the document set is immutable once published.
-        """
         if result.status == ResultStatus.PUBLISHED:
             raise ValidationError(
                 'Files cannot be added to a PUBLISHED result.'
@@ -330,12 +585,6 @@ class ResultFileService:
 
     @staticmethod
     def get_download_url(result_file: ResultFile) -> dict:
-        """
-        Generate a time-limited signed URL for downloading a result file.
-        The file_key is consumed internally and never returned to callers.
-
-        Returns a dict suitable for SignedDownloadURLSerializer.
-        """
         expires_in = getattr(settings, 'RESULT_FILE_SIGNED_URL_EXPIRY', 900)
         url = generate_download_url(result_file.file_key, expires_in=expires_in)
         return {
@@ -351,13 +600,6 @@ class ResultFileService:
         deleted_by: StaffUser,
         request,
     ) -> None:
-        """
-        Remove a ResultFile.
-
-        Only allowed on DRAFT results — files are locked after submission
-        to prevent the evidence trail from being modified during review.
-        PUBLISHED result files are permanently immutable.
-        """
         result = result_file.result
         if result.status != ResultStatus.DRAFT:
             raise ValidationError(
@@ -369,10 +611,8 @@ class ResultFileService:
         file_id = result_file.id
         original_filename = result_file.original_filename
 
-        # Remove DB record first (bypasses model-level guard)
         ResultFile.objects.filter(id=result_file.id).delete()
 
-        # Remove from storage — failure is logged but does not abort
         delete_stored_file(file_key)
 
         _audit(

@@ -1,9 +1,9 @@
 """
 Cytova — Result Views
 
-ExamResultViewSet
+ResultVersionViewSet
     list, retrieve, create, partial_update
-    submit, validate, reject_validation, publish
+    submit, validate, reject, publish
 
 ResultFileViewSet  (nested under results)
     list, upload (POST), download (GET signed URL), delete (DELETE)
@@ -30,20 +30,20 @@ from common.permissions import (
     IsBiologistOrAbove,
     IsTechnicianOrAbove,
 )
-from .filters import ExamResultFilter
-from .models import ExamResult, ResultFile
+from .filters import ResultVersionFilter
+from .models import ResultVersion, ResultFile
 from .serializers import (
-    ExamResultCreateSerializer,
-    ExamResultDetailSerializer,
-    ExamResultListSerializer,
-    ExamResultUpdateSerializer,
+    ResultVersionCreateSerializer,
+    ResultVersionDetailSerializer,
+    ResultVersionListSerializer,
+    ResultVersionUpdateSerializer,
     RejectValidationSerializer,
     ResultFileSerializer,
     ResultFileUploadSerializer,
     SignedDownloadURLSerializer,
     ValidationNotesSerializer,
 )
-from .services import ResultFileService, ResultService
+from .services import ResultFileService, ResultVersionService
 
 logger = logging.getLogger(__name__)
 
@@ -52,20 +52,21 @@ logger = logging.getLogger(__name__)
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _get_result_or_404(pk) -> ExamResult:
+def _get_version_or_404(pk) -> ResultVersion:
     try:
         return (
-            ExamResult.objects
+            ResultVersion.objects
             .select_related(
                 'item__exam_definition',
                 'item__analysis_request',
-                'created_by', 'validated_by', 'published_by',
+                'entered_by', 'submitted_by',
+                'validated_by', 'rejected_by', 'published_by',
             )
             .prefetch_related('files__uploaded_by')
             .get(pk=pk)
         )
-    except ExamResult.DoesNotExist:
-        raise NotFound('Exam result not found.')
+    except ResultVersion.DoesNotExist:
+        raise NotFound('Result version not found.')
 
 
 def _get_file_or_404(result_pk, pk) -> ResultFile:
@@ -78,33 +79,31 @@ def _get_file_or_404(result_pk, pk) -> ResultFile:
 
 
 # ---------------------------------------------------------------------------
-# ExamResultViewSet
+# ResultVersionViewSet
 # ---------------------------------------------------------------------------
 
-class ExamResultViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet):
+class ResultVersionViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet):
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_class = ExamResultFilter
+    filterset_class = ResultVersionFilter
     search_fields = [
         'item__exam_definition__code',
         'item__exam_definition__name',
         'item__analysis_request__request_number',
     ]
-    ordering_fields = ['created_at', 'status', 'published_at']
+    ordering_fields = ['created_at', 'status', 'version_number', 'published_at']
     ordering = ['-created_at']
 
     def get_queryset(self):
         from django.db.models import Prefetch
-        from apps.results.models import ResultFile
 
-        # Prefetch files WITH uploaded_by to avoid N+1 when serializer
-        # accesses file.uploaded_by.email in ResultFileSerializer.
         files_qs = ResultFile.objects.select_related('uploaded_by')
         return (
-            ExamResult.objects
+            ResultVersion.objects
             .select_related(
                 'item__exam_definition',
                 'item__analysis_request',
-                'created_by', 'validated_by', 'published_by',
+                'entered_by', 'submitted_by',
+                'validated_by', 'rejected_by', 'published_by',
             )
             .prefetch_related(Prefetch('files', queryset=files_qs))
         )
@@ -112,88 +111,104 @@ class ExamResultViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet):
     def get_permissions(self):
         if self.action in ('list', 'retrieve'):
             return [IsAnyStaff()]
-        if self.action in ('validate', 'reject_validation', 'publish'):
+        if self.action in ('validate', 'reject', 'publish'):
             return [IsBiologistOrAbove()]
         # create, partial_update, submit
         return [IsTechnicianOrAbove()]
 
     def get_serializer_class(self):
         if self.action == 'list':
-            return ExamResultListSerializer
-        return ExamResultDetailSerializer
+            return ResultVersionListSerializer
+        return ResultVersionDetailSerializer
 
     def create(self, request, *args, **kwargs):
-        serializer = ExamResultCreateSerializer(data=request.data)
+        serializer = ResultVersionCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        result = ResultService.create(
-            validated_data=serializer.validated_data,
-            created_by=request.user,
-            request=request,
+        data = serializer.validated_data
+
+        from apps.requests.models import AnalysisRequestItem
+        item = (
+            AnalysisRequestItem.objects
+            .select_related('analysis_request', 'exam_definition')
+            .get(pk=data['item_id'])
         )
-        result = _get_result_or_404(result.id)
+
+        version = ResultVersionService.create_draft(
+            item=item,
+            entered_by=request.user,
+            request=request,
+            result_value=data.get('result_value', ''),
+            result_unit=data.get('result_unit', ''),
+            reference_range=data.get('reference_range', ''),
+            is_abnormal=data.get('is_abnormal', False),
+            comments=data.get('comments', ''),
+            internal_notes=data.get('internal_notes', ''),
+            notes=data.get('notes', ''),
+        )
+        version = _get_version_or_404(version.id)
         return Response(
-            ExamResultDetailSerializer(result).data,
+            ResultVersionDetailSerializer(version).data,
             status=status.HTTP_201_CREATED,
         )
 
     def partial_update(self, request, *args, **kwargs):
-        result = _get_result_or_404(kwargs['pk'])
-        serializer = ExamResultUpdateSerializer(data=request.data)
+        version = _get_version_or_404(kwargs['pk'])
+        serializer = ResultVersionUpdateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        result = ResultService.update(
-            result=result,
+        version = ResultVersionService.update_draft(
+            version=version,
             validated_data=serializer.validated_data,
             updated_by=request.user,
             request=request,
         )
-        result = _get_result_or_404(result.id)
-        return Response(ExamResultDetailSerializer(result).data)
+        version = _get_version_or_404(version.id)
+        return Response(ResultVersionDetailSerializer(version).data)
 
     @action(detail=True, methods=['post'], url_path='submit')
     def submit(self, request, pk=None):
-        result = _get_result_or_404(pk)
-        result = ResultService.submit(
-            result=result,
+        version = _get_version_or_404(pk)
+        version = ResultVersionService.submit(
+            version=version,
             submitted_by=request.user,
             request=request,
         )
-        return Response(ExamResultDetailSerializer(result).data)
+        return Response(ResultVersionDetailSerializer(version).data)
 
     @action(detail=True, methods=['post'], url_path='validate')
     def validate(self, request, pk=None):
-        result = _get_result_or_404(pk)
+        version = _get_version_or_404(pk)
         serializer = ValidationNotesSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        result = ResultService.validate(
-            result=result,
+        version = ResultVersionService.validate(
+            version=version,
             validation_notes=serializer.validated_data.get('validation_notes', ''),
             validated_by=request.user,
             request=request,
         )
-        return Response(ExamResultDetailSerializer(result).data)
+        return Response(ResultVersionDetailSerializer(version).data)
 
-    @action(detail=True, methods=['post'], url_path='reject-validation')
-    def reject_validation(self, request, pk=None):
-        result = _get_result_or_404(pk)
+    @action(detail=True, methods=['post'], url_path='reject')
+    def reject(self, request, pk=None):
+        version = _get_version_or_404(pk)
         serializer = RejectValidationSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        result = ResultService.reject_validation(
-            result=result,
-            validation_notes=serializer.validated_data['validation_notes'],
+        version = ResultVersionService.reject(
+            version=version,
+            rejection_notes=serializer.validated_data['rejection_notes'],
             rejected_by=request.user,
             request=request,
         )
-        return Response(ExamResultDetailSerializer(result).data)
+        return Response(ResultVersionDetailSerializer(version).data)
 
     @action(detail=True, methods=['post'], url_path='publish')
     def publish(self, request, pk=None):
-        result = _get_result_or_404(pk)
-        result = ResultService.publish(
-            result=result,
+        version = _get_version_or_404(pk)
+        version = ResultVersionService.publish(
+            version=version,
             published_by=request.user,
             request=request,
         )
-        return Response(ExamResultDetailSerializer(result).data)
+        return Response(ResultVersionDetailSerializer(version).data)
 
 
 # ---------------------------------------------------------------------------
@@ -201,15 +216,6 @@ class ExamResultViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet):
 # ---------------------------------------------------------------------------
 
 class ResultFileViewSet(GenericViewSet):
-    """
-    Manages files attached to an ExamResult.
-
-    Security:
-    - file_key is NEVER included in any response
-    - All file downloads go through a signed URL generated on demand
-    - Upload and delete are rejected for PUBLISHED results
-    - Download (signed URL) is available to all authenticated staff
-    """
     parser_classes = [MultiPartParser, JSONParser]
 
     def get_permissions(self):
@@ -222,9 +228,9 @@ class ResultFileViewSet(GenericViewSet):
 
     def _get_parent(self, result_pk):
         try:
-            return ExamResult.objects.get(pk=result_pk)
-        except ExamResult.DoesNotExist:
-            raise NotFound('Exam result not found.')
+            return ResultVersion.objects.get(pk=result_pk)
+        except ResultVersion.DoesNotExist:
+            raise NotFound('Result version not found.')
 
     def list(self, request, result_pk=None, *args, **kwargs):
         self._get_parent(result_pk)
@@ -254,11 +260,7 @@ class ResultFileViewSet(GenericViewSet):
         )
 
     def download(self, request, result_pk=None, pk=None, *args, **kwargs):
-        """
-        Generate and return a time-limited signed URL for the requested file.
-        The file_key is consumed internally; the URL is all the client receives.
-        """
-        self._get_parent(result_pk)  # 404 if result not found
+        self._get_parent(result_pk)
         result_file = _get_file_or_404(result_pk, pk)
 
         url_data = ResultFileService.get_download_url(result_file)

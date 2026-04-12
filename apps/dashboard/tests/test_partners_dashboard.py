@@ -31,7 +31,8 @@ def dashboard_data(lab_admin, make_request):
     - 2 partner requests (confirmed, with items + prices)
     """
     patient = Patient.objects.create(
-        national_id='DASH-NID-001',
+        document_type='NATIONAL_ID_CARD',
+        document_number='DASH-NID-001',
         first_name='Jane',
         last_name='Metrics',
         date_of_birth='1985-06-15',

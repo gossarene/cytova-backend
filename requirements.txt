@@ -46,3 +46,6 @@ whitenoise==6.7.0
 
 # Image processing (for file validation)
 Pillow==10.4.0
+
+# PDF generation — printable specimen labels (request labels)
+reportlab==4.4.10

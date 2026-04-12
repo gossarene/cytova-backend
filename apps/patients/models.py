@@ -2,9 +2,10 @@
 Cytova — Patient Models
 
 Patient
-    Per-tenant patient record. national_id is unique within the schema.
-    Hard delete is blocked at the model level (BR-P2); only deactivation is
-    permitted once the patient has linked analysis requests.
+    Per-tenant patient record. Identified by document_type + document_number
+    (unique together within the schema). Hard delete is blocked at the model
+    level (BR-P2); only deactivation is permitted once the patient has linked
+    analysis requests.
 
 PatientPortalAccount
     Optional 1:1 companion to Patient. Grants the patient read-only access
@@ -24,6 +25,13 @@ from common.models import BaseModel
 class Gender(models.TextChoices):
     MALE = 'MALE', 'Male'
     FEMALE = 'FEMALE', 'Female'
+
+
+class DocumentType(models.TextChoices):
+    NATIONAL_ID_CARD = 'NATIONAL_ID_CARD', 'National ID Card'
+    PASSPORT = 'PASSPORT', 'Passport'
+    CIP = 'CIP', 'CIP'
+    RESIDENCE_PERMIT = 'RESIDENCE_PERMIT', 'Residence Permit'
     OTHER = 'OTHER', 'Other'
 
 
@@ -31,19 +39,28 @@ class Patient(BaseModel):
     """
     A person whose biological samples are analysed by the laboratory.
     Scoped to the current tenant schema — no cross-tenant visibility.
-
-    Fields match the validated data model in DOMAIN_MODEL.md §patients.
     """
-    national_id = models.CharField(max_length=100, unique=True, db_index=True)
+    # Identification
+    document_type = models.CharField(
+        max_length=20,
+        choices=DocumentType.choices,
+        default=DocumentType.NATIONAL_ID_CARD,
+    )
+    document_number = models.CharField(max_length=100, db_index=True)
+
     first_name = models.CharField(max_length=100)
     last_name = models.CharField(max_length=100)
     date_of_birth = models.DateField()
     gender = models.CharField(max_length=10, choices=Gender.choices)
+    nationality = models.CharField(max_length=100, blank=True, default='')
 
-    # Optional contact / billing fields
+    # Contact / location
     phone = models.CharField(max_length=30, blank=True, default='')
     email = models.EmailField(blank=True, default='')
+    city_of_residence = models.CharField(max_length=150, blank=True, default='')
     address = models.TextField(blank=True, default='')
+
+    # Billing
     insurance_number = models.CharField(max_length=100, blank=True, default='')
 
     is_active = models.BooleanField(default=True, db_index=True)
@@ -62,9 +79,15 @@ class Patient(BaseModel):
         indexes = [
             models.Index(fields=['last_name', 'first_name']),
         ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['document_type', 'document_number'],
+                name='unique_patient_document',
+            ),
+        ]
 
     def __str__(self):
-        return f'{self.last_name.upper()}, {self.first_name} ({self.national_id})'
+        return f'{self.last_name.upper()}, {self.first_name} ({self.document_number})'
 
     def delete(self, *args, **kwargs):
         """

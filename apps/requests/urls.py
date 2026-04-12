@@ -40,6 +40,11 @@ item_urls = [
         AnalysisRequestItemViewSet.as_view({'post': 'reject'}),
         name='analysisrequestitem-reject',
     ),
+    path(
+        '<uuid:request_pk>/items/<uuid:pk>/mark-collected/',
+        AnalysisRequestItemViewSet.as_view({'post': 'mark_collected'}),
+        name='analysisrequestitem-mark-collected',
+    ),
 ]
 
 urlpatterns = router.urls + item_urls

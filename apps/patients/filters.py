@@ -1,5 +1,5 @@
 import django_filters
-from .models import Patient
+from .models import DocumentType, Gender, Patient
 
 
 class HasPortalAccountFilter(django_filters.BooleanFilter):
@@ -19,8 +19,10 @@ class HasPortalAccountFilter(django_filters.BooleanFilter):
 
 class PatientFilter(django_filters.FilterSet):
     is_active = django_filters.BooleanFilter()
+    gender = django_filters.ChoiceFilter(choices=Gender.choices)
+    document_type = django_filters.ChoiceFilter(choices=DocumentType.choices)
     has_portal_account = HasPortalAccountFilter()
 
     class Meta:
         model = Patient
-        fields = ['is_active']
+        fields = ['is_active', 'gender', 'document_type']

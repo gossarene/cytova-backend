@@ -8,7 +8,7 @@ from django.conf import settings
 from rest_framework import serializers
 
 from apps.catalog.models import ExamDefinition
-from .models import ExamResult, ResultFile, ResultStatus
+from .models import ResultVersion, ResultFile, ResultStatus
 
 
 # ---------------------------------------------------------------------------
@@ -16,10 +16,6 @@ from .models import ExamResult, ResultFile, ResultStatus
 # ---------------------------------------------------------------------------
 
 class ResultFileSerializer(serializers.ModelSerializer):
-    """
-    Public representation of a result file.
-    file_key is intentionally absent — access via the download endpoint.
-    """
     uploaded_by_email = serializers.CharField(
         source='uploaded_by.email', read_only=True, default=None,
     )
@@ -38,10 +34,10 @@ class ResultFileSerializer(serializers.ModelSerializer):
 
 
 # ---------------------------------------------------------------------------
-# ExamResult — read
+# ResultVersion — read
 # ---------------------------------------------------------------------------
 
-class ExamResultListSerializer(serializers.ModelSerializer):
+class ResultVersionListSerializer(serializers.ModelSerializer):
     exam_code = serializers.CharField(
         source='item.exam_definition.code', read_only=True,
     )
@@ -51,14 +47,19 @@ class ExamResultListSerializer(serializers.ModelSerializer):
     request_number = serializers.CharField(
         source='item.analysis_request.request_number', read_only=True,
     )
+    entered_by_email = serializers.CharField(
+        source='entered_by.email', read_only=True, default=None,
+    )
     files_count = serializers.SerializerMethodField()
 
     class Meta:
-        model = ExamResult
+        model = ResultVersion
         fields = [
             'id', 'item_id', 'exam_code', 'exam_name', 'request_number',
-            'status', 'is_abnormal', 'result_value', 'result_unit',
-            'validated_at', 'published_at',
+            'version_number', 'is_current', 'status',
+            'is_abnormal', 'result_value', 'result_unit',
+            'entered_by_email', 'entered_at',
+            'submitted_at', 'validated_at', 'published_at',
             'files_count', 'created_at',
         ]
 
@@ -66,7 +67,7 @@ class ExamResultListSerializer(serializers.ModelSerializer):
         return obj.files.count()
 
 
-class ExamResultDetailSerializer(serializers.ModelSerializer):
+class ResultVersionDetailSerializer(serializers.ModelSerializer):
     exam_code = serializers.CharField(
         source='item.exam_definition.code', read_only=True,
     )
@@ -76,11 +77,17 @@ class ExamResultDetailSerializer(serializers.ModelSerializer):
     request_number = serializers.CharField(
         source='item.analysis_request.request_number', read_only=True,
     )
-    created_by_email = serializers.CharField(
-        source='created_by.email', read_only=True, default=None,
+    entered_by_email = serializers.CharField(
+        source='entered_by.email', read_only=True, default=None,
+    )
+    submitted_by_email = serializers.CharField(
+        source='submitted_by.email', read_only=True, default=None,
     )
     validated_by_email = serializers.CharField(
         source='validated_by.email', read_only=True, default=None,
+    )
+    rejected_by_email = serializers.CharField(
+        source='rejected_by.email', read_only=True, default=None,
     )
     published_by_email = serializers.CharField(
         source='published_by.email', read_only=True, default=None,
@@ -88,26 +95,30 @@ class ExamResultDetailSerializer(serializers.ModelSerializer):
     files = ResultFileSerializer(many=True, read_only=True)
 
     class Meta:
-        model = ExamResult
+        model = ResultVersion
         fields = [
             'id', 'item_id', 'exam_code', 'exam_name', 'request_number',
-            'status',
+            'version_number', 'is_current', 'status',
             'result_value', 'result_unit', 'reference_range',
             'is_abnormal', 'comments', 'internal_notes',
+            'notes',
+            'entered_by_email', 'entered_at',
+            'submitted_by_email', 'submitted_at',
             'validation_notes',
             'validated_by_email', 'validated_at',
+            'rejection_notes',
+            'rejected_by_email', 'rejected_at',
             'published_by_email', 'published_at',
-            'created_by_email',
             'files',
             'created_at', 'updated_at',
         ]
 
 
 # ---------------------------------------------------------------------------
-# ExamResult — write
+# ResultVersion — write
 # ---------------------------------------------------------------------------
 
-class ExamResultCreateSerializer(serializers.Serializer):
+class ResultVersionCreateSerializer(serializers.Serializer):
     item_id = serializers.UUIDField()
     result_value = serializers.CharField(allow_blank=True, default='')
     result_unit = serializers.CharField(
@@ -121,32 +132,18 @@ class ExamResultCreateSerializer(serializers.Serializer):
     internal_notes = serializers.CharField(
         required=False, allow_blank=True, default='',
     )
+    notes = serializers.CharField(required=False, allow_blank=True, default='')
 
     def validate_item_id(self, value):
         from apps.requests.models import AnalysisRequestItem, ItemStatus
         try:
-            item = AnalysisRequestItem.objects.select_related(
-                'analysis_request'
-            ).get(pk=value)
+            AnalysisRequestItem.objects.get(pk=value)
         except AnalysisRequestItem.DoesNotExist:
             raise serializers.ValidationError('Analysis request item not found.')
-
-        if item.status not in {ItemStatus.IN_PROGRESS, ItemStatus.COMPLETED}:
-            raise serializers.ValidationError(
-                'A result can only be created for an item that is '
-                'IN_PROGRESS or COMPLETED.'
-            )
-
-        if hasattr(item, 'result'):
-            raise serializers.ValidationError(
-                'A result already exists for this item.'
-            )
-
         return value
 
 
-class ExamResultUpdateSerializer(serializers.Serializer):
-    """All fields are optional — only provided fields are updated."""
+class ResultVersionUpdateSerializer(serializers.Serializer):
     result_value = serializers.CharField(required=False, allow_blank=True)
     result_unit = serializers.CharField(
         max_length=50, required=False, allow_blank=True,
@@ -157,18 +154,17 @@ class ExamResultUpdateSerializer(serializers.Serializer):
     is_abnormal = serializers.BooleanField(required=False)
     comments = serializers.CharField(required=False, allow_blank=True)
     internal_notes = serializers.CharField(required=False, allow_blank=True)
+    notes = serializers.CharField(required=False, allow_blank=True)
 
 
 class ValidationNotesSerializer(serializers.Serializer):
-    """Optional notes body for validate and reject-validation actions."""
     validation_notes = serializers.CharField(
         required=False, allow_blank=True, default='',
     )
 
 
 class RejectValidationSerializer(serializers.Serializer):
-    """Rejection always requires an explanatory note."""
-    validation_notes = serializers.CharField(min_length=1)
+    rejection_notes = serializers.CharField(min_length=1)
 
 
 # ---------------------------------------------------------------------------
@@ -207,7 +203,6 @@ class ResultFileUploadSerializer(serializers.Serializer):
 # ---------------------------------------------------------------------------
 
 class SignedDownloadURLSerializer(serializers.Serializer):
-    """Shape of the response from the download endpoint."""
     url = serializers.URLField()
     expires_in = serializers.IntegerField()
     filename = serializers.CharField()

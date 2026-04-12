@@ -15,7 +15,10 @@ from rest_framework.exceptions import ValidationError
 
 from apps.audit.models import AuditLog, AuditAction, ActorType
 from apps.users.models import StaffUser
-from .models import ExamCategory, ExamDefinition, LabExamSettings, PricingRule, PricingType
+from .models import (
+    ExamCategory, ExamFamily, ExamSubFamily, TubeType, ExamTechnique,
+    ExamDefinition, LabExamSettings, PricingRule, PricingType,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +96,262 @@ class ExamCategoryService:
 
 
 # ---------------------------------------------------------------------------
+# Reference-data services (ExamFamily, ExamSubFamily, TubeType, ExamTechnique)
+#
+# These mirror ExamCategoryService's shape: create / update / deactivate, each
+# writing an AuditLog entry. Keeping all four in the same module avoids
+# scattering catalog write-paths across files and keeps audit semantics
+# uniform — the ``entity_type`` column in AuditLog is the only thing that
+# changes between them.
+# ---------------------------------------------------------------------------
+
+
+def _audit(actor, action, entity_type, entity_id, diff, request):
+    """Small helper so every reference service writes audit logs identically."""
+    AuditLog.objects.create(
+        actor_type=ActorType.STAFF_USER,
+        actor_id=actor.id,
+        actor_email=actor.email,
+        action=action,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        diff=diff,
+        ip_address=getattr(request, 'audit_ip', None),
+        user_agent=getattr(request, 'audit_user_agent', ''),
+    )
+
+
+class ExamFamilyService:
+    ENTITY = 'ExamFamily'
+
+    @staticmethod
+    def create(validated_data: dict, created_by: StaffUser, request) -> ExamFamily:
+        family = ExamFamily(**validated_data)
+        family.save()
+        _audit(
+            created_by, AuditAction.CREATE, ExamFamilyService.ENTITY, family.id,
+            {'after': {'name': family.name}}, request,
+        )
+        return family
+
+    @staticmethod
+    def update(family: ExamFamily, validated_data: dict, updated_by: StaffUser, request) -> ExamFamily:
+        if not validated_data:
+            return family
+        before = {k: getattr(family, k) for k in validated_data}
+        for field, value in validated_data.items():
+            setattr(family, field, value)
+        family.save(update_fields=list(validated_data.keys()) + ['updated_at'])
+        after = {k: getattr(family, k) for k in validated_data}
+        _audit(
+            updated_by, AuditAction.UPDATE, ExamFamilyService.ENTITY, family.id,
+            {'before': before, 'after': after}, request,
+        )
+        return family
+
+    @staticmethod
+    def deactivate(family: ExamFamily, deactivated_by: StaffUser, request) -> ExamFamily:
+        if not family.is_active:
+            return family
+        family.is_active = False
+        family.save(update_fields=['is_active', 'updated_at'])
+        _audit(
+            deactivated_by, AuditAction.DEACTIVATE, ExamFamilyService.ENTITY, family.id,
+            {'after': {'is_active': False}}, request,
+        )
+        return family
+
+    @staticmethod
+    def reactivate(family: ExamFamily, reactivated_by: StaffUser, request) -> ExamFamily:
+        # Idempotent: already-active → return silently without writing a
+        # duplicate audit event. Only the actual False → True transition is
+        # recorded, which keeps the audit trail meaningful for lifecycle
+        # queries (``action=REACTIVATE`` counts are real transitions, not
+        # no-op clicks).
+        if family.is_active:
+            return family
+        family.is_active = True
+        family.save(update_fields=['is_active', 'updated_at'])
+        _audit(
+            reactivated_by, AuditAction.REACTIVATE, ExamFamilyService.ENTITY, family.id,
+            {'before': {'is_active': False}, 'after': {'is_active': True}}, request,
+        )
+        return family
+
+
+class ExamSubFamilyService:
+    ENTITY = 'ExamSubFamily'
+
+    @staticmethod
+    def create(validated_data: dict, created_by: StaffUser, request) -> ExamSubFamily:
+        sub = ExamSubFamily(**validated_data)
+        sub.save()
+        _audit(
+            created_by, AuditAction.CREATE, ExamSubFamilyService.ENTITY, sub.id,
+            {'after': {'family_id': str(sub.family_id), 'name': sub.name}}, request,
+        )
+        return sub
+
+    @staticmethod
+    def update(sub: ExamSubFamily, validated_data: dict, updated_by: StaffUser, request) -> ExamSubFamily:
+        if not validated_data:
+            return sub
+        before = {k: getattr(sub, k) for k in validated_data}
+        for field, value in validated_data.items():
+            setattr(sub, field, value)
+        sub.save(update_fields=list(validated_data.keys()) + ['updated_at'])
+        after = {k: getattr(sub, k) for k in validated_data}
+        _audit(
+            updated_by, AuditAction.UPDATE, ExamSubFamilyService.ENTITY, sub.id,
+            {'before': before, 'after': after}, request,
+        )
+        return sub
+
+    @staticmethod
+    def deactivate(sub: ExamSubFamily, deactivated_by: StaffUser, request) -> ExamSubFamily:
+        if not sub.is_active:
+            return sub
+        sub.is_active = False
+        sub.save(update_fields=['is_active', 'updated_at'])
+        _audit(
+            deactivated_by, AuditAction.DEACTIVATE, ExamSubFamilyService.ENTITY, sub.id,
+            {'after': {'is_active': False}}, request,
+        )
+        return sub
+
+    @staticmethod
+    def reactivate(sub: ExamSubFamily, reactivated_by: StaffUser, request) -> ExamSubFamily:
+        # Reactivating a sub-family whose parent family is inactive would
+        # create a zombie: the record would show as active but no new exam
+        # could reference it (``ExamSubFamilyCreateSerializer.validate_family_id``
+        # already rejects inactive parents). We reject here so the catalog
+        # stays internally consistent and the UI gives the admin an actionable
+        # error instead of a silent half-broken row.
+        if sub.is_active:
+            return sub
+        if not sub.family.is_active:
+            raise ValidationError({
+                'family_id': (
+                    'Cannot reactivate a sub-family whose parent family is '
+                    'inactive. Reactivate the family first.'
+                ),
+            })
+        sub.is_active = True
+        sub.save(update_fields=['is_active', 'updated_at'])
+        _audit(
+            reactivated_by, AuditAction.REACTIVATE, ExamSubFamilyService.ENTITY, sub.id,
+            {'before': {'is_active': False}, 'after': {'is_active': True}}, request,
+        )
+        return sub
+
+
+class TubeTypeService:
+    ENTITY = 'TubeType'
+
+    @staticmethod
+    def create(validated_data: dict, created_by: StaffUser, request) -> TubeType:
+        tube = TubeType(**validated_data)
+        tube.save()
+        _audit(
+            created_by, AuditAction.CREATE, TubeTypeService.ENTITY, tube.id,
+            {'after': {'name': tube.name}}, request,
+        )
+        return tube
+
+    @staticmethod
+    def update(tube: TubeType, validated_data: dict, updated_by: StaffUser, request) -> TubeType:
+        if not validated_data:
+            return tube
+        before = {k: getattr(tube, k) for k in validated_data}
+        for field, value in validated_data.items():
+            setattr(tube, field, value)
+        tube.save(update_fields=list(validated_data.keys()) + ['updated_at'])
+        after = {k: getattr(tube, k) for k in validated_data}
+        _audit(
+            updated_by, AuditAction.UPDATE, TubeTypeService.ENTITY, tube.id,
+            {'before': before, 'after': after}, request,
+        )
+        return tube
+
+    @staticmethod
+    def deactivate(tube: TubeType, deactivated_by: StaffUser, request) -> TubeType:
+        if not tube.is_active:
+            return tube
+        tube.is_active = False
+        tube.save(update_fields=['is_active', 'updated_at'])
+        _audit(
+            deactivated_by, AuditAction.DEACTIVATE, TubeTypeService.ENTITY, tube.id,
+            {'after': {'is_active': False}}, request,
+        )
+        return tube
+
+    @staticmethod
+    def reactivate(tube: TubeType, reactivated_by: StaffUser, request) -> TubeType:
+        if tube.is_active:
+            return tube
+        tube.is_active = True
+        tube.save(update_fields=['is_active', 'updated_at'])
+        _audit(
+            reactivated_by, AuditAction.REACTIVATE, TubeTypeService.ENTITY, tube.id,
+            {'before': {'is_active': False}, 'after': {'is_active': True}}, request,
+        )
+        return tube
+
+
+class ExamTechniqueService:
+    ENTITY = 'ExamTechnique'
+
+    @staticmethod
+    def create(validated_data: dict, created_by: StaffUser, request) -> ExamTechnique:
+        tech = ExamTechnique(**validated_data)
+        tech.save()
+        _audit(
+            created_by, AuditAction.CREATE, ExamTechniqueService.ENTITY, tech.id,
+            {'after': {'name': tech.name}}, request,
+        )
+        return tech
+
+    @staticmethod
+    def update(tech: ExamTechnique, validated_data: dict, updated_by: StaffUser, request) -> ExamTechnique:
+        if not validated_data:
+            return tech
+        before = {k: getattr(tech, k) for k in validated_data}
+        for field, value in validated_data.items():
+            setattr(tech, field, value)
+        tech.save(update_fields=list(validated_data.keys()) + ['updated_at'])
+        after = {k: getattr(tech, k) for k in validated_data}
+        _audit(
+            updated_by, AuditAction.UPDATE, ExamTechniqueService.ENTITY, tech.id,
+            {'before': before, 'after': after}, request,
+        )
+        return tech
+
+    @staticmethod
+    def deactivate(tech: ExamTechnique, deactivated_by: StaffUser, request) -> ExamTechnique:
+        if not tech.is_active:
+            return tech
+        tech.is_active = False
+        tech.save(update_fields=['is_active', 'updated_at'])
+        _audit(
+            deactivated_by, AuditAction.DEACTIVATE, ExamTechniqueService.ENTITY, tech.id,
+            {'after': {'is_active': False}}, request,
+        )
+        return tech
+
+    @staticmethod
+    def reactivate(tech: ExamTechnique, reactivated_by: StaffUser, request) -> ExamTechnique:
+        if tech.is_active:
+            return tech
+        tech.is_active = True
+        tech.save(update_fields=['is_active', 'updated_at'])
+        _audit(
+            reactivated_by, AuditAction.REACTIVATE, ExamTechniqueService.ENTITY, tech.id,
+            {'before': {'is_active': False}, 'after': {'is_active': True}}, request,
+        )
+        return tech
+
+
+# ---------------------------------------------------------------------------
 # ExamDefinition
 # ---------------------------------------------------------------------------
 
@@ -119,11 +378,29 @@ class ExamDefinitionService:
 
     @staticmethod
     def update(exam: ExamDefinition, validated_data: dict, updated_by: StaffUser, request) -> ExamDefinition:
-        # Resolve category_id → category FK if provided
-        category_id = validated_data.pop('category_id', None)
-        if category_id is not None:
-            validated_data['category_id'] = category_id
+        """
+        Apply a partial update to an exam definition and write an audit log.
 
+        Historical integrity: existing ``AnalysisRequestItem`` rows snapshot
+        ``unit_price`` into their own column at creation time, so changing
+        ``ExamDefinition.unit_price`` here never back-propagates into past
+        requests. This function therefore does not need to touch any
+        request-related model — the guarantee is enforced by the data model.
+
+        Audit: every meaningful write is recorded as one ``UPDATE`` entry
+        with a full before/after diff of the fields the caller actually
+        changed. Only the keys present in ``validated_data`` are snapshotted,
+        so untouched columns are not flagged as "changed" by accident.
+        """
+        if not validated_data:
+            return exam
+
+        # Note on FK clears: when the caller passes e.g. ``sub_family_id: None``
+        # that is a legitimate "detach the sub-family" intent. Django's ORM
+        # handles ``setattr(exam, 'sub_family_id', None)`` natively, so we
+        # iterate ``validated_data`` as-is without any pre-filtering. The
+        # previous implementation stripped ``None`` FK values and silently
+        # failed to apply legitimate clears.
         before = {k: getattr(exam, k) for k in validated_data}
 
         for field, value in validated_data.items():
