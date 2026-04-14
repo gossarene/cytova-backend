@@ -144,15 +144,23 @@ class ExamCategory(BaseModel):
 # ExamDefinition
 # ---------------------------------------------------------------------------
 
+class ResultStructure(models.TextChoices):
+    SINGLE_VALUE    = 'SINGLE_VALUE',    'Single Value'
+    MULTI_PARAMETER = 'MULTI_PARAMETER', 'Multi Parameter'
+
+
 class ExamDefinition(BaseModel):
     """
     Reusable descriptor for one exam type.
 
-    `code` is a short identifier used in external reporting and integrations.
-    It is unique within the tenant and must not change once an exam item
-    references this definition.
+    ``result_structure`` determines how results are entered:
+        SINGLE_VALUE    — one value + unit + reference_range on the definition
+        MULTI_PARAMETER — child ``ExamParameter`` rows define the result shape
 
-    Hard delete is blocked — deactivate instead.
+    ``technique`` is mandatory and references ``ExamTechnique``.
+
+    ``code`` is unique within the tenant and must not change once an exam
+    item references this definition. Hard delete is blocked.
     """
     # Legacy FK — kept until data migration removes it
     category = models.ForeignKey(
@@ -163,7 +171,7 @@ class ExamDefinition(BaseModel):
         blank=True,
     )
 
-    # New structured classification
+    # Structured classification
     family = models.ForeignKey(
         ExamFamily,
         on_delete=models.PROTECT,
@@ -187,10 +195,8 @@ class ExamDefinition(BaseModel):
     )
     technique = models.ForeignKey(
         ExamTechnique,
-        on_delete=models.SET_NULL,
+        on_delete=models.PROTECT,
         related_name='exams',
-        null=True,
-        blank=True,
     )
     fasting_required = models.BooleanField(
         default=False,
@@ -203,6 +209,25 @@ class ExamDefinition(BaseModel):
         max_length=10,
         choices=SampleType.choices,
         db_index=True,
+    )
+    result_structure = models.CharField(
+        max_length=20,
+        choices=ResultStructure.choices,
+        default=ResultStructure.SINGLE_VALUE,
+        db_index=True,
+        help_text='Whether results are a single value or multiple parameters.',
+    )
+    unit = models.CharField(
+        max_length=50,
+        blank=True,
+        default='',
+        help_text='Result unit for SINGLE_VALUE exams (e.g. g/dL, mmol/L).',
+    )
+    reference_range = models.CharField(
+        max_length=100,
+        blank=True,
+        default='',
+        help_text='Normal range for SINGLE_VALUE exams (e.g. 12.0–16.0).',
     )
     turnaround_hours = models.PositiveIntegerField(
         null=True,
@@ -229,6 +254,49 @@ class ExamDefinition(BaseModel):
     def delete(self, *args, **kwargs):
         raise PermissionError(
             'Exam definitions cannot be deleted. Use deactivation instead.'
+        )
+
+
+class ExamParameter(BaseModel):
+    """
+    One result parameter within a MULTI_PARAMETER exam definition.
+
+    Each parameter defines a named sub-result (e.g. WBC, RBC, Hemoglobin
+    inside a Complete Blood Count panel). ``display_order`` controls the
+    order parameters appear in result entry and report forms.
+    """
+    exam_definition = models.ForeignKey(
+        ExamDefinition,
+        on_delete=models.CASCADE,
+        related_name='parameters',
+    )
+    code = models.CharField(
+        max_length=50,
+        help_text='Short identifier for this parameter within the exam.',
+    )
+    name = models.CharField(max_length=255)
+    unit = models.CharField(max_length=50, blank=True, default='')
+    reference_range = models.CharField(max_length=100, blank=True, default='')
+    display_order = models.IntegerField(default=0, db_index=True)
+    is_active = models.BooleanField(default=True, db_index=True)
+
+    class Meta:
+        verbose_name = 'Exam Parameter'
+        verbose_name_plural = 'Exam Parameters'
+        ordering = ['display_order', 'name']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['exam_definition', 'code'],
+                name='unique_param_code_per_exam',
+            ),
+        ]
+
+    def __str__(self):
+        return f'{self.exam_definition.code} / {self.code} — {self.name}'
+
+    def delete(self, *args, **kwargs):
+        raise PermissionError(
+            'Exam parameters cannot be hard-deleted. Deactivate instead.'
         )
 
 

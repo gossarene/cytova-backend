@@ -177,6 +177,66 @@ class ResultVersion(BaseModel):
         )
 
 
+class ResultValue(BaseModel):
+    """
+    One structured result value within a ResultVersion.
+
+    For SINGLE_VALUE exams: one row per version, parameter=null.
+    For MULTI_PARAMETER exams: one row per entered parameter.
+
+    Snapshot fields (name_snapshot, unit_snapshot, reference_range_snapshot)
+    freeze the catalog metadata at entry time so historical results remain
+    readable even if the exam definition or parameters are later modified.
+    """
+    result_version = models.ForeignKey(
+        ResultVersion,
+        on_delete=models.CASCADE,
+        related_name='values',
+    )
+    parameter = models.ForeignKey(
+        'catalog.ExamParameter',
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='result_values',
+    )
+    name_snapshot = models.CharField(
+        max_length=255,
+        blank=True,
+        default='',
+        help_text='Parameter name frozen at entry time.',
+    )
+    value = models.TextField(blank=True, default='')
+    unit_snapshot = models.CharField(max_length=50, blank=True, default='')
+    reference_range_snapshot = models.CharField(max_length=100, blank=True, default='')
+    is_abnormal = models.BooleanField(default=False)
+    display_order = models.IntegerField(default=0)
+
+    class Meta:
+        verbose_name = 'Result Value'
+        verbose_name_plural = 'Result Values'
+        ordering = ['display_order', 'name_snapshot']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['result_version', 'parameter'],
+                condition=models.Q(parameter__isnull=False),
+                name='unique_param_per_version',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['result_version', 'display_order']),
+        ]
+
+    def __str__(self):
+        label = self.name_snapshot or 'single'
+        return f'{label}: {self.value} {self.unit_snapshot}'
+
+    def delete(self, *args, **kwargs):
+        raise PermissionError(
+            'Result values are medical records — hard delete is blocked.'
+        )
+
+
 class ResultFile(models.Model):
     """
     A file (PDF or image scan) attached to a ResultVersion.

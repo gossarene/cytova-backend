@@ -39,7 +39,7 @@ from apps.requests.models import (
 )
 from apps.requests.state_machine import RequestStateMachine, ItemStateMachine
 from apps.users.models import StaffUser
-from .models import ResultVersion, ResultFile, ResultStatus
+from .models import ResultVersion, ResultValue, ResultFile, ResultStatus
 from .state_machine import ResultStateMachine as VersionStateMachine
 
 logger = logging.getLogger(__name__)
@@ -70,6 +70,81 @@ _RESULT_ENTRY_ELIGIBLE = {
 }
 
 
+def _create_result_values(version: ResultVersion, values_input: list, exam_def) -> list:
+    """
+    Create ResultValue rows for a version based on structured input.
+    Snapshots metadata from the catalog at creation time.
+    Returns the created rows.
+    """
+    from apps.catalog.models import ResultStructure, ExamParameter
+
+    structure = exam_def.result_structure
+
+    if structure == ResultStructure.SINGLE_VALUE:
+        if len(values_input) > 1:
+            raise ValidationError(
+                'Single-value exams expect at most one value entry.'
+            )
+        row = values_input[0] if values_input else {}
+        return [ResultValue.objects.create(
+            result_version=version,
+            parameter=None,
+            name_snapshot='',
+            value=row.get('value', version.result_value),
+            unit_snapshot=exam_def.unit,
+            reference_range_snapshot=exam_def.reference_range,
+            is_abnormal=row.get('is_abnormal', version.is_abnormal),
+            display_order=0,
+        )]
+
+    # MULTI_PARAMETER
+    if not values_input:
+        return []
+
+    param_ids = [v['parameter_id'] for v in values_input if v.get('parameter_id')]
+    if len(param_ids) != len(set(param_ids)):
+        raise ValidationError('Duplicate parameter entries are not allowed.')
+
+    valid_params = {
+        str(p.id): p
+        for p in ExamParameter.objects.filter(
+            exam_definition=exam_def, is_active=True,
+        )
+    }
+    for pid in param_ids:
+        if str(pid) not in valid_params:
+            raise ValidationError(
+                f'Parameter {pid} is not a valid active parameter '
+                f'for exam {exam_def.code}.'
+            )
+
+    created = []
+    for v in values_input:
+        pid = v.get('parameter_id')
+        if not pid:
+            raise ValidationError(
+                'parameter_id is required for multi-parameter exam values.'
+            )
+        param = valid_params[str(pid)]
+        created.append(ResultValue.objects.create(
+            result_version=version,
+            parameter=param,
+            name_snapshot=param.name,
+            value=v.get('value', ''),
+            unit_snapshot=param.unit,
+            reference_range_snapshot=param.reference_range,
+            is_abnormal=v.get('is_abnormal', False),
+            display_order=param.display_order,
+        ))
+    return created
+
+
+def _replace_result_values(version: ResultVersion, values_input: list, exam_def) -> list:
+    """Replace all value rows on a DRAFT version (for update)."""
+    ResultValue.objects.filter(result_version=version).delete()
+    return _create_result_values(version, values_input, exam_def)
+
+
 # ---------------------------------------------------------------------------
 # ResultVersionService
 # ---------------------------------------------------------------------------
@@ -89,20 +164,15 @@ class ResultVersionService:
         comments: str = '',
         internal_notes: str = '',
         notes: str = '',
+        values: list | None = None,
     ) -> ResultVersion:
         """
         Create a new DRAFT result version for the given item.
 
-        Preconditions:
-            - Item must be COLLECTED or RESULT_ENTERED.
-            - If a current version exists, it must be REJECTED (re-entry
-              after biologist rejection). A current DRAFT or SUBMITTED
-              version blocks creation — edit or submit the existing one.
-
-        Side effects:
-            - The previous current version (if any) is marked is_current=False.
-            - Item transitions to RESULT_ENTERED if currently COLLECTED.
-            - reference_range is auto-populated from LabExamSettings if blank.
+        For SINGLE_VALUE exams, accepts either the legacy flat fields
+        (result_value, result_unit, etc.) or a ``values`` list with one
+        entry. For MULTI_PARAMETER exams, ``values`` must contain
+        parameter_id + value pairs — the backend snapshots metadata.
         """
         if item.status not in _RESULT_ENTRY_ELIGIBLE:
             raise ValidationError(
@@ -117,9 +187,11 @@ class ResultVersionService:
                 f'Edit or submit the existing version before creating a new one.'
             )
 
+        exam_def = item.exam_definition
+
         if not reference_range:
             try:
-                reference_range = item.exam_definition.lab_settings.reference_range
+                reference_range = exam_def.lab_settings.reference_range
             except Exception:
                 reference_range = ''
 
@@ -147,6 +219,12 @@ class ResultVersionService:
             entered_at=timezone.now(),
         )
         version.save()
+
+        _create_result_values(
+            version,
+            values if values is not None else [],
+            exam_def,
+        )
 
         if item.status == ItemStatus.COLLECTED:
             ItemStateMachine.transition(item, ItemStatus.RESULT_ENTERED)
@@ -182,23 +260,28 @@ class ResultVersionService:
             )
         if not version.is_current:
             raise ValidationError('Only the current version can be edited.')
-        if not validated_data:
-            return version
 
-        before = {k: getattr(version, k) for k in validated_data}
-        for field, value in validated_data.items():
-            setattr(version, field, value)
-        version.save(update_fields=list(validated_data.keys()) + ['updated_at'])
-        after = {k: getattr(version, k) for k in validated_data}
+        values_input = validated_data.pop('values', None)
 
-        _audit(
-            actor=updated_by,
-            action=AuditAction.UPDATE,
-            entity_type='ResultVersion',
-            entity_id=version.id,
-            diff={'before': before, 'after': after},
-            request=request,
-        )
+        if validated_data:
+            before = {k: getattr(version, k) for k in validated_data}
+            for field, value in validated_data.items():
+                setattr(version, field, value)
+            version.save(update_fields=list(validated_data.keys()) + ['updated_at'])
+            after = {k: getattr(version, k) for k in validated_data}
+
+            _audit(
+                actor=updated_by,
+                action=AuditAction.UPDATE,
+                entity_type='ResultVersion',
+                entity_id=version.id,
+                diff={'before': before, 'after': after},
+                request=request,
+            )
+
+        if values_input is not None:
+            exam_def = version.item.exam_definition
+            _replace_result_values(version, values_input, exam_def)
 
         return version
 
@@ -210,26 +293,26 @@ class ResultVersionService:
         request,
     ) -> ResultVersion:
         """
-        Update patient-visible comments or validation notes on a
-        VALIDATED result version. Allowed only while the parent request
-        is still in READY_FOR_RELEASE (before the biologist finalizes).
-        Once the request is VALIDATED, no further edits are permitted.
+        Update the patient-facing ``comments`` field (and optionally
+        ``validation_notes``) on a current result version that is under
+        biologist review.
+
+        Allowed on SUBMITTED or VALIDATED versions while the parent
+        request has not been finalized. Once the request reaches
+        VALIDATED, the comments are locked.
         """
-        if version.status != ResultStatus.VALIDATED:
+        if version.status not in {ResultStatus.SUBMITTED, ResultStatus.VALIDATED}:
             raise ValidationError(
-                'Review comments can only be edited on VALIDATED results.'
+                'Comments can only be edited on SUBMITTED or VALIDATED results.'
             )
         if not version.is_current:
             raise ValidationError('Only the current version can be edited.')
 
         ar = version.item.analysis_request
-        if ar.status not in {
-            RequestStatus.AWAITING_REVIEW,
-            RequestStatus.READY_FOR_RELEASE,
-        }:
+        if ar.status == RequestStatus.VALIDATED:
             raise ValidationError(
-                'Review comments can only be edited before the request '
-                'is finalized.'
+                'The request has been finalized. Comments can no longer '
+                'be edited.'
             )
 
         allowed_fields = {'comments', 'validation_notes'}
@@ -264,16 +347,42 @@ class ResultVersionService:
     ) -> ResultVersion:
         """
         Transition DRAFT → SUBMITTED.
-        The result_value must be non-empty before submission.
-        Item transitions to UNDER_REVIEW. Request may advance
-        to AWAITING_REVIEW if all active items are submitted or beyond.
+
+        Completeness check depends on the exam's result_structure:
+        - SINGLE_VALUE: the legacy result_value field must be non-empty
+        - MULTI_PARAMETER: every active parameter must have a non-empty
+          ResultValue row
         """
+        from apps.catalog.models import ResultStructure
+
         if not version.is_current:
             raise ValidationError('Only the current version can be submitted.')
-        if not version.result_value.strip():
-            raise ValidationError(
-                'result_value must be set before submitting for review.'
+
+        exam_def = version.item.exam_definition
+
+        if exam_def.result_structure == ResultStructure.MULTI_PARAMETER:
+            active_param_ids = set(
+                exam_def.parameters
+                .filter(is_active=True)
+                .values_list('id', flat=True)
             )
+            filled_param_ids = set(
+                version.values
+                .filter(parameter_id__isnull=False)
+                .exclude(value='')
+                .values_list('parameter_id', flat=True)
+            )
+            missing = active_param_ids - filled_param_ids
+            if missing:
+                raise ValidationError(
+                    f'{len(missing)} parameter(s) still need a value '
+                    f'before submitting for review.'
+                )
+        else:
+            if not version.result_value.strip():
+                raise ValidationError(
+                    'result_value must be set before submitting for review.'
+                )
 
         VersionStateMachine.transition(version, ResultStatus.SUBMITTED)
         version.submitted_by = submitted_by

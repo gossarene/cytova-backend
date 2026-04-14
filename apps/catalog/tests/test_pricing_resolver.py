@@ -28,9 +28,10 @@ def category():
 
 
 @pytest.fixture()
-def exam(category):
+def exam(category, default_technique):
     return ExamDefinition.objects.create(
         category=category,
+        technique=default_technique,
         code='GLU',
         name='Fasting Glucose',
         sample_type=SampleType.BLOOD,

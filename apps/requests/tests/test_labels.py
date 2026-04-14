@@ -116,36 +116,36 @@ def family_c():
 
 
 @pytest.fixture()
-def exam_ham(family_a, category):
+def exam_ham(family_a, category, default_technique):
     return ExamDefinition.objects.create(
-        category=category, family=family_a,
+        category=category, family=family_a, technique=default_technique,
         code='CBC', name='Complete Blood Count',
         sample_type=SampleType.BLOOD, unit_price=Decimal('50.0000'),
     )
 
 
 @pytest.fixture()
-def exam_ham2(family_a, category):
+def exam_ham2(family_a, category, default_technique):
     return ExamDefinition.objects.create(
-        category=category, family=family_a,
+        category=category, family=family_a, technique=default_technique,
         code='HBA1C', name='Glycated Hemoglobin',
         sample_type=SampleType.BLOOD, unit_price=Decimal('80.0000'),
     )
 
 
 @pytest.fixture()
-def exam_bio(family_b, category):
+def exam_bio(family_b, category, default_technique):
     return ExamDefinition.objects.create(
-        category=category, family=family_b,
+        category=category, family=family_b, technique=default_technique,
         code='GLU', name='Fasting Glucose',
         sample_type=SampleType.BLOOD, unit_price=Decimal('30.0000'),
     )
 
 
 @pytest.fixture()
-def exam_imm(family_c, category):
+def exam_imm(family_c, category, default_technique):
     return ExamDefinition.objects.create(
-        category=category, family=family_c,
+        category=category, family=family_c, technique=default_technique,
         code='CRP', name='C-Reactive Protein',
         sample_type=SampleType.BLOOD, unit_price=Decimal('40.0000'),
     )
@@ -620,3 +620,77 @@ class TestLabelsDownload:
         # Not a raw media URL — this is the critical security property.
         assert '/media/' not in pdf_url
         assert not pdf_url.startswith('http')
+
+
+# ---------------------------------------------------------------------------
+# Label download restriction after collection
+# ---------------------------------------------------------------------------
+
+class TestLabelDownloadAfterCollection:
+
+    def _generate_labels(self, admin_client, ar):
+        resp = admin_client.post(f'{API}/{ar.id}/labels/')
+        assert resp.status_code == 200
+        return _data(resp)
+
+    def test_partial_collection_allows_download(
+        self, admin_client, patient, exam_ham, exam_bio,
+        lab_admin, technician, make_request,
+    ):
+        from apps.requests.services import AnalysisRequestItemService
+        ar = _create_confirmed_request(
+            patient, lab_admin, make_request, [exam_ham.id, exam_bio.id],
+        )
+        self._generate_labels(admin_client, ar)
+
+        items = list(ar.items.order_by('created_at'))
+        AnalysisRequestItemService.mark_collected(
+            item=items[0], collected_by=technician,
+            request=make_request(technician),
+        )
+
+        # tech_client is not admin — should still be allowed (partial)
+        tech = APIClient(HTTP_HOST='testlab.localhost')
+        tech.force_authenticate(user=technician)
+        resp = tech.get(f'{API}/{ar.id}/labels/download/')
+        assert resp.status_code == 200
+
+    def test_full_collection_blocks_download(
+        self, admin_client, patient, exam_ham, exam_bio,
+        lab_admin, technician, make_request,
+    ):
+        from apps.requests.services import AnalysisRequestItemService
+        ar = _create_confirmed_request(
+            patient, lab_admin, make_request, [exam_ham.id, exam_bio.id],
+        )
+        self._generate_labels(admin_client, ar)
+
+        for item in ar.items.all():
+            AnalysisRequestItemService.mark_collected(
+                item=item, collected_by=technician,
+                request=make_request(technician),
+            )
+
+        tech = APIClient(HTTP_HOST='testlab.localhost')
+        tech.force_authenticate(user=technician)
+        resp = tech.get(f'{API}/{ar.id}/labels/download/')
+        assert resp.status_code == 403
+
+    def test_admin_can_download_after_full_collection(
+        self, admin_client, patient, exam_ham, exam_bio,
+        lab_admin, technician, make_request,
+    ):
+        from apps.requests.services import AnalysisRequestItemService
+        ar = _create_confirmed_request(
+            patient, lab_admin, make_request, [exam_ham.id, exam_bio.id],
+        )
+        self._generate_labels(admin_client, ar)
+
+        for item in ar.items.all():
+            AnalysisRequestItemService.mark_collected(
+                item=item, collected_by=technician,
+                request=make_request(technician),
+            )
+
+        resp = admin_client.get(f'{API}/{ar.id}/labels/download/')
+        assert resp.status_code == 200

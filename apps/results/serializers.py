@@ -8,7 +8,7 @@ from django.conf import settings
 from rest_framework import serializers
 
 from apps.catalog.models import ExamDefinition
-from .models import ResultVersion, ResultFile, ResultStatus
+from .models import ResultVersion, ResultValue, ResultFile, ResultStatus
 
 
 # ---------------------------------------------------------------------------
@@ -31,6 +31,30 @@ class ResultFileSerializer(serializers.ModelSerializer):
 
     def get_file_size_kb(self, obj):
         return round(obj.file_size / 1024, 1)
+
+
+# ---------------------------------------------------------------------------
+# ResultValue
+# ---------------------------------------------------------------------------
+
+class ResultValueSerializer(serializers.ModelSerializer):
+    parameter_id = serializers.UUIDField(read_only=True, default=None)
+
+    class Meta:
+        model = ResultValue
+        fields = [
+            'id', 'parameter_id',
+            'name_snapshot', 'value', 'unit_snapshot',
+            'reference_range_snapshot', 'is_abnormal',
+            'display_order',
+        ]
+
+
+class ResultValueInputSerializer(serializers.Serializer):
+    """Input for a single result value row (used in create/update)."""
+    parameter_id = serializers.UUIDField(required=False, allow_null=True, default=None)
+    value = serializers.CharField(allow_blank=True, default='')
+    is_abnormal = serializers.BooleanField(default=False)
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +117,7 @@ class ResultVersionDetailSerializer(serializers.ModelSerializer):
         source='published_by.email', read_only=True, default=None,
     )
     files = ResultFileSerializer(many=True, read_only=True)
+    values = ResultValueSerializer(many=True, read_only=True)
 
     class Meta:
         model = ResultVersion
@@ -109,7 +134,7 @@ class ResultVersionDetailSerializer(serializers.ModelSerializer):
             'rejection_notes',
             'rejected_by_email', 'rejected_at',
             'published_by_email', 'published_at',
-            'files',
+            'files', 'values',
             'created_at', 'updated_at',
         ]
 
@@ -133,6 +158,7 @@ class ResultVersionCreateSerializer(serializers.Serializer):
         required=False, allow_blank=True, default='',
     )
     notes = serializers.CharField(required=False, allow_blank=True, default='')
+    values = ResultValueInputSerializer(many=True, required=False, default=[])
 
     def validate_item_id(self, value):
         from apps.requests.models import AnalysisRequestItem, ItemStatus
@@ -155,6 +181,13 @@ class ResultVersionUpdateSerializer(serializers.Serializer):
     comments = serializers.CharField(required=False, allow_blank=True)
     internal_notes = serializers.CharField(required=False, allow_blank=True)
     notes = serializers.CharField(required=False, allow_blank=True)
+    values = ResultValueInputSerializer(many=True, required=False)
+
+
+class ReviewCommentsUpdateSerializer(serializers.Serializer):
+    """Update patient-facing comments during biologist review."""
+    comments = serializers.CharField(required=False, allow_blank=True)
+    validation_notes = serializers.CharField(required=False, allow_blank=True)
 
 
 class ValidationNotesSerializer(serializers.Serializer):

@@ -127,6 +127,14 @@ class AnalysisRequestViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet)
             # schema. Unauthenticated callers hit DRF's 401 path before
             # reaching the view.
             return [IsAnyStaff()]
+        if self.action == 'report_generate':
+            # Generating the final patient report is a biologist-level
+            # responsibility — the same user who finalizes the request.
+            return [IsBiologistOrAbove()]
+        if self.action == 'report_download':
+            # Any authenticated staff in the tenant can download the PDF;
+            # tenant isolation is already enforced by middleware.
+            return [IsAnyStaff()]
         # create, partial_update, confirm, preview_pricing
         return [IsReceptionistOrLabAdmin()]
 
@@ -273,10 +281,25 @@ class AnalysisRequestViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet)
         the backend mediates every download. For small label PDFs this
         is the right tradeoff.
         """
+        from .models import ItemStatus
+        from apps.users.models import Role
+
         ar = _get_request_or_404(pk)
         batch = getattr(ar, 'label_batch', None)
         if batch is None or not batch.pdf_file_key:
             raise NotFound('No labels have been generated for this request yet.')
+
+        is_admin = getattr(request.user, 'role', None) == Role.LAB_ADMIN
+        if not is_admin:
+            active_items = ar.items.exclude(status=ItemStatus.REJECTED)
+            all_collected = active_items.exists() and not active_items.filter(
+                status=ItemStatus.PENDING,
+            ).exists()
+            if all_collected:
+                from rest_framework.exceptions import PermissionDenied
+                raise PermissionDenied(
+                    'Labels cannot be downloaded after all specimens are collected.'
+                )
 
         file_obj = default_storage.open(batch.pdf_file_key, 'rb')
         return FileResponse(
@@ -284,6 +307,47 @@ class AnalysisRequestViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet)
             content_type='application/pdf',
             as_attachment=True,
             filename=f'labels_{ar.request_number}.pdf',
+        )
+
+    @action(detail=True, methods=['post'], url_path='report')
+    def report_generate(self, request, pk=None):
+        """
+        Generate the final patient report PDF for a VALIDATED request, or
+        return the existing one if already generated (idempotent).
+        """
+        from .report_service import RequestReportService
+        ar = _get_request_or_404(pk)
+        report = RequestReportService.generate_or_get(
+            analysis_request=ar,
+            generated_by=request.user,
+            request=request,
+        )
+        return Response({
+            'id': str(report.id),
+            'generated_at': report.generated_at.isoformat(),
+            'generated_by_email': report.generated_by.email if report.generated_by else None,
+            'pdf_url': f'/requests/{ar.id}/report/download/',
+        })
+
+    @action(detail=True, methods=['get'], url_path='report/download')
+    def report_download(self, request, pk=None):
+        """
+        Stream the generated report PDF. Access is gated by the same tenant
+        isolation and authentication used by labels_download. The raw
+        storage key is never exposed — every byte flows through this
+        authenticated endpoint.
+        """
+        ar = _get_request_or_404(pk)
+        report = getattr(ar, 'report', None)
+        if report is None or not report.pdf_file_key:
+            raise NotFound('No report has been generated for this request yet.')
+
+        file_obj = default_storage.open(report.pdf_file_key, 'rb')
+        return FileResponse(
+            file_obj,
+            content_type='application/pdf',
+            as_attachment=True,
+            filename=f'report_{ar.request_number}.pdf',
         )
 
     @action(detail=False, methods=['post'], url_path='preview-pricing')

@@ -38,6 +38,7 @@ from .serializers import (
     ResultVersionListSerializer,
     ResultVersionUpdateSerializer,
     RejectValidationSerializer,
+    ReviewCommentsUpdateSerializer,
     ResultFileSerializer,
     ResultFileUploadSerializer,
     SignedDownloadURLSerializer,
@@ -62,7 +63,7 @@ def _get_version_or_404(pk) -> ResultVersion:
                 'entered_by', 'submitted_by',
                 'validated_by', 'rejected_by', 'published_by',
             )
-            .prefetch_related('files__uploaded_by')
+            .prefetch_related('files__uploaded_by', 'values')
             .get(pk=pk)
         )
     except ResultVersion.DoesNotExist:
@@ -105,13 +106,16 @@ class ResultVersionViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet):
                 'entered_by', 'submitted_by',
                 'validated_by', 'rejected_by', 'published_by',
             )
-            .prefetch_related(Prefetch('files', queryset=files_qs))
+            .prefetch_related(
+                Prefetch('files', queryset=files_qs),
+                'values',
+            )
         )
 
     def get_permissions(self):
         if self.action in ('list', 'retrieve'):
             return [IsAnyStaff()]
-        if self.action in ('validate', 'reject', 'publish'):
+        if self.action in ('validate', 'reject', 'publish', 'review_comments'):
             return [IsBiologistOrAbove()]
         # create, partial_update, submit
         return [IsTechnicianOrAbove()]
@@ -144,6 +148,7 @@ class ResultVersionViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet):
             comments=data.get('comments', ''),
             internal_notes=data.get('internal_notes', ''),
             notes=data.get('notes', ''),
+            values=data.get('values'),
         )
         version = _get_version_or_404(version.id)
         return Response(
@@ -208,6 +213,20 @@ class ResultVersionViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet):
             published_by=request.user,
             request=request,
         )
+        return Response(ResultVersionDetailSerializer(version).data)
+
+    @action(detail=True, methods=['patch'], url_path='review-comments')
+    def review_comments(self, request, pk=None):
+        version = _get_version_or_404(pk)
+        serializer = ReviewCommentsUpdateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        version = ResultVersionService.update_review_comments(
+            version=version,
+            validated_data=serializer.validated_data,
+            updated_by=request.user,
+            request=request,
+        )
+        version = _get_version_or_404(version.id)
         return Response(ResultVersionDetailSerializer(version).data)
 
 

@@ -492,14 +492,16 @@ class TestExamDefinitionIntegration:
     endpoints as the source of truth.
     """
 
-    def test_create_exam_with_family_only(self, admin_client, family):
+    def test_create_exam_with_family_only(self, admin_client, family, technique):
         resp = admin_client.post(
             f'{API}/exams/',
             {
                 'family_id': str(family.id),
+                'technique_id': str(technique.id),
                 'code': 'CBC',
                 'name': 'Complete Blood Count',
                 'sample_type': 'BLOOD',
+                'unit': 'g/dL',
                 'unit_price': '50.0000',
             },
             format='json',
@@ -523,6 +525,7 @@ class TestExamDefinitionIntegration:
                 'code': 'PT',
                 'name': 'Prothrombin Time',
                 'sample_type': 'BLOOD',
+                'unit': 'seconds',
                 'unit_price': '40.0000',
             },
             format='json',
@@ -550,9 +553,10 @@ class TestExamDefinitionIntegration:
         )
         assert resp.status_code == 400
 
-    def test_update_exam_set_sub_family(self, admin_client, family, sub_family):
+    def test_update_exam_set_sub_family(self, admin_client, family, sub_family, technique):
         exam = ExamDefinition.objects.create(
             family=family,
+            technique=technique,
             code='UPD',
             name='Update Target',
             sample_type=SampleType.BLOOD,
@@ -568,10 +572,10 @@ class TestExamDefinitionIntegration:
         assert exam.sub_family_id == sub_family.id
 
     def test_update_exam_rejects_stale_sub_family_on_family_change(
-        self, admin_client, family, sub_family, other_family,
+        self, admin_client, family, sub_family, other_family, technique,
     ):
         exam = ExamDefinition.objects.create(
-            family=family, sub_family=sub_family,
+            family=family, sub_family=sub_family, technique=technique,
             code='STALE', name='Stale',
             sample_type=SampleType.BLOOD, unit_price=Decimal('10.0000'),
         )
@@ -805,9 +809,10 @@ class TestTechniqueReactivate:
 class TestExamDefinitionUpdate:
 
     @pytest.fixture()
-    def exam(self, family):
+    def exam(self, family, technique):
         return ExamDefinition.objects.create(
             family=family,
+            technique=technique,
             code='UPD-CBC',
             name='Complete Blood Count',
             sample_type=SampleType.BLOOD,
@@ -959,11 +964,12 @@ class TestExamDefinitionUpdate:
         )
         assert resp.status_code == 400
 
-    def test_update_clears_sub_family_with_null(self, admin_client, family, sub_family):
+    def test_update_clears_sub_family_with_null(self, admin_client, family, sub_family, technique):
         """Explicitly setting sub_family_id to null must actually clear it
         on the instance — not be silently dropped."""
         exam = ExamDefinition.objects.create(
             family=family,
+            technique=technique,
             sub_family=sub_family,
             code='CLR',
             name='Clearable',

@@ -136,6 +136,20 @@ def inventory_manager():
 
 
 # ---------------------------------------------------------------------------
+# Shared catalog fixture — technique is non-null on ExamDefinition
+# ---------------------------------------------------------------------------
+
+@pytest.fixture()
+def default_technique():
+    from apps.catalog.models import ExamTechnique
+    t, _ = ExamTechnique.objects.get_or_create(
+        name='Default Test Technique',
+        defaults={'description': 'Shared test fixture', 'is_active': True},
+    )
+    return t
+
+
+# ---------------------------------------------------------------------------
 # Request factory with audit attributes
 # ---------------------------------------------------------------------------
 

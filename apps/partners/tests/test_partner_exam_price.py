@@ -102,9 +102,10 @@ def family():
 
 
 @pytest.fixture()
-def exam(family):
+def exam(family, default_technique):
     return ExamDefinition.objects.create(
         family=family,
+        technique=default_technique,
         code='CBC',
         name='Complete Blood Count',
         sample_type=SampleType.BLOOD,
@@ -113,9 +114,10 @@ def exam(family):
 
 
 @pytest.fixture()
-def other_exam(family):
+def other_exam(family, default_technique):
     return ExamDefinition.objects.create(
         family=family,
+        technique=default_technique,
         code='GLU',
         name='Glucose',
         sample_type=SampleType.BLOOD,

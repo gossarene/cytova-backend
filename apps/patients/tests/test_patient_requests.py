@@ -31,10 +31,10 @@ def other_patient(lab_admin):
 
 
 @pytest.fixture()
-def exam_definition():
+def exam_definition(default_technique):
     cat = ExamCategory.objects.create(name='Hematology', display_order=1)
     return ExamDefinition.objects.create(
-        category=cat, code='CBC', name='Complete Blood Count',
+        category=cat, technique=default_technique, code='CBC', name='Complete Blood Count',
         sample_type=SampleType.BLOOD, unit_price=Decimal('50.0000'),
     )
 
@@ -125,11 +125,11 @@ class TestPatientRecentRequests:
         assert 'created_at' in data
         assert data['items_count'] == 1
 
-    def test_items_count_correct(self, patient, lab_admin, exam_definition):
+    def test_items_count_correct(self, patient, lab_admin, exam_definition, default_technique):
         """Request with multiple items should report correct count."""
         cat = ExamCategory.objects.create(name='Biochemistry', display_order=2)
         extra_exam = ExamDefinition.objects.create(
-            category=cat, code='GLU', name='Glucose',
+            category=cat, technique=default_technique, code='GLU', name='Glucose',
             sample_type=SampleType.BLOOD, unit_price=Decimal('30.0000'),
         )
         ar = AnalysisRequest.objects.create(

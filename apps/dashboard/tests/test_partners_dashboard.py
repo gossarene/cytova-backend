@@ -23,7 +23,7 @@ from apps.requests.services import AnalysisRequestService
 
 
 @pytest.fixture()
-def dashboard_data(lab_admin, make_request):
+def dashboard_data(lab_admin, make_request, default_technique):
     """
     Creates a realistic dataset:
     - 2 partner orgs
@@ -61,7 +61,7 @@ def dashboard_data(lab_admin, make_request):
 
     cat = ExamCategory.objects.create(name='Dashboard Cat', display_order=1)
     exam = ExamDefinition.objects.create(
-        category=cat, code='DASH-CBC', name='Dashboard CBC',
+        category=cat, technique=default_technique, code='DASH-CBC', name='Dashboard CBC',
         sample_type=SampleType.BLOOD,
     )
     PricingRule.objects.create(

@@ -58,10 +58,11 @@ def inactive_partner(lab_admin, make_request):
 
 
 @pytest.fixture()
-def exam_definition():
+def exam_definition(default_technique):
     cat = ExamCategory.objects.create(name='Hematology', display_order=1)
     return ExamDefinition.objects.create(
         category=cat,
+        technique=default_technique,
         code='CBC',
         name='Complete Blood Count',
         sample_type=SampleType.BLOOD,

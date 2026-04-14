@@ -4,7 +4,8 @@ Cytova — Catalog Serializers
 from rest_framework import serializers
 from .models import (
     ExamCategory, ExamFamily, ExamSubFamily, TubeType, ExamTechnique,
-    ExamDefinition, LabExamSettings, PricingRule, PricingType, SampleType,
+    ExamDefinition, ExamParameter, LabExamSettings, PricingRule,
+    PricingType, ResultStructure, SampleType,
 )
 
 
@@ -264,15 +265,41 @@ class LabExamSettingsWriteSerializer(serializers.Serializer):
 # Exam Definition
 # ---------------------------------------------------------------------------
 
+class ExamParameterSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ExamParameter
+        fields = [
+            'id', 'code', 'name', 'unit', 'reference_range',
+            'display_order', 'is_active', 'created_at',
+        ]
+
+
+class ExamParameterWriteSerializer(serializers.Serializer):
+    code = serializers.CharField(max_length=50)
+    name = serializers.CharField(max_length=255)
+    unit = serializers.CharField(max_length=50, required=False, allow_blank=True, default='')
+    reference_range = serializers.CharField(max_length=100, required=False, allow_blank=True, default='')
+    display_order = serializers.IntegerField(required=False, default=0)
+    is_active = serializers.BooleanField(required=False, default=True)
+
+
+class ExamParameterUpdateSerializer(serializers.Serializer):
+    name = serializers.CharField(max_length=255, required=False)
+    unit = serializers.CharField(max_length=50, required=False, allow_blank=True)
+    reference_range = serializers.CharField(max_length=100, required=False, allow_blank=True)
+    display_order = serializers.IntegerField(required=False)
+    is_active = serializers.BooleanField(required=False)
+
+
 class ExamDefinitionListSerializer(serializers.ModelSerializer):
     family_name = serializers.CharField(source='family.name', default=None, read_only=True)
     sub_family_name = serializers.CharField(source='sub_family.name', default=None, read_only=True)
     tube_type_name = serializers.CharField(source='tube_type.name', default=None, read_only=True)
     technique_name = serializers.CharField(source='technique.name', default=None, read_only=True)
-    # Legacy field kept for frontend compatibility during transition
     category_name = serializers.CharField(source='category.name', default=None, read_only=True)
     unit_price = serializers.DecimalField(max_digits=12, decimal_places=4, coerce_to_string=True)
     is_enabled = serializers.SerializerMethodField()
+    parameters_count = serializers.SerializerMethodField()
 
     class Meta:
         model = ExamDefinition
@@ -283,9 +310,10 @@ class ExamDefinitionListSerializer(serializers.ModelSerializer):
             'tube_type_id', 'tube_type_name',
             'technique_id', 'technique_name',
             'fasting_required',
+            'result_structure', 'unit', 'reference_range',
             'sample_type', 'turnaround_hours', 'unit_price',
             'is_active', 'is_enabled',
-            # Legacy
+            'parameters_count',
             'category_id', 'category_name',
             'created_at',
         ]
@@ -296,16 +324,21 @@ class ExamDefinitionListSerializer(serializers.ModelSerializer):
         except LabExamSettings.DoesNotExist:
             return True
 
+    def get_parameters_count(self, obj):
+        if obj.result_structure != ResultStructure.MULTI_PARAMETER:
+            return 0
+        return obj.parameters.filter(is_active=True).count()
+
 
 class ExamDefinitionDetailSerializer(serializers.ModelSerializer):
     family = ExamFamilyListSerializer(read_only=True)
     sub_family = ExamSubFamilySerializer(read_only=True)
     tube_type = TubeTypeSerializer(read_only=True)
     technique = ExamTechniqueSerializer(read_only=True)
-    # Legacy
     category = ExamCategoryListSerializer(read_only=True)
     unit_price = serializers.DecimalField(max_digits=12, decimal_places=4, coerce_to_string=True)
     lab_settings = LabExamSettingsSerializer(read_only=True)
+    parameters = ExamParameterSerializer(many=True, read_only=True)
 
     class Meta:
         model = ExamDefinition
@@ -313,10 +346,11 @@ class ExamDefinitionDetailSerializer(serializers.ModelSerializer):
             'id', 'code', 'name',
             'family', 'sub_family', 'tube_type', 'technique',
             'fasting_required',
+            'result_structure', 'unit', 'reference_range',
             'sample_type', 'turnaround_hours', 'description',
             'unit_price', 'is_active',
             'lab_settings',
-            # Legacy
+            'parameters',
             'category',
             'created_at', 'updated_at',
         ]
@@ -326,16 +360,23 @@ class ExamDefinitionCreateSerializer(serializers.Serializer):
     family_id = serializers.UUIDField()
     sub_family_id = serializers.UUIDField(required=False, allow_null=True, default=None)
     tube_type_id = serializers.UUIDField(required=False, allow_null=True, default=None)
-    technique_id = serializers.UUIDField(required=False, allow_null=True, default=None)
+    technique_id = serializers.UUIDField()
     fasting_required = serializers.BooleanField(required=False, default=False)
     code = serializers.CharField(max_length=50)
     name = serializers.CharField(max_length=255)
     sample_type = serializers.ChoiceField(choices=SampleType.choices)
+    result_structure = serializers.ChoiceField(
+        choices=ResultStructure.choices,
+        default=ResultStructure.SINGLE_VALUE,
+    )
+    unit = serializers.CharField(max_length=50, required=False, allow_blank=True, default='')
+    reference_range = serializers.CharField(max_length=100, required=False, allow_blank=True, default='')
     turnaround_hours = serializers.IntegerField(required=False, allow_null=True, min_value=1)
     description = serializers.CharField(required=False, allow_blank=True, default='')
     unit_price = serializers.DecimalField(
         max_digits=12, decimal_places=4, min_value=0, default=0,
     )
+    parameters = ExamParameterWriteSerializer(many=True, required=False, default=[])
 
     def validate_family_id(self, value):
         if not ExamFamily.objects.filter(id=value, is_active=True).exists():
@@ -353,7 +394,7 @@ class ExamDefinitionCreateSerializer(serializers.Serializer):
         return value
 
     def validate_technique_id(self, value):
-        if value is not None and not ExamTechnique.objects.filter(id=value, is_active=True).exists():
+        if not ExamTechnique.objects.filter(id=value, is_active=True).exists():
             raise serializers.ValidationError('Technique not found or inactive.')
         return value
 
@@ -364,8 +405,6 @@ class ExamDefinitionCreateSerializer(serializers.Serializer):
         return code
 
     def validate(self, attrs):
-        # Coherence rule: if a sub_family is provided, it must belong to the
-        # selected family. family is required, sub_family is optional.
         sub_family_id = attrs.get('sub_family_id')
         if sub_family_id is not None:
             family_id = attrs.get('family_id')
@@ -375,16 +414,39 @@ class ExamDefinitionCreateSerializer(serializers.Serializer):
                 raise serializers.ValidationError({
                     'sub_family_id': 'Sub-family does not belong to the selected family.',
                 })
+
+        structure = attrs.get('result_structure', ResultStructure.SINGLE_VALUE)
+        params = attrs.get('parameters', [])
+
+        if structure == ResultStructure.SINGLE_VALUE:
+            if not attrs.get('unit', '').strip():
+                raise serializers.ValidationError({
+                    'unit': 'Unit is required for single-value exams.',
+                })
+
+        if structure == ResultStructure.MULTI_PARAMETER:
+            if not params:
+                raise serializers.ValidationError({
+                    'parameters': 'At least one parameter is required for multi-parameter exams.',
+                })
+            codes = [p['code'] for p in params]
+            if len(codes) != len(set(codes)):
+                raise serializers.ValidationError({
+                    'parameters': 'Parameter codes must be unique within the exam.',
+                })
+
         return attrs
 
 
 class ExamDefinitionUpdateSerializer(serializers.Serializer):
-    """code is immutable. family replaces category for updates."""
+    """code and result_structure are immutable after creation."""
     family_id = serializers.UUIDField(required=False)
     sub_family_id = serializers.UUIDField(required=False, allow_null=True)
     tube_type_id = serializers.UUIDField(required=False, allow_null=True)
-    technique_id = serializers.UUIDField(required=False, allow_null=True)
+    technique_id = serializers.UUIDField(required=False)
     fasting_required = serializers.BooleanField(required=False)
+    unit = serializers.CharField(max_length=50, required=False, allow_blank=True)
+    reference_range = serializers.CharField(max_length=100, required=False, allow_blank=True)
     name = serializers.CharField(max_length=255, required=False)
     sample_type = serializers.ChoiceField(choices=SampleType.choices, required=False)
     turnaround_hours = serializers.IntegerField(required=False, allow_null=True, min_value=1)
@@ -409,20 +471,18 @@ class ExamDefinitionUpdateSerializer(serializers.Serializer):
         return value
 
     def validate_technique_id(self, value):
-        if value is not None and not ExamTechnique.objects.filter(id=value, is_active=True).exists():
+        if not ExamTechnique.objects.filter(id=value, is_active=True).exists():
             raise serializers.ValidationError('Technique not found or inactive.')
         return value
 
     def validate(self, attrs):
-        # Code is a stable business identifier — once an exam definition
-        # exists it may be referenced by analysis requests, reports, and
-        # external integrations, so renaming it silently is dangerous. We
-        # reject explicitly (400) when ``code`` is present in the raw payload
-        # instead of silently stripping it, so a client mis-using the endpoint
-        # gets immediate, auditable feedback instead of a fake success.
         if 'code' in self.initial_data:
             raise serializers.ValidationError({
                 'code': 'Code is immutable after creation and cannot be changed.',
+            })
+        if 'result_structure' in self.initial_data:
+            raise serializers.ValidationError({
+                'result_structure': 'Result structure is immutable after creation.',
             })
 
         # Coherence rule on the *resulting* (family, sub_family) pair after
@@ -441,17 +501,23 @@ class ExamDefinitionUpdateSerializer(serializers.Serializer):
         else:
             resulting_sub_family_id = getattr(instance, 'sub_family_id', None)
 
-        if resulting_sub_family_id is None:
-            return attrs
+        if resulting_sub_family_id is not None:
+            if not ExamSubFamily.objects.filter(
+                id=resulting_sub_family_id,
+                family_id=resulting_family_id,
+                is_active=True,
+            ).exists():
+                raise serializers.ValidationError({
+                    'sub_family_id': 'Sub-family does not belong to the selected family.',
+                })
 
-        if not ExamSubFamily.objects.filter(
-            id=resulting_sub_family_id,
-            family_id=resulting_family_id,
-            is_active=True,
-        ).exists():
-            raise serializers.ValidationError({
-                'sub_family_id': 'Sub-family does not belong to the selected family.',
-            })
+        if instance and 'unit' in attrs:
+            from .models import ResultStructure
+            if instance.result_structure == ResultStructure.SINGLE_VALUE:
+                if not attrs['unit'].strip():
+                    raise serializers.ValidationError({
+                        'unit': 'Unit is required for single-value exams.',
+                    })
 
         return attrs
 

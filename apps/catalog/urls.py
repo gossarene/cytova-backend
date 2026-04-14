@@ -9,6 +9,7 @@ from .views import (
     ExamTechniqueViewSet,
     SampleTypeViewSet,
     ExamDefinitionViewSet,
+    ExamParameterViewSet,
     PricingRuleViewSet,
 )
 
@@ -40,4 +41,22 @@ nested_pricing_urls = [
     ),
 ]
 
-urlpatterns = router.urls + nested_pricing_urls
+nested_parameter_urls = [
+    path(
+        'exams/<uuid:exam_pk>/parameters/',
+        ExamParameterViewSet.as_view({'get': 'list', 'post': 'create'}),
+        name='examparameter-list',
+    ),
+    path(
+        'exams/<uuid:exam_pk>/parameters/<uuid:pk>/',
+        ExamParameterViewSet.as_view({'patch': 'partial_update'}),
+        name='examparameter-detail',
+    ),
+    path(
+        'exams/<uuid:exam_pk>/parameters/<uuid:pk>/deactivate/',
+        ExamParameterViewSet.as_view({'post': 'deactivate'}),
+        name='examparameter-deactivate',
+    ),
+]
+
+urlpatterns = router.urls + nested_pricing_urls + nested_parameter_urls

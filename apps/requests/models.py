@@ -165,6 +165,11 @@ class AnalysisRequest(BaseModel):
         blank=True,
         related_name='cancelled_requests',
     )
+    final_conclusion = models.TextField(
+        blank=True,
+        default='',
+        help_text='Biologist conclusion included on the final patient report.',
+    )
     created_by = models.ForeignKey(
         'users.StaffUser',
         on_delete=models.SET_NULL,
@@ -473,4 +478,49 @@ class RequestLabel(BaseModel):
     def delete(self, *args, **kwargs):
         raise PermissionError(
             'Request labels cannot be deleted — they are traceability records.'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Final patient report
+# ---------------------------------------------------------------------------
+
+class AnalysisRequestReport(BaseModel):
+    """
+    One generated final report PDF per analysis request.
+
+    Generated once from a finalized (VALIDATED) request and reused. PDFs are
+    streamed through a protected backend endpoint — the raw storage path is
+    never exposed. Hard delete is blocked for traceability.
+    """
+    analysis_request = models.OneToOneField(
+        AnalysisRequest,
+        on_delete=models.PROTECT,
+        related_name='report',
+    )
+    generated_by = models.ForeignKey(
+        'users.StaffUser',
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name='generated_reports',
+    )
+    generated_at = models.DateTimeField(default=timezone.now, db_index=True)
+    pdf_file_key = models.CharField(
+        max_length=500,
+        blank=True,
+        default='',
+        help_text='Internal storage key for the rendered PDF. Never exposed to clients.',
+    )
+
+    class Meta:
+        verbose_name = 'Analysis Request Report'
+        verbose_name_plural = 'Analysis Request Reports'
+        ordering = ['-generated_at']
+
+    def __str__(self):
+        return f'Report for {self.analysis_request.request_number}'
+
+    def delete(self, *args, **kwargs):
+        raise PermissionError(
+            'Request reports cannot be deleted — they are medical records.'
         )

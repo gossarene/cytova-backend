@@ -108,17 +108,17 @@ def family():
 
 
 @pytest.fixture()
-def exam_a(family, category):
+def exam_a(family, category, default_technique):
     return ExamDefinition.objects.create(
-        category=category, family=family,
+        category=category, family=family, technique=default_technique,
         code='FA', name='Exam A', sample_type=SampleType.BLOOD,
     )
 
 
 @pytest.fixture()
-def exam_b(family, category):
+def exam_b(family, category, default_technique):
     return ExamDefinition.objects.create(
-        category=category, family=family,
+        category=category, family=family, technique=default_technique,
         code='FB', name='Exam B', sample_type=SampleType.BLOOD,
     )
 

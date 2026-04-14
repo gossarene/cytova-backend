@@ -45,6 +45,7 @@ urlpatterns = [
         path('partners/',     include('apps.partners.urls')),
         path('alerts/',       include('apps.alerts.urls')),
         path('dashboard/',    include('apps.dashboard.urls')),
+        path('lab-settings/', include('apps.lab_settings.urls')),
         # path('audit/',        include('apps.audit.urls')),
         # path('files/',        include('apps.files.urls')),
         # path('portal/',       include('apps.portal.urls')),

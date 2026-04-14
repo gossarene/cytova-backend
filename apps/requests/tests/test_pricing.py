@@ -60,9 +60,10 @@ def category():
 
 
 @pytest.fixture()
-def exam(category):
+def exam(category, default_technique):
     return ExamDefinition.objects.create(
         category=category,
+        technique=default_technique,
         code='GLU',
         name='Fasting Glucose',
         sample_type=SampleType.BLOOD,
@@ -71,9 +72,10 @@ def exam(category):
 
 
 @pytest.fixture()
-def exam_b(category):
+def exam_b(category, default_technique):
     return ExamDefinition.objects.create(
         category=category,
+        technique=default_technique,
         code='HBA1C',
         name='Glycated Hemoglobin',
         sample_type=SampleType.BLOOD,
@@ -129,9 +131,9 @@ class TestExamUnitPrice:
     def test_exam_stores_unit_price(self, exam):
         assert exam.unit_price == Decimal('50.0000')
 
-    def test_exam_default_unit_price_is_zero(self, category):
+    def test_exam_default_unit_price_is_zero(self, category, default_technique):
         exam = ExamDefinition.objects.create(
-            category=category, code='TEST', name='Test',
+            category=category, technique=default_technique, code='TEST', name='Test',
             sample_type=SampleType.BLOOD,
         )
         assert exam.unit_price == 0

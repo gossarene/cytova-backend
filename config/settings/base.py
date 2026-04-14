@@ -60,6 +60,7 @@ TENANT_APPS = [
     'apps.alerts',
     'apps.dashboard',
     'apps.audit',
+    'apps.lab_settings',
 
     # JWT token blacklist is per-tenant (tokens are tenant-scoped)
     'rest_framework_simplejwt.token_blacklist',

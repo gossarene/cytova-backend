@@ -359,8 +359,13 @@ class ExamDefinitionService:
 
     @staticmethod
     def create(validated_data: dict, created_by: StaffUser, request) -> ExamDefinition:
+        from .models import ExamParameter
+        params_data = validated_data.pop('parameters', [])
         exam = ExamDefinition(**validated_data)
         exam.save()
+
+        for p in params_data:
+            ExamParameter.objects.create(exam_definition=exam, **p)
 
         AuditLog.objects.create(
             actor_type=ActorType.STAFF_USER,
@@ -369,7 +374,12 @@ class ExamDefinitionService:
             action=AuditAction.CREATE,
             entity_type='ExamDefinition',
             entity_id=exam.id,
-            diff={'after': {'code': exam.code, 'name': exam.name}},
+            diff={'after': {
+                'code': exam.code,
+                'name': exam.name,
+                'result_structure': exam.result_structure,
+                'parameters_count': len(params_data),
+            }},
             ip_address=getattr(request, 'audit_ip', None),
             user_agent=getattr(request, 'audit_user_agent', ''),
         )
@@ -478,6 +488,87 @@ class ExamDefinitionService:
         )
 
         return settings
+
+
+# ---------------------------------------------------------------------------
+# ExamParameter
+# ---------------------------------------------------------------------------
+
+class ExamParameterService:
+
+    @staticmethod
+    def create(exam: ExamDefinition, validated_data: dict, created_by: StaffUser, request):
+        from .models import ExamParameter, ResultStructure
+        if exam.result_structure != ResultStructure.MULTI_PARAMETER:
+            from rest_framework.exceptions import ValidationError
+            raise ValidationError(
+                'Parameters can only be added to MULTI_PARAMETER exams.'
+            )
+
+        param = ExamParameter(exam_definition=exam, **validated_data)
+        param.save()
+
+        AuditLog.objects.create(
+            actor_type=ActorType.STAFF_USER,
+            actor_id=created_by.id,
+            actor_email=created_by.email,
+            action=AuditAction.CREATE,
+            entity_type='ExamParameter',
+            entity_id=param.id,
+            diff={'after': {'code': param.code, 'name': param.name,
+                            'exam_id': str(exam.id)}},
+            ip_address=getattr(request, 'audit_ip', None),
+            user_agent=getattr(request, 'audit_user_agent', ''),
+        )
+        return param
+
+    @staticmethod
+    def update(param, validated_data: dict, updated_by: StaffUser, request):
+        if not validated_data:
+            return param
+
+        from .models import ExamParameter
+        before = {k: getattr(param, k) for k in validated_data}
+        for field, value in validated_data.items():
+            setattr(param, field, value)
+        param.save(update_fields=list(validated_data.keys()) + ['updated_at'])
+        after = {k: getattr(param, k) for k in validated_data}
+
+        AuditLog.objects.create(
+            actor_type=ActorType.STAFF_USER,
+            actor_id=updated_by.id,
+            actor_email=updated_by.email,
+            action=AuditAction.UPDATE,
+            entity_type='ExamParameter',
+            entity_id=param.id,
+            diff={
+                'before': {k: str(v) for k, v in before.items()},
+                'after': {k: str(v) for k, v in after.items()},
+            },
+            ip_address=getattr(request, 'audit_ip', None),
+            user_agent=getattr(request, 'audit_user_agent', ''),
+        )
+        return param
+
+    @staticmethod
+    def deactivate(param, deactivated_by: StaffUser, request):
+        if not param.is_active:
+            return param
+        param.is_active = False
+        param.save(update_fields=['is_active', 'updated_at'])
+
+        AuditLog.objects.create(
+            actor_type=ActorType.STAFF_USER,
+            actor_id=deactivated_by.id,
+            actor_email=deactivated_by.email,
+            action=AuditAction.DEACTIVATE,
+            entity_type='ExamParameter',
+            entity_id=param.id,
+            diff={'after': {'is_active': False}},
+            ip_address=getattr(request, 'audit_ip', None),
+            user_agent=getattr(request, 'audit_user_agent', ''),
+        )
+        return param
 
 
 # ---------------------------------------------------------------------------

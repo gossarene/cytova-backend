@@ -120,18 +120,18 @@ def family_b():
 
 
 @pytest.fixture()
-def exam_cbc(family_a, category):
+def exam_cbc(family_a, category, default_technique):
     return ExamDefinition.objects.create(
-        category=category, family=family_a,
+        category=category, family=family_a, technique=default_technique,
         code='CBC', name='Complete Blood Count',
         sample_type=SampleType.BLOOD,
     )
 
 
 @pytest.fixture()
-def exam_glu(family_b, category):
+def exam_glu(family_b, category, default_technique):
     return ExamDefinition.objects.create(
-        category=category, family=family_b,
+        category=category, family=family_b, technique=default_technique,
         code='GLU', name='Fasting Glucose',
         sample_type=SampleType.BLOOD,
     )

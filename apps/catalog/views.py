@@ -21,7 +21,7 @@ from .filters import (
 )
 from .models import (
     ExamCategory, ExamFamily, ExamSubFamily, TubeType, ExamTechnique,
-    ExamDefinition, PricingRule, SampleType,
+    ExamDefinition, ExamParameter, PricingRule, SampleType, ResultStructure,
 )
 from .serializers import (
     ExamCategoryCreateSerializer,
@@ -49,12 +49,16 @@ from .serializers import (
     SampleTypeSerializer,
     LabExamSettingsSerializer,
     LabExamSettingsWriteSerializer,
+    ExamParameterSerializer,
+    ExamParameterWriteSerializer,
+    ExamParameterUpdateSerializer,
     PricingRuleCreateSerializer,
     PricingRuleSerializer,
     PricingRuleUpdateSerializer,
 )
 from .services import (
-    ExamCategoryService, ExamDefinitionService, PricingRuleService,
+    ExamCategoryService, ExamDefinitionService, ExamParameterService,
+    PricingRuleService,
     ExamFamilyService, ExamSubFamilyService, TubeTypeService, ExamTechniqueService,
 )
 
@@ -554,6 +558,82 @@ class ExamDefinitionViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet):
             request=request,
         )
         return Response(LabExamSettingsSerializer(lab_settings).data)
+
+
+# ---------------------------------------------------------------------------
+# ExamParameter (nested under /exams/{exam_pk}/parameters/)
+# ---------------------------------------------------------------------------
+
+class ExamParameterViewSet(GenericViewSet):
+    """Manage parameters for MULTI_PARAMETER exam definitions."""
+
+    def get_permissions(self):
+        if self.action == 'list':
+            return [IsAnyStaff()]
+        return [IsLabAdmin()]
+
+    def _get_exam(self):
+        from rest_framework.exceptions import NotFound
+        try:
+            return ExamDefinition.objects.get(pk=self.kwargs['exam_pk'])
+        except ExamDefinition.DoesNotExist:
+            raise NotFound('Exam definition not found.')
+
+    def _get_param(self):
+        from rest_framework.exceptions import NotFound
+        try:
+            return ExamParameter.objects.get(
+                pk=self.kwargs['pk'],
+                exam_definition_id=self.kwargs['exam_pk'],
+            )
+        except ExamParameter.DoesNotExist:
+            raise NotFound('Exam parameter not found.')
+
+    def list(self, request, exam_pk=None, *args, **kwargs):
+        self._get_exam()
+        params = (
+            ExamParameter.objects
+            .filter(exam_definition_id=exam_pk)
+            .order_by('display_order', 'name')
+        )
+        return Response(ExamParameterSerializer(params, many=True).data)
+
+    def create(self, request, exam_pk=None, *args, **kwargs):
+        exam = self._get_exam()
+        serializer = ExamParameterWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        param = ExamParameterService.create(
+            exam=exam,
+            validated_data=serializer.validated_data,
+            created_by=request.user,
+            request=request,
+        )
+        return Response(
+            ExamParameterSerializer(param).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+    def partial_update(self, request, exam_pk=None, pk=None, *args, **kwargs):
+        param = self._get_param()
+        serializer = ExamParameterUpdateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        param = ExamParameterService.update(
+            param=param,
+            validated_data=serializer.validated_data,
+            updated_by=request.user,
+            request=request,
+        )
+        return Response(ExamParameterSerializer(param).data)
+
+    @action(detail=True, methods=['post'], url_path='deactivate')
+    def deactivate(self, request, exam_pk=None, pk=None):
+        param = self._get_param()
+        param = ExamParameterService.deactivate(
+            param=param,
+            deactivated_by=request.user,
+            request=request,
+        )
+        return Response(ExamParameterSerializer(param).data)
 
 
 # ---------------------------------------------------------------------------
