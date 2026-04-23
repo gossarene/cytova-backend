@@ -58,9 +58,23 @@ class StaffUser(AbstractBaseUser, PermissionsMixin):
     """
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     email = models.EmailField(unique=True)
+    title = models.CharField(
+        max_length=20,
+        blank=True,
+        default='',
+        help_text='Professional title (e.g. "Dr", "Pr"). Displayed on '
+                  'signed documents such as final reports.',
+    )
     first_name = models.CharField(max_length=100)
     last_name = models.CharField(max_length=100)
     role = models.CharField(max_length=30, choices=Role.choices)
+    signature_file_key = models.CharField(
+        max_length=500,
+        blank=True,
+        default='',
+        help_text='Internal storage key for the user\'s signature image. '
+                  'Rendered on reports validated by this user.',
+    )
 
     # Django internals
     is_active = models.BooleanField(default=True)
@@ -93,6 +107,13 @@ class StaffUser(AbstractBaseUser, PermissionsMixin):
 
     def get_full_name(self):
         return f'{self.first_name} {self.last_name}'.strip()
+
+    def get_display_name(self):
+        """Full name prefixed with professional title when available."""
+        name = self.get_full_name()
+        if self.title:
+            return f'{self.title} {name}'
+        return name
 
     def get_short_name(self):
         return self.first_name

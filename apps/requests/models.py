@@ -99,7 +99,21 @@ class AnalysisRequest(BaseModel):
         db_index=True,
         blank=True,
         default='',
-        help_text='Auto-generated human-readable identifier.',
+        help_text='Internal/system identifier (e.g. REQ-2026-A2AF70DE). '
+                  'Used for audit logs and backend debugging.',
+    )
+    # A dedicated patient-facing reference keeps internal identifiers out of
+    # printable documents. The two are separate on purpose: the internal
+    # ``request_number`` can stay stable even if the public layout changes,
+    # and the public reference can be regenerated or reformatted in the
+    # future without rewriting audit history.
+    public_reference = models.CharField(
+        max_length=20,
+        unique=True,
+        blank=True,
+        default='',
+        help_text='Clean patient-facing reference (YYYYMMDD-NNNNNN). '
+                  'Used on final reports and other external documents.',
     )
     patient = models.ForeignKey(
         'patients.Patient',
@@ -481,22 +495,100 @@ class RequestLabel(BaseModel):
         )
 
 
+class RequestReferenceSequence(models.Model):
+    """
+    Per-tenant daily counter used by the public_reference allocator.
+
+    One row per calendar ``date`` within this tenant's schema. Overlapping
+    creates serialise on the row via ``select_for_update`` inside the
+    allocator's ``transaction.atomic`` block. The resulting reference is
+    composed as ``YYYYMMDD-<6-digit-sequence>``.
+    """
+    date = models.DateField(unique=True)
+    last_value = models.PositiveIntegerField(default=0)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Request Reference Sequence'
+        verbose_name_plural = 'Request Reference Sequences'
+
+    def __str__(self):
+        return f'RequestReferenceSequence({self.date.isoformat()} @ {self.last_value})'
+
+
+class LabelSequence(models.Model):
+    """
+    Per-tenant monthly counter used by the numeric label code allocator.
+
+    One row per ``(year, month)`` within this tenant's schema. Because
+    the table lives in the tenant schema, the ``(year, month)`` unique
+    constraint is already tenant-scoped — no ``tenant_code`` column is
+    required on the row itself. The allocator composes the final label
+    code by prefixing the tenant's public-schema numeric_code.
+
+    Access path for concurrency safety: callers wrap ``get_or_create``
+    + ``select_for_update`` + increment in a single ``transaction.atomic``
+    block so overlapping label generations serialise on this row.
+    """
+    year = models.PositiveSmallIntegerField()
+    month = models.PositiveSmallIntegerField()
+    last_value = models.PositiveIntegerField(default=0)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Label Sequence'
+        verbose_name_plural = 'Label Sequences'
+        constraints = [
+            models.UniqueConstraint(
+                fields=['year', 'month'],
+                name='unique_label_sequence_year_month',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['year', 'month']),
+        ]
+
+    def __str__(self):
+        return f'LabelSequence({self.year:04d}-{self.month:02d} @ {self.last_value})'
+
+
 # ---------------------------------------------------------------------------
 # Final patient report
 # ---------------------------------------------------------------------------
 
 class AnalysisRequestReport(BaseModel):
     """
-    One generated final report PDF per analysis request.
+    One generated version of the final patient report for an analysis
+    request. A request accumulates one or more versions over time —
+    the first is produced by ``generate_or_get``, each subsequent one
+    by an explicit ``regenerate`` action.
 
-    Generated once from a finalized (VALIDATED) request and reused. PDFs are
-    streamed through a protected backend endpoint — the raw storage path is
-    never exposed. Hard delete is blocked for traceability.
+    Invariants (enforced by DB constraints):
+    - ``version_number`` is unique within a request.
+    - At most one row per request has ``is_current=True``.
+
+    The "current" version is what the download endpoint streams and
+    what the detail payload exposes to the UI. Older versions are
+    retained untouched for traceability and are never deleted.
+
+    Security: ``pdf_file_key`` is an internal storage key, never
+    exposed to clients. Downloads are streamed through the
+    authenticated ``report/download/`` endpoint only.
     """
-    analysis_request = models.OneToOneField(
+    analysis_request = models.ForeignKey(
         AnalysisRequest,
         on_delete=models.PROTECT,
-        related_name='report',
+        related_name='reports',
+    )
+    version_number = models.PositiveIntegerField(
+        help_text='1-indexed version number within this request. '
+                  'Increments on every regenerate action.',
+    )
+    is_current = models.BooleanField(
+        default=True,
+        db_index=True,
+        help_text='True for the version that download and UI use. '
+                  'Exactly one current version per request.',
     )
     generated_by = models.ForeignKey(
         'users.StaffUser',
@@ -516,9 +608,26 @@ class AnalysisRequestReport(BaseModel):
         verbose_name = 'Analysis Request Report'
         verbose_name_plural = 'Analysis Request Reports'
         ordering = ['-generated_at']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['analysis_request', 'version_number'],
+                name='unique_report_version_per_request',
+            ),
+            models.UniqueConstraint(
+                fields=['analysis_request'],
+                condition=models.Q(is_current=True),
+                name='unique_current_report_per_request',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['analysis_request', '-version_number']),
+        ]
 
     def __str__(self):
-        return f'Report for {self.analysis_request.request_number}'
+        return (
+            f'Report v{self.version_number} for '
+            f'{self.analysis_request.request_number}'
+        )
 
     def delete(self, *args, **kwargs):
         raise PermissionError(

@@ -5,12 +5,14 @@ import uuid
 from django.core.files.base import ContentFile
 from django.core.files.storage import default_storage
 from django.http import FileResponse
-from rest_framework.exceptions import NotFound
+from rest_framework.exceptions import NotFound, ValidationError
 from rest_framework.parsers import JSONParser, MultiPartParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.audit.models import ActorType, AuditAction, AuditLog
+from apps.labels.defaults import DEFAULTS_BY_MODE, get_defaults
+from apps.labels.models import LabelPrintPreset
 from common.permissions import IsAnyStaff, IsLabAdmin
 from .models import LabSettings
 from .serializers import (
@@ -141,6 +143,54 @@ class LabLogoView(APIView):
             request=request,
         )
         return Response(LabSettingsSerializer(settings).data)
+
+
+class LabelDefaultsView(APIView):
+    """
+    GET /api/v1/lab-settings/label-defaults/[?mode=A4_SHEET|THERMAL_ROLL]
+
+    Returns the factory default layout values for the requested print
+    mode, or the full map keyed by mode when no ``mode`` query param
+    is supplied. The frontend uses this to pre-fill forms when a user
+    switches print modes without persisting anything yet.
+    """
+    permission_classes = [IsAnyStaff]
+
+    def get(self, request):
+        mode = request.query_params.get('mode')
+        if mode:
+            try:
+                return Response({'mode': mode, 'defaults': get_defaults(mode)})
+            except ValueError:
+                raise ValidationError(f'Unknown print mode: {mode!r}')
+        return Response({'defaults': DEFAULTS_BY_MODE})
+
+
+class LabelPresetListView(APIView):
+    """
+    GET /api/v1/lab-settings/label-presets/
+
+    Lists the currently active platform-managed presets. Tenants read
+    but cannot write — preset authoring happens via Cytova Admin.
+    """
+    permission_classes = [IsAnyStaff]
+
+    def get(self, request):
+        presets = LabelPrintPreset.objects.filter(is_active=True).order_by(
+            'print_mode', 'name',
+        )
+        data = [
+            {
+                'id': str(p.id),
+                'code': p.code,
+                'name': p.name,
+                'print_mode': p.print_mode,
+                'is_system': p.is_system,
+                **p.to_effective_config(),
+            }
+            for p in presets
+        ]
+        return Response({'results': data})
 
 
 def _guess_content_type(file_key: str) -> str:

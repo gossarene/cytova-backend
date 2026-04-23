@@ -32,6 +32,9 @@ SHARED_APPS = [
     # Tenant registry lives in the public schema
     'apps.tenants',
 
+    # Platform-managed label print presets (shared catalog)
+    'apps.labels',
+
     # Standard Django shared apps
     'django.contrib.contenttypes',
     'django.contrib.auth',
@@ -57,6 +60,7 @@ TENANT_APPS = [
     'apps.suppliers',
     'apps.procurement',  # Thin routing app — no models, re-exports suppliers views
     'apps.partners',
+    'apps.invoicing',
     'apps.alerts',
     'apps.dashboard',
     'apps.audit',

@@ -35,6 +35,10 @@ from apps.requests.services import AnalysisRequestService
 
 API = '/api/v1/requests'
 
+# This module tests label generation explicitly — disable the autouse
+# conftest wrapper that auto-generates labels on confirmation.
+pytestmark = pytest.mark.no_auto_labels
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -303,18 +307,27 @@ class TestGenerateOrGet:
     def test_barcode_format_matches_convention(
         self, patient, exam_ham, lab_admin, make_request,
     ):
+        """Numeric-only code: TTTTYYMMSSSSSS (14 digits)."""
+        from django.utils import timezone
+        from django.db import connection
+        from apps.tenants.models import Tenant
+
         ar = _create_confirmed_request(patient, lab_admin, make_request, [exam_ham.id])
         batch = RequestLabelService.generate_or_get(
             analysis_request=ar,
             generated_by=lab_admin,
             request=make_request(lab_admin),
         )
+        tenant_code = Tenant.objects.get(
+            schema_name=connection.schema_name,
+        ).numeric_code
+        today = timezone.now().date()
+        expected_prefix = f'{tenant_code}{today.year % 100:02d}{today.month:02d}'
+
         for label in batch.labels.all():
-            assert label.barcode_value.startswith('LBL-')
-            parts = label.barcode_value.split('-')
-            assert len(parts) == 3
-            assert len(parts[1]) == 8   # YYYYMMDD
-            assert len(parts[2]) == 12  # 12 hex chars
+            assert label.barcode_value.isdigit()
+            assert len(label.barcode_value) == 14
+            assert label.barcode_value.startswith(expected_prefix)
 
     def test_pdf_is_generated_and_stored(
         self, patient, exam_ham, lab_admin, make_request,

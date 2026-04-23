@@ -166,7 +166,7 @@ class TestReportUsesUploadedLogo:
         from apps.results.services import ResultVersionService
         from apps.requests.models import SourceType
         from apps.requests.report_service import (
-            _collect_sections, _render_report,
+            _collect_sections, _render_report, _RenderContext,
         )
         from reportlab.pdfgen import canvas
         from reportlab.lib.pagesizes import A4
@@ -228,7 +228,7 @@ class TestReportUsesUploadedLogo:
         # 1) Render without logo
         buf1 = io.BytesIO()
         c1 = canvas.Canvas(buf1, pagesize=A4)
-        _render_report(c1, ar, settings, _collect_sections(ar))
+        _render_report(c1, ar, settings, _collect_sections(ar), _RenderContext())
         c1.save()
         size_without = len(buf1.getvalue())
 
@@ -239,7 +239,7 @@ class TestReportUsesUploadedLogo:
 
         buf2 = io.BytesIO()
         c2 = canvas.Canvas(buf2, pagesize=A4)
-        _render_report(c2, ar, settings, _collect_sections(ar))
+        _render_report(c2, ar, settings, _collect_sections(ar), _RenderContext())
         c2.save()
         size_with = len(buf2.getvalue())
 

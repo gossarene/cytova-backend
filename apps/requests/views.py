@@ -28,7 +28,7 @@ from common.permissions import (
     IsTechnicianOrAbove,
 )
 from .filters import AnalysisRequestFilter, AnalysisRequestItemFilter
-from .models import AnalysisRequest, AnalysisRequestItem
+from .models import AnalysisRequest, AnalysisRequestItem, AnalysisRequestReport
 from .serializers import (
     AnalysisRequestCreateSerializer,
     AnalysisRequestDetailSerializer,
@@ -58,6 +58,18 @@ def _get_request_or_404(pk) -> AnalysisRequest:
         return AnalysisRequest.objects.get(pk=pk)
     except AnalysisRequest.DoesNotExist:
         raise NotFound('Analysis request not found.')
+
+
+def _serialize_report(ar: AnalysisRequest, report) -> dict:
+    """Shared envelope for report endpoints (generate / regenerate / GET)."""
+    return {
+        'id': str(report.id),
+        'version_number': report.version_number,
+        'is_current': report.is_current,
+        'generated_at': report.generated_at.isoformat(),
+        'generated_by_email': report.generated_by.email if report.generated_by else None,
+        'pdf_url': f'/requests/{ar.id}/report/download/',
+    }
 
 
 def _get_item_or_404(request_pk, pk) -> AnalysisRequestItem:
@@ -131,9 +143,11 @@ class AnalysisRequestViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet)
             # Generating the final patient report is a biologist-level
             # responsibility — the same user who finalizes the request.
             return [IsBiologistOrAbove()]
-        if self.action == 'report_download':
-            # Any authenticated staff in the tenant can download the PDF;
-            # tenant isolation is already enforced by middleware.
+        if self.action in ('report_download', 'report_versions', 'report_version_download'):
+            # Any authenticated staff in the tenant can read the history
+            # and stream any stored version. Tenant isolation is enforced
+            # upstream by CytovaTenantMiddleware, and the view itself
+            # scopes the lookup to the parent request.
             return [IsAnyStaff()]
         # create, partial_update, confirm, preview_pricing
         return [IsReceptionistOrLabAdmin()]
@@ -309,36 +323,126 @@ class AnalysisRequestViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet)
             filename=f'labels_{ar.request_number}.pdf',
         )
 
-    @action(detail=True, methods=['post'], url_path='report')
-    def report_generate(self, request, pk=None):
+    @action(detail=True, methods=['get', 'post'], url_path='report')
+    def report(self, request, pk=None):
         """
-        Generate the final patient report PDF for a VALIDATED request, or
-        return the existing one if already generated (idempotent).
+        GET  — return current report metadata if present, 404 otherwise.
+        POST — generate version 1 if none exists, idempotent thereafter.
         """
         from .report_service import RequestReportService
         ar = _get_request_or_404(pk)
+
+        if request.method == 'GET':
+            current = RequestReportService.get_current(ar)
+            if current is None:
+                raise NotFound('No report has been generated for this request yet.')
+            return Response(_serialize_report(ar, current))
+
         report = RequestReportService.generate_or_get(
             analysis_request=ar,
             generated_by=request.user,
             request=request,
         )
+        return Response(_serialize_report(ar, report))
+
+    @action(detail=True, methods=['post'], url_path='report/regenerate')
+    def report_regenerate(self, request, pk=None):
+        """
+        Create the next report version and switch the "current" pointer.
+
+        Requires a VALIDATED request and at least one previous version.
+        Historical versions are preserved untouched. An explicit audit
+        entry distinguishes this from the initial generation.
+        """
+        from .report_service import RequestReportService
+        ar = _get_request_or_404(pk)
+        report = RequestReportService.regenerate(
+            analysis_request=ar,
+            generated_by=request.user,
+            request=request,
+        )
+        return Response(_serialize_report(ar, report))
+
+    @action(detail=True, methods=['get'], url_path='report/versions')
+    def report_versions(self, request, pk=None):
+        """
+        List every report version generated for this request, newest
+        version first. Exposed so the UI can render a history panel
+        and let operators download any past version.
+        """
+        ar = _get_request_or_404(pk)
+        versions = (
+            AnalysisRequestReport.objects
+            .filter(analysis_request=ar)
+            .select_related('generated_by')
+            .order_by('-version_number')
+        )
         return Response({
-            'id': str(report.id),
-            'generated_at': report.generated_at.isoformat(),
-            'generated_by_email': report.generated_by.email if report.generated_by else None,
-            'pdf_url': f'/requests/{ar.id}/report/download/',
+            'results': [
+                {
+                    'id': str(v.id),
+                    'version_number': v.version_number,
+                    'is_current': v.is_current,
+                    'generated_at': v.generated_at.isoformat(),
+                    'generated_by_email': (
+                        v.generated_by.email if v.generated_by else None
+                    ),
+                    'downloadable': bool(v.pdf_file_key),
+                    'pdf_url': (
+                        f'/requests/{ar.id}/report/versions/{v.id}/download/'
+                    ),
+                }
+                for v in versions
+            ],
         })
+
+    @action(
+        detail=True, methods=['get'],
+        url_path=r'report/versions/(?P<report_id>[0-9a-f-]+)/download',
+    )
+    def report_version_download(self, request, pk=None, report_id=None):
+        """
+        Stream a specific (historical or current) report version.
+
+        Security:
+        - The version must belong to the request in the URL — a stray
+          report_id from another request resolves to 404, never leaks.
+        - Tenant isolation is enforced by middleware: a record created in
+          another tenant's schema is invisible to this query.
+        - Raw storage keys are never exposed; the file is streamed via
+          ``FileResponse`` through the authenticated endpoint only.
+        """
+        ar = _get_request_or_404(pk)
+        try:
+            report = AnalysisRequestReport.objects.get(
+                pk=report_id, analysis_request=ar,
+            )
+        except AnalysisRequestReport.DoesNotExist:
+            raise NotFound('Report version not found for this request.')
+
+        if not report.pdf_file_key:
+            raise NotFound('Report version has no stored PDF.')
+
+        file_obj = default_storage.open(report.pdf_file_key, 'rb')
+        return FileResponse(
+            file_obj,
+            content_type='application/pdf',
+            as_attachment=True,
+            filename=f'report_{ar.public_reference or ar.request_number}_v{report.version_number}.pdf',
+        )
 
     @action(detail=True, methods=['get'], url_path='report/download')
     def report_download(self, request, pk=None):
         """
-        Stream the generated report PDF. Access is gated by the same tenant
-        isolation and authentication used by labels_download. The raw
-        storage key is never exposed — every byte flows through this
-        authenticated endpoint.
+        Stream the CURRENT report PDF version.
+
+        Access is gated by the same tenant isolation and authentication
+        used by labels_download. The raw storage key is never exposed —
+        every byte flows through this authenticated endpoint.
         """
+        from .report_service import RequestReportService
         ar = _get_request_or_404(pk)
-        report = getattr(ar, 'report', None)
+        report = RequestReportService.get_current(ar)
         if report is None or not report.pdf_file_key:
             raise NotFound('No report has been generated for this request yet.')
 
@@ -347,7 +451,7 @@ class AnalysisRequestViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet)
             file_obj,
             content_type='application/pdf',
             as_attachment=True,
-            filename=f'report_{ar.request_number}.pdf',
+            filename=f'report_{ar.public_reference or ar.request_number}_v{report.version_number}.pdf',
         )
 
     @action(detail=False, methods=['post'], url_path='preview-pricing')

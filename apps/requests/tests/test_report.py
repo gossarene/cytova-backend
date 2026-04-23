@@ -348,11 +348,13 @@ class TestDisplayOptions:
         import io
         from reportlab.pdfgen import canvas
         from reportlab.lib.pagesizes import A4
-        from apps.requests.report_service import _render_report, _collect_sections
+        from apps.requests.report_service import (
+            _render_report, _collect_sections, _RenderContext,
+        )
 
         buf = io.BytesIO()
         c = canvas.Canvas(buf, pagesize=A4)
-        _render_report(c, ar, settings, _collect_sections(ar))
+        _render_report(c, ar, settings, _collect_sections(ar), _RenderContext())
         c.save()
         return len(buf.getvalue())
 

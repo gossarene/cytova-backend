@@ -14,9 +14,44 @@ from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 
-from apps.tenants.models import Tenant, Domain, Plan
+from rest_framework.exceptions import ValidationError
+
+from apps.tenants.models import Tenant, Domain, Plan, TenantCodeCounter
 
 logger = logging.getLogger(__name__)
+
+
+TENANT_CODE_MIN = 1
+TENANT_CODE_MAX = 9999
+TENANT_CODE_WIDTH = 4
+
+
+class TenantCodeAllocator:
+    """
+    Allocates the next 4-digit tenant numeric code ("0001"-"9999").
+
+    Thread- and process-safe: the single ``TenantCodeCounter`` row is
+    locked with ``SELECT ... FOR UPDATE`` for the duration of the
+    enclosing transaction so concurrent onboarding calls serialise on
+    that row and never collide.
+
+    The allocator intentionally does not persist the ``Tenant`` itself —
+    callers are responsible for attaching the allocated code to the
+    tenant instance they create in the same transaction.
+    """
+
+    @staticmethod
+    @transaction.atomic
+    def allocate() -> str:
+        counter, _ = TenantCodeCounter.objects.select_for_update().get_or_create(pk=1)
+        next_value = counter.last_value + 1
+        if next_value > TENANT_CODE_MAX:
+            raise ValidationError(
+                'Tenant numeric code range exhausted — platform limit reached.'
+            )
+        counter.last_value = next_value
+        counter.save(update_fields=['last_value'])
+        return f'{next_value:0{TENANT_CODE_WIDTH}d}'
 
 
 class TenantService:

@@ -117,7 +117,8 @@ class AnalysisRequestListSerializer(serializers.ModelSerializer):
     class Meta:
         model = AnalysisRequest
         fields = [
-            'id', 'request_number', 'patient_id', 'patient_name',
+            'id', 'request_number', 'public_reference',
+            'patient_id', 'patient_name',
             'status', 'source_type', 'billing_mode',
             'partner_organization_id', 'partner_organization_name',
             'items_count', 'created_by_email', 'created_at',
@@ -153,11 +154,16 @@ class AnalysisRequestDetailSerializer(serializers.ModelSerializer):
     partner_organization_code = serializers.CharField(
         source='partner_organization.code', read_only=True, default=None,
     )
+    # Report availability is surfaced directly on the detail payload so the
+    # UI can decide between "Generate" / "Regenerate" / "Download" without a
+    # second round-trip and without losing state on reload.
+    has_report = serializers.SerializerMethodField()
+    current_report = serializers.SerializerMethodField()
 
     class Meta:
         model = AnalysisRequest
         fields = [
-            'id', 'request_number', 'patient_id',
+            'id', 'request_number', 'public_reference', 'patient_id',
             'status', 'notes',
             'source_type', 'billing_mode',
             'partner_organization_id', 'partner_organization_name',
@@ -166,8 +172,37 @@ class AnalysisRequestDetailSerializer(serializers.ModelSerializer):
             'cancelled_at', 'cancelled_by_email',
             'created_by_email',
             'items',
+            'has_report', 'current_report',
             'created_at', 'updated_at',
         ]
+
+    def _get_current_report(self, obj):
+        # Use the queryset filter directly rather than obj.reports.all()
+        # so prefetching strategies stay compatible — is_current is indexed.
+        return (
+            obj.reports
+            .filter(is_current=True)
+            .select_related('generated_by')
+            .first()
+        )
+
+    def get_has_report(self, obj) -> bool:
+        return self._get_current_report(obj) is not None
+
+    def get_current_report(self, obj):
+        report = self._get_current_report(obj)
+        if report is None:
+            return None
+        return {
+            'id': str(report.id),
+            'version_number': report.version_number,
+            'generated_at': report.generated_at.isoformat(),
+            'generated_by_email': (
+                report.generated_by.email if report.generated_by else None
+            ),
+            'pdf_url': f'/requests/{obj.id}/report/download/',
+            'downloadable': bool(report.pdf_file_key),
+        }
 
 
 # ---------------------------------------------------------------------------

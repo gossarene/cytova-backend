@@ -43,6 +43,7 @@ urlpatterns = [
         # Legacy: /suppliers/ still available for backward compatibility
         path('suppliers/',    include('apps.suppliers.urls')),
         path('partners/',     include('apps.partners.urls')),
+        path('invoicing/',    include('apps.invoicing.urls')),
         path('alerts/',       include('apps.alerts.urls')),
         path('dashboard/',    include('apps.dashboard.urls')),
         path('lab-settings/', include('apps.lab_settings.urls')),

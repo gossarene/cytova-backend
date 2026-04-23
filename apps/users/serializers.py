@@ -10,7 +10,7 @@ class StaffUserListSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = StaffUser
-        fields = ['id', 'email', 'first_name', 'last_name', 'full_name', 'role', 'is_active', 'created_at']
+        fields = ['id', 'email', 'title', 'first_name', 'last_name', 'full_name', 'role', 'is_active', 'created_at']
 
     def get_full_name(self, obj):
         return obj.get_full_name()
@@ -18,17 +18,27 @@ class StaffUserListSerializer(serializers.ModelSerializer):
 
 class StaffUserDetailSerializer(serializers.ModelSerializer):
     full_name = serializers.SerializerMethodField()
+    display_name = serializers.SerializerMethodField()
     created_by = serializers.SerializerMethodField()
+    has_signature = serializers.SerializerMethodField()
 
     class Meta:
         model = StaffUser
         fields = [
-            'id', 'email', 'first_name', 'last_name', 'full_name',
-            'role', 'is_active', 'created_by', 'created_at', 'updated_at',
+            'id', 'email', 'title', 'first_name', 'last_name',
+            'full_name', 'display_name',
+            'role', 'is_active', 'has_signature',
+            'created_by', 'created_at', 'updated_at',
         ]
 
     def get_full_name(self, obj):
         return obj.get_full_name()
+
+    def get_display_name(self, obj):
+        return obj.get_display_name()
+
+    def get_has_signature(self, obj):
+        return bool(obj.signature_file_key)
 
     def get_created_by(self, obj):
         if obj.created_by_id:
@@ -57,6 +67,7 @@ class StaffUserCreateSerializer(serializers.Serializer):
 
 
 class StaffUserUpdateSerializer(serializers.Serializer):
+    title = serializers.CharField(max_length=20, required=False, allow_blank=True)
     first_name = serializers.CharField(max_length=100, required=False)
     last_name = serializers.CharField(max_length=100, required=False)
     role = serializers.ChoiceField(choices=Role.choices, required=False)
@@ -64,17 +75,27 @@ class StaffUserUpdateSerializer(serializers.Serializer):
 
 class MeSerializer(serializers.ModelSerializer):
     full_name = serializers.SerializerMethodField()
+    display_name = serializers.SerializerMethodField()
+    has_signature = serializers.SerializerMethodField()
     permissions = serializers.SerializerMethodField()
 
     class Meta:
         model = StaffUser
         fields = [
-            'id', 'email', 'first_name', 'last_name', 'full_name',
-            'role', 'is_active', 'created_at', 'updated_at', 'permissions',
+            'id', 'email', 'title', 'first_name', 'last_name',
+            'full_name', 'display_name',
+            'role', 'is_active', 'has_signature',
+            'created_at', 'updated_at', 'permissions',
         ]
 
     def get_full_name(self, obj):
         return obj.get_full_name()
+
+    def get_display_name(self, obj):
+        return obj.get_display_name()
+
+    def get_has_signature(self, obj):
+        return bool(obj.signature_file_key)
 
     def get_permissions(self, obj):
         from common.permission_checker import PermissionChecker
@@ -107,6 +128,24 @@ class MeUpdateSerializer(serializers.Serializer):
                     {'current_password': 'Current password is incorrect.'}
                 )
         return attrs
+
+
+class SignatureUploadSerializer(serializers.Serializer):
+    """Validate a signature image upload."""
+    file = serializers.FileField()
+
+    _ALLOWED_TYPES = frozenset({'image/png', 'image/jpeg', 'image/gif'})
+    _MAX_SIZE = 2 * 1024 * 1024
+
+    def validate_file(self, value):
+        ct = getattr(value, 'content_type', '')
+        if ct not in self._ALLOWED_TYPES:
+            raise serializers.ValidationError(
+                f'Unsupported image type: {ct}. Use PNG, JPEG or GIF.'
+            )
+        if value.size > self._MAX_SIZE:
+            raise serializers.ValidationError('File too large. Maximum 2 MB.')
+        return value
 
 
 # ---------------------------------------------------------------------------

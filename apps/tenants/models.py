@@ -201,6 +201,27 @@ class Plan(models.TextChoices):
 # Tenant
 # ---------------------------------------------------------------------------
 
+class TenantCodeCounter(models.Model):
+    """
+    Single-row counter in the public schema used to allocate the next
+    tenant numeric code atomically via SELECT ... FOR UPDATE.
+
+    Kept as an explicit DB row (rather than a Python-side constant or a
+    ``MAX(code)+1`` query) so concurrent onboarding transactions serialise
+    cleanly on the row lock. Starting value is 0 → first allocated code
+    is "0001".
+    """
+    id = models.PositiveSmallIntegerField(primary_key=True, default=1)
+    last_value = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        verbose_name = 'Tenant Code Counter'
+        verbose_name_plural = 'Tenant Code Counter'
+
+    def __str__(self):
+        return f'TenantCodeCounter(last_value={self.last_value})'
+
+
 class Tenant(TenantMixin):
     """
     Represents a medical laboratory on the Cytova platform.
@@ -218,6 +239,13 @@ class Tenant(TenantMixin):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=255)
     subdomain = models.CharField(max_length=100, unique=True)
+    numeric_code = models.CharField(
+        max_length=4,
+        unique=True,
+        editable=False,
+        help_text='Stable 4-digit zero-padded tenant identifier used as the '
+                  'prefix of generated label codes. Immutable once assigned.',
+    )
     plan = models.CharField(max_length=20, choices=Plan.choices, default=Plan.STARTER)
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -229,6 +257,17 @@ class Tenant(TenantMixin):
     class Meta:
         verbose_name = 'Tenant'
         verbose_name_plural = 'Tenants'
+
+    def save(self, *args, **kwargs):
+        # Auto-allocate the numeric code on first save so callers (onboarding
+        # flow, management shell, tests) never have to supply it manually.
+        # Once allocated, the value is immutable — subsequent saves never
+        # overwrite it because the ``not self.numeric_code`` guard is only
+        # truthy on insert.
+        if not self.numeric_code:
+            from .services import TenantCodeAllocator
+            self.numeric_code = TenantCodeAllocator.allocate()
+        return super().save(*args, **kwargs)
 
     def __str__(self):
         return f'{self.name} ({self.subdomain})'
@@ -336,7 +375,7 @@ from .platform_audit import PlatformAuditLog, PlatformAction  # noqa: E402, F401
 
 __all__ = [
     'SubscriptionPlan', 'SubscriptionStatus', 'Subscription',
-    'Plan', 'Tenant', 'Domain',
+    'Plan', 'Tenant', 'TenantCodeCounter', 'Domain',
     'PlatformRole', 'PlatformAdmin', 'PlatformAdminManager',
     'PlatformAuditLog', 'PlatformAction',
 ]

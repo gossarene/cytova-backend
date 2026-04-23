@@ -16,11 +16,19 @@ UserViewSet covers:
     GET    /users/roles/                 — list available roles       (all staff)
     GET    /users/permissions-catalog/   — list all permissions       (all staff)
 """
+import logging
+import os
+import uuid
+
 from django.core.exceptions import ValidationError as DjangoValidationError
+from django.core.files.base import ContentFile
+from django.core.files.storage import default_storage
+from django.http import FileResponse
 from rest_framework import status
 from rest_framework.decorators import action
-from rest_framework.exceptions import PermissionDenied, ValidationError
+from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 from rest_framework.mixins import ListModelMixin, RetrieveModelMixin
+from rest_framework.parsers import JSONParser, MultiPartParser
 from rest_framework.response import Response
 from rest_framework.viewsets import GenericViewSet
 
@@ -32,6 +40,7 @@ from .serializers import (
     StaffUserDetailSerializer,
     StaffUserCreateSerializer,
     StaffUserUpdateSerializer,
+    SignatureUploadSerializer,
     MeSerializer,
     MeUpdateSerializer,
     RoleAssignSerializer,
@@ -39,6 +48,8 @@ from .serializers import (
     UserPermissionOverrideSerializer,
 )
 from .services import UserService
+
+logger = logging.getLogger(__name__)
 
 
 class UserViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet):
@@ -64,7 +75,7 @@ class UserViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet):
         return StaffUserDetailSerializer
 
     def get_permissions(self):
-        if self.action in ('me', 'roles', 'permissions_catalog'):
+        if self.action in ('me', 'my_signature', 'roles', 'permissions_catalog'):
             return [IsAnyStaff()]
         if self.action in ('list', 'retrieve', 'user_permissions'):
             return [RequiresPermission('users.view')()]
@@ -233,3 +244,73 @@ class UserViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet):
                 for p in sorted(perms, key=lambda x: x.code)
             ]
         return Response(result)
+
+    # ------------------------------------------------------------------
+    # Signature management — own signature (any staff, scoped to self)
+    # ------------------------------------------------------------------
+
+    @action(
+        detail=False,
+        methods=['get', 'post', 'delete'],
+        url_path='me/signature',
+        parser_classes=[MultiPartParser, JSONParser],
+    )
+    def my_signature(self, request):
+        """
+        Manage the authenticated user's signature image.
+
+        POST   — upload / replace (multipart file)
+        GET    — stream the image
+        DELETE — clear
+        """
+        user = request.user
+        if request.method == 'GET':
+            return self._stream_signature(user)
+        if request.method == 'DELETE':
+            return self._clear_signature(user)
+        return self._upload_signature(user, request)
+
+    def _upload_signature(self, user, request):
+        serializer = SignatureUploadSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        file = serializer.validated_data['file']
+
+        _, ext = os.path.splitext(getattr(file, 'name', 'sig'))
+        ext = ext.lower() or '.png'
+        file_key = f'user-signatures/{user.id}/{uuid.uuid4().hex}{ext}'
+        default_storage.save(file_key, ContentFile(file.read()))
+
+        old_key = user.signature_file_key
+        user.signature_file_key = file_key
+        user.save(update_fields=['signature_file_key', 'updated_at'])
+        if old_key and old_key != file_key:
+            try:
+                default_storage.delete(old_key)
+            except Exception:  # noqa: BLE001
+                logger.warning('Failed to delete old signature %s', old_key)
+
+        return Response(MeSerializer(user, context={'request': request}).data)
+
+    def _stream_signature(self, user):
+        if not user.signature_file_key:
+            raise NotFound('No signature uploaded.')
+        try:
+            f = default_storage.open(user.signature_file_key, 'rb')
+        except FileNotFoundError:
+            raise NotFound('Signature file missing from storage.')
+        ext = os.path.splitext(user.signature_file_key)[1].lower()
+        ct = {'.png': 'image/png', '.jpg': 'image/jpeg',
+              '.jpeg': 'image/jpeg', '.gif': 'image/gif'}.get(ext, 'application/octet-stream')
+        return FileResponse(f, content_type=ct)
+
+    def _clear_signature(self, user):
+        old_key = user.signature_file_key
+        if not old_key:
+            return Response(MeSerializer(user, context={'request': user}).data)
+        user.signature_file_key = ''
+        user.save(update_fields=['signature_file_key', 'updated_at'])
+        try:
+            default_storage.delete(old_key)
+        except Exception:  # noqa: BLE001
+            logger.warning('Failed to delete signature %s', old_key)
+        return Response(MeSerializer(user, context={'request': user}).data)

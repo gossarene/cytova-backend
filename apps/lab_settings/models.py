@@ -42,6 +42,21 @@ class LabSettings(BaseModel):
         help_text='Confidentiality / legal text printed at the bottom of reports.',
     )
 
+    # -- Logo rendering on reports --
+    logo_position = models.CharField(
+        max_length=10,
+        choices=[('LEFT', 'Left'), ('CENTER', 'Center'), ('RIGHT', 'Right')],
+        default='RIGHT',
+    )
+    logo_max_width_mm = models.PositiveSmallIntegerField(
+        default=40,
+        help_text='Maximum width of the logo bounding box in mm.',
+    )
+    logo_max_height_mm = models.PositiveSmallIntegerField(
+        default=20,
+        help_text='Maximum height of the logo bounding box in mm.',
+    )
+
     # -- Report display options --
     show_logo = models.BooleanField(default=True)
     show_lab_address = models.BooleanField(default=True)
@@ -57,6 +72,105 @@ class LabSettings(BaseModel):
     show_legal_footer = models.BooleanField(default=True)
     show_abnormal_flags = models.BooleanField(default=True)
 
+    # -- Result PDF protection --
+    lab_secret_code = models.CharField(
+        max_length=2,
+        blank=True,
+        default='',
+        help_text='2-character code auto-generated per lab. Used as a suffix '
+                  'in PDF password derivation. Regenerable by lab admin.',
+    )
+    result_pdf_password_enabled = models.BooleanField(
+        default=False,
+        help_text='When enabled, generated result PDFs require a password to open.',
+    )
+    result_pdf_password_mode = models.CharField(
+        max_length=30,
+        choices=[
+            ('PATIENT_DOB', 'Patient date of birth (YYYYMMDD)'),
+            ('PATIENT_PHONE', 'Patient phone (digits only)'),
+            ('REQUEST_REFERENCE', 'Request public reference'),
+            ('DOB_PLUS_PHONE_SUFFIX', 'DOB + last 4 digits of phone'),
+            ('DOB_PHONE_SECRET', 'DOB + phone suffix + lab secret code'),
+        ],
+        default='DOB_PHONE_SECRET',
+    )
+    result_pdf_password_hint = models.CharField(
+        max_length=255,
+        blank=True,
+        default='Your date of birth (YYYYMMDD) followed by the last 4 digits of your phone number.',
+        help_text='Hint text displayed to users who need to open the PDF.',
+    )
+
+    # -- Billing --
+    financial_document_mode = models.CharField(
+        max_length=30,
+        choices=[
+            ('INVOICE_ONLY', 'Invoice only'),
+            ('STATEMENT_ONLY', 'Financial statement only'),
+            ('BOTH', 'Both invoice and financial statement'),
+        ],
+        default='INVOICE_ONLY',
+        help_text='Controls which financial document types this lab can generate.',
+    )
+    default_invoice_vat_rate = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text='Default VAT percentage applied on invoices (e.g. 18.00 '
+                  'for 18%). Snapshotted at invoice generation time.',
+    )
+
+    # -- Report appearance (controlled) --
+    report_accent_color = models.CharField(
+        max_length=7,
+        blank=True,
+        default='#0f172a',
+        help_text='Hex color for family section titles and accent lines '
+                  '(e.g. "#0f172a"). Must be a valid 7-char hex code.',
+    )
+    show_family_divider_line = models.BooleanField(
+        default=True,
+        help_text='Draw a thin horizontal line below each exam family title.',
+    )
+    show_previous_results = models.BooleanField(
+        default=True,
+        help_text='Include the previous result column in report tables.',
+    )
+
+    # -- Label printing: effective config --
+    # When a preset is selected via the API, its values are copied
+    # into the fields below. Rendering reads exclusively from these
+    # frozen fields — never from the preset row — so platform admins
+    # can revise presets without silently reformatting labels that a
+    # laboratory has already validated operationally.
+    label_print_mode = models.CharField(
+        max_length=20,
+        choices=[('A4_SHEET', 'A4 Multi-Label Sheet'),
+                 ('THERMAL_ROLL', 'Thermal Roll')],
+        default='A4_SHEET',
+    )
+    label_preset = models.ForeignKey(
+        'labels.LabelPrintPreset',
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name='+',
+        help_text='Last preset applied. Kept as an audit reference only — '
+                  'effective values live on this row and are authoritative.',
+    )
+    label_page_width_mm = models.PositiveSmallIntegerField(default=210)
+    label_page_height_mm = models.PositiveSmallIntegerField(default=297)
+    label_label_width_mm = models.PositiveSmallIntegerField(default=90)
+    label_label_height_mm = models.PositiveSmallIntegerField(default=50)
+    label_margin_top_mm = models.PositiveSmallIntegerField(default=15)
+    label_margin_left_mm = models.PositiveSmallIntegerField(default=10)
+    label_horizontal_gap_mm = models.PositiveSmallIntegerField(default=5)
+    label_vertical_gap_mm = models.PositiveSmallIntegerField(default=5)
+    label_thermal_gap_mm = models.PositiveSmallIntegerField(default=2)
+    label_show_barcode = models.BooleanField(default=True)
+    label_show_numeric_code = models.BooleanField(default=True)
+
     class Meta:
         verbose_name = 'Lab Settings'
         verbose_name_plural = 'Lab Settings'
@@ -67,5 +181,63 @@ class LabSettings(BaseModel):
     @classmethod
     def get_solo(cls) -> 'LabSettings':
         """Return the single tenant-scoped settings row, creating it if missing."""
-        obj, _ = cls.objects.get_or_create()
+        obj, created = cls.objects.get_or_create()
+        if not obj.lab_secret_code:
+            obj.lab_secret_code = cls._generate_secret_code()
+            obj.save(update_fields=['lab_secret_code', 'updated_at'])
         return obj
+
+    @staticmethod
+    def _generate_secret_code() -> str:
+        """Generate a 2-char uppercase alphanumeric code, avoiding ambiguous chars."""
+        import secrets
+        alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+        return ''.join(secrets.choice(alphabet) for _ in range(2))
+
+    # -- Label-config helpers --------------------------------------------------
+    LABEL_CONFIG_FIELDS = (
+        'label_page_width_mm', 'label_page_height_mm',
+        'label_label_width_mm', 'label_label_height_mm',
+        'label_margin_top_mm', 'label_margin_left_mm',
+        'label_horizontal_gap_mm', 'label_vertical_gap_mm',
+        'label_thermal_gap_mm',
+        'label_show_barcode', 'label_show_numeric_code',
+    )
+
+    def apply_preset(self, preset) -> None:
+        """
+        Copy a ``LabelPrintPreset``'s values into the effective config.
+        The caller is responsible for calling ``save()``.
+        """
+        values = preset.to_effective_config()
+        self.label_print_mode = values['print_mode']
+        self.label_page_width_mm = values['page_width_mm']
+        self.label_page_height_mm = values['page_height_mm']
+        self.label_label_width_mm = values['label_width_mm']
+        self.label_label_height_mm = values['label_height_mm']
+        self.label_margin_top_mm = values['margin_top_mm']
+        self.label_margin_left_mm = values['margin_left_mm']
+        self.label_horizontal_gap_mm = values['horizontal_gap_mm']
+        self.label_vertical_gap_mm = values['vertical_gap_mm']
+        self.label_thermal_gap_mm = values['thermal_gap_mm']
+        self.label_show_barcode = values['show_barcode']
+        self.label_show_numeric_code = values['show_numeric_code']
+        self.label_preset = preset
+
+    def to_label_layout_config(self):
+        """Return a ``LabelLayoutConfig`` ready for the rendering engine."""
+        from apps.labels.renderers import LabelLayoutConfig
+        return LabelLayoutConfig(
+            print_mode=self.label_print_mode,
+            page_width_mm=self.label_page_width_mm,
+            page_height_mm=self.label_page_height_mm,
+            label_width_mm=self.label_label_width_mm,
+            label_height_mm=self.label_label_height_mm,
+            margin_top_mm=self.label_margin_top_mm,
+            margin_left_mm=self.label_margin_left_mm,
+            horizontal_gap_mm=self.label_horizontal_gap_mm,
+            vertical_gap_mm=self.label_vertical_gap_mm,
+            thermal_gap_mm=self.label_thermal_gap_mm,
+            show_barcode=self.label_show_barcode,
+            show_numeric_code=self.label_show_numeric_code,
+        )

@@ -15,6 +15,7 @@ class PartnerOrganizationListSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'code', 'name', 'organization_type',
             'contact_person', 'phone', 'email',
+            'invoice_discount_rate',
             'is_active', 'created_at',
         ]
 
@@ -25,7 +26,8 @@ class PartnerOrganizationDetailSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'code', 'name', 'organization_type',
             'contact_person', 'phone', 'email', 'address',
-            'default_billing_mode', 'payment_terms_days', 'billing_notes',
+            'default_billing_mode', 'payment_terms_days',
+            'invoice_discount_rate', 'billing_notes',
             'notes', 'is_active', 'created_at', 'updated_at',
         ]
 
@@ -47,6 +49,10 @@ class PartnerOrganizationCreateSerializer(serializers.Serializer):
     )
     payment_terms_days = serializers.IntegerField(
         required=False, allow_null=True, default=None, min_value=0,
+    )
+    invoice_discount_rate = serializers.DecimalField(
+        max_digits=5, decimal_places=2,
+        required=False, allow_null=True, default=None,
     )
     billing_notes = serializers.CharField(required=False, allow_blank=True, default='')
     notes = serializers.CharField(required=False, allow_blank=True, default='')
@@ -78,6 +84,10 @@ class PartnerOrganizationUpdateSerializer(serializers.Serializer):
     )
     payment_terms_days = serializers.IntegerField(
         required=False, allow_null=True, min_value=0,
+    )
+    invoice_discount_rate = serializers.DecimalField(
+        max_digits=5, decimal_places=2,
+        required=False, allow_null=True,
     )
     billing_notes = serializers.CharField(required=False, allow_blank=True)
     notes = serializers.CharField(required=False, allow_blank=True)

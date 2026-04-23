@@ -30,12 +30,41 @@ from apps.catalog.models import ExamDefinition
 from apps.users.models import StaffUser
 from .models import (
     AnalysisRequest, AnalysisRequestItem, ExamTraceability,
+    RequestLabelBatch, RequestReferenceSequence,
     RequestStatus, ItemStatus, ExecutionMode, PriceSource,
 )
 from .pricing import RequestPricingResolver
 from .state_machine import RequestStateMachine, ItemStateMachine
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Public reference allocator
+# ---------------------------------------------------------------------------
+
+PUBLIC_REFERENCE_WIDTH = 6
+PUBLIC_REFERENCE_MAX = 10 ** PUBLIC_REFERENCE_WIDTH - 1
+
+
+def _allocate_public_reference(day) -> str:
+    """
+    Allocate one patient-facing reference of the form ``YYYYMMDD-NNNNNN``.
+
+    Caller must be inside ``transaction.atomic`` — the ``select_for_update``
+    on ``RequestReferenceSequence`` serialises overlapping creates for
+    the same day so the sequence never collides.
+    """
+    RequestReferenceSequence.objects.get_or_create(date=day)
+    seq = RequestReferenceSequence.objects.select_for_update().get(date=day)
+    next_value = seq.last_value + 1
+    if next_value > PUBLIC_REFERENCE_MAX:
+        raise ValidationError(
+            'Daily request reference sequence exhausted for this tenant.'
+        )
+    seq.last_value = next_value
+    seq.save(update_fields=['last_value', 'updated_at'])
+    return f'{day.strftime("%Y%m%d")}-{next_value:0{PUBLIC_REFERENCE_WIDTH}d}'
 
 
 # ---------------------------------------------------------------------------
@@ -201,10 +230,15 @@ class AnalysisRequestService:
         )
         ar.save()
 
-        # Assign human-readable request number using the first 8 chars of the UUID
+        # Assign the internal request_number (unchanged: REQ-YYYY-XXXXXXXX)
+        # and the patient-facing public_reference (YYYYMMDD-NNNNNN). The
+        # two live side by side: the UUID-derived number is stable and
+        # useful for audit log grep, the public reference is the clean
+        # one printed on final reports.
         uid_part = str(ar.id).replace('-', '')[:8].upper()
         ar.request_number = f'REQ-{ar.created_at.year}-{uid_part}'
-        ar.save(update_fields=['request_number'])
+        ar.public_reference = _allocate_public_reference(ar.created_at.date())
+        ar.save(update_fields=['request_number', 'public_reference'])
 
         for item_data in items_data:
             _create_item_with_traceability(ar, item_data)
@@ -706,6 +740,16 @@ class AnalysisRequestItemService:
                 'Specimens can only be collected while the request is '
                 'CONFIRMED or COLLECTION_IN_PROGRESS '
                 f"(current status: {ar.status}).",
+            )
+
+        # Traceability gate: collection is only meaningful once a
+        # specimen tube carries a printed label. Blocking here prevents
+        # un-labeled tubes from entering the workflow and keeps
+        # scan-based downstream steps auditable end-to-end.
+        if not RequestLabelBatch.objects.filter(analysis_request=ar).exists():
+            raise ValidationError(
+                'Labels must be generated for this request before specimens '
+                'can be marked as collected.'
             )
 
         if item.status != ItemStatus.PENDING:

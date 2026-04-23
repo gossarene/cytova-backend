@@ -56,6 +56,8 @@ class OnboardingService:
         trial_plan = SubscriptionService.get_default_trial_plan()
 
         # ---- Step 2: Create Tenant + Domain in public schema ----
+        # The 4-digit numeric code is allocated automatically by
+        # ``Tenant.save()`` (see TenantCodeAllocator).
         tenant = Tenant(
             schema_name=schema_name,
             name=laboratory_name,

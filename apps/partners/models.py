@@ -79,6 +79,15 @@ class PartnerOrganization(BaseModel):
         blank=True,
         help_text='Payment terms in days (e.g. 30, 60). Used by future invoicing module.',
     )
+    invoice_discount_rate = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text='Global invoice discount percentage (e.g. 10.00 for 10%). '
+                  'Applied on the gross total of generated invoices. '
+                  'Distinct from per-exam negotiated prices.',
+    )
     billing_notes = models.TextField(
         blank=True,
         default='',
