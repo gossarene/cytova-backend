@@ -375,6 +375,7 @@ SERVER_EMAIL = config('SERVER_EMAIL', default='errors@cytova.io')
 # Platform settings
 # ---------------------------------------------------------------------------
 CYTOVA_DOMAIN = config('CYTOVA_DOMAIN', default='cytova.io')
+CYTOVA_FRONTEND_BASE_URL = config('CYTOVA_FRONTEND_BASE_URL', default='', cast=str)
 
 # Allow requests with no matching tenant to fall through to the public schema
 # (useful in development). Set to False in production.

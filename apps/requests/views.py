@@ -72,6 +72,25 @@ def _serialize_report(ar: AnalysisRequest, report) -> dict:
     }
 
 
+def _serialize_access_token(token, request) -> dict:
+    from django.conf import settings as dj_settings
+    from django.utils import timezone as tz
+    fe_base = getattr(dj_settings, 'CYTOVA_FRONTEND_BASE_URL', '')
+    if not fe_base:
+        scheme = 'https' if request.is_secure() else 'http'
+        fe_base = f'{scheme}://{request.get_host()}'
+    scheme = 'https' if request.is_secure() else 'http'
+    api_base = f'{scheme}://{request.get_host()}'
+    expired = token.expires_at <= tz.now()
+    return {
+        'status': 'expired' if expired else ('active' if token.is_active else 'revoked'),
+        'token': token.token,
+        'expires_at': token.expires_at.isoformat(),
+        'access_url': f'{fe_base}/results/access/{token.token}',
+        'download_url': f'{api_base}/r/{token.token}/download/',
+    }
+
+
 def _get_item_or_404(request_pk, pk) -> AnalysisRequestItem:
     try:
         return (
@@ -144,10 +163,8 @@ class AnalysisRequestViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet)
             # responsibility — the same user who finalizes the request.
             return [IsBiologistOrAbove()]
         if self.action in ('report_download', 'report_versions', 'report_version_download'):
-            # Any authenticated staff in the tenant can read the history
-            # and stream any stored version. Tenant isolation is enforced
-            # upstream by CytovaTenantMiddleware, and the view itself
-            # scopes the lookup to the parent request.
+            return [IsAnyStaff()]
+        if self.action in ('create_access_token', 'regenerate_access_token'):
             return [IsAnyStaff()]
         # create, partial_update, confirm, preview_pricing
         return [IsReceptionistOrLabAdmin()]
@@ -453,6 +470,32 @@ class AnalysisRequestViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet)
             as_attachment=True,
             filename=f'report_{ar.public_reference or ar.request_number}_v{report.version_number}.pdf',
         )
+
+    @action(detail=True, methods=['get', 'post'], url_path='access-token')
+    def create_access_token(self, request, pk=None):
+        """
+        GET  — return the current active token state (or null).
+        POST — get-or-create a token (idempotent).
+        """
+        from .patient_access import ResultAccessService
+        ar = _get_request_or_404(pk)
+
+        if request.method == 'GET':
+            token = ResultAccessService.get_active_token(ar)
+            if token is None:
+                return Response({'status': 'not_generated'})
+            return Response(_serialize_access_token(token, request))
+
+        token = ResultAccessService.get_or_create_token(ar)
+        return Response(_serialize_access_token(token, request))
+
+    @action(detail=True, methods=['post'], url_path='access-token/regenerate')
+    def regenerate_access_token(self, request, pk=None):
+        """Force-create a new token, deactivating the previous one."""
+        from .patient_access import ResultAccessService
+        ar = _get_request_or_404(pk)
+        token = ResultAccessService.create_token(ar)
+        return Response(_serialize_access_token(token, request))
 
     @action(detail=False, methods=['post'], url_path='preview-pricing')
     def preview_pricing(self, request):

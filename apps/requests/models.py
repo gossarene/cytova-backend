@@ -553,6 +553,66 @@ class LabelSequence(models.Model):
 
 
 # ---------------------------------------------------------------------------
+# Patient result access tokens
+# ---------------------------------------------------------------------------
+
+class ResultAccessToken(BaseModel):
+    """
+    A short-lived, non-guessable token that grants a patient (or their
+    delegate) access to download a specific result PDF without
+    authentication.
+
+    Security model:
+    - Token is a 64-char hex string (256 bits of entropy).
+    - Expires after a configurable duration (default 48h).
+    - ``is_active`` can be revoked manually before expiry.
+    - The token resolves to a specific report version's ``pdf_file_key``
+      — the file is streamed via ``FileResponse``, never exposed as a
+      raw URL.
+    - Tokens are tenant-scoped: the access endpoint sets the search
+      path from the token's tenant context.
+    """
+    token = models.CharField(
+        max_length=64, unique=True, db_index=True, editable=False,
+    )
+    analysis_request = models.ForeignKey(
+        AnalysisRequest,
+        on_delete=models.CASCADE,
+        related_name='access_tokens',
+    )
+    patient = models.ForeignKey(
+        'patients.Patient',
+        on_delete=models.CASCADE,
+        related_name='result_access_tokens',
+    )
+    report_file_key = models.CharField(
+        max_length=500,
+        help_text='Snapshot of the pdf_file_key at token creation time.',
+    )
+    expires_at = models.DateTimeField(db_index=True)
+    is_active = models.BooleanField(default=True, db_index=True)
+    failed_attempts = models.PositiveSmallIntegerField(default=0)
+    locked_until = models.DateTimeField(null=True, blank=True)
+    verified_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        verbose_name = 'Result Access Token'
+        verbose_name_plural = 'Result Access Tokens'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f'Token for {self.analysis_request} (expires {self.expires_at})'
+
+    @property
+    def is_valid(self) -> bool:
+        return self.is_active and self.expires_at > timezone.now()
+
+    @property
+    def is_locked(self) -> bool:
+        return self.locked_until is not None and self.locked_until > timezone.now()
+
+
+# ---------------------------------------------------------------------------
 # Final patient report
 # ---------------------------------------------------------------------------
 

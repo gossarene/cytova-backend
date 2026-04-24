@@ -8,6 +8,8 @@ from django.contrib import admin
 from django.urls import path, include
 from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView
 
+from apps.requests.patient_access_views import result_access, result_download, verify_password
+
 urlpatterns = [
     # Django admin (accessible from tenant context in development)
     path('admin/', admin.site.urls),
@@ -52,6 +54,11 @@ urlpatterns = [
         # path('portal/',       include('apps.portal.urls')),
 
     ])),
+
+    # Public patient result access — no authentication, token is the credential
+    path('r/<str:token>/', result_access, name='result-access'),
+    path('r/<str:token>/verify-password/', verify_password, name='result-verify-password'),
+    path('r/<str:token>/download/', result_download, name='result-download'),
 
     # Health check — returns {"status": "ok"}, no internal detail exposed
     path('health/', include('common.urls')),
