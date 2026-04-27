@@ -67,6 +67,13 @@ class StaffUser(AbstractBaseUser, PermissionsMixin):
     )
     first_name = models.CharField(max_length=100)
     last_name = models.CharField(max_length=100)
+    phone = models.CharField(
+        max_length=30,
+        blank=True,
+        default='',
+        help_text='Contact phone number, free format. Collected at onboarding '
+                  'for the lab admin; optional for other staff.',
+    )
     role = models.CharField(max_length=30, choices=Role.choices)
     signature_file_key = models.CharField(
         max_length=500,
@@ -191,6 +198,15 @@ class PasswordResetToken(models.Model):
     created_at = models.DateTimeField(default=timezone.now)
     expires_at = models.DateTimeField()
     is_used = models.BooleanField(default=False)
+    used_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text='Set when the token is consumed; complements is_used for audit/forensics.',
+    )
+    created_by_ip = models.GenericIPAddressField(
+        null=True, blank=True,
+        help_text='IP address of the requester at token creation time. '
+                  'Useful for forensic review of password-reset abuse.',
+    )
 
     class Meta:
         verbose_name = 'Password Reset Token'

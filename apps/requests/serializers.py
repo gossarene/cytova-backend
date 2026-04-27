@@ -148,6 +148,13 @@ class AnalysisRequestDetailSerializer(serializers.ModelSerializer):
     created_by_email = serializers.CharField(
         source='created_by.email', read_only=True, default=None,
     )
+    # Patient email surfaced so the UI can pre-validate "Notify by email"
+    # actions without a second round-trip. The notify-patient endpoint
+    # still validates server-side and returns PATIENT_EMAIL_MISSING if
+    # the field is blank — this is purely a UX hint.
+    patient_email = serializers.CharField(
+        source='patient.email', read_only=True, default='',
+    )
     partner_organization_name = serializers.CharField(
         source='partner_organization.name', read_only=True, default=None,
     )
@@ -164,6 +171,7 @@ class AnalysisRequestDetailSerializer(serializers.ModelSerializer):
         model = AnalysisRequest
         fields = [
             'id', 'request_number', 'public_reference', 'patient_id',
+            'patient_email',
             'status', 'notes',
             'source_type', 'billing_mode',
             'partner_organization_id', 'partner_organization_name',

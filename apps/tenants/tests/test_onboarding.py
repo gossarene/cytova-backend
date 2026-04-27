@@ -1,295 +1,294 @@
 """
-Tests for the laboratory self-service onboarding flow.
+Tests for the multi-step onboarding flow.
 
-Uses transactional_db because tenant creation runs DDL. Each test uses
-unique slugs/emails via _signup_data() to avoid cross-test collisions
-(DDL is not rolled back between tests).
+Covers:
+  - start() never creates a tenant
+  - start() resumes existing pending registrations (idempotent on email)
+  - verify_email() success / wrong code / expired code / lockout
+  - resend_code() cooldown
+  - complete() refuses if email is not verified
+  - complete() creates tenant + admin + trial subscription
+  - email enumeration defence (start always returns same shape)
+  - the issued verification code is never persisted as plaintext
 """
-import pytest
 from datetime import timedelta
 
+import pytest
 from django.utils import timezone
 from django_tenants.utils import schema_context
-from rest_framework.exceptions import ValidationError
 
 from apps.tenants.models import (
-    Domain,
-    Subscription,
-    SubscriptionPlan,
-    SubscriptionStatus,
-    Tenant,
+    Domain, OnboardingRegistration, OnboardingStatus, SubscriptionPlan, Tenant,
 )
-from apps.tenants.onboarding_serializers import LaboratorySignupSerializer
-from apps.tenants.onboarding_service import OnboardingService
+from apps.tenants.onboarding_service import (
+    InvalidVerificationCode,
+    OnboardingNotFound,
+    OnboardingNotReady,
+    OnboardingService,
+    ResendCooldown,
+    VerificationCodeExpired,
+    VerificationLocked,
+)
 
 
-@pytest.fixture(autouse=True)
-def _in_tenant_schema():
-    yield
+# ---------------------------------------------------------------------------
+# Fixtures + helpers
+# ---------------------------------------------------------------------------
 
-
-@pytest.fixture()
-def trial_plan():
+@pytest.fixture
+def trial_plan(db):
     return SubscriptionPlan.objects.get_or_create(
-        code='TRIAL',
+        code='TRIAL_DEFAULT',
         defaults={
-            'name': 'Free Trial',
+            'name': 'Trial',
             'is_trial': True,
-            'is_public': False,
+            'is_active': True,
             'trial_duration_days': 14,
         },
     )[0]
 
 
+@pytest.fixture
+def captured_codes(monkeypatch):
+    """Patch the email sender to keep the issued code in a list rather than
+    actually sending mail. Returns the list — callers grab `codes[-1]` to
+    obtain the most recently issued plaintext code."""
+    codes: list[str] = []
+
+    def _capture(_registration, code):
+        codes.append(code)
+
+    monkeypatch.setattr(
+        OnboardingService,
+        '_send_verification_email',
+        staticmethod(_capture),
+    )
+    return codes
+
+
 _counter = 0
 
 
-def _signup_data(**overrides):
+def _identity(**overrides):
+    """Generate unique identity payloads so concurrent tests don't collide."""
     global _counter
     _counter += 1
     base = {
-        'laboratory_name': f'Lab {_counter}',
-        'slug': f'lab-{_counter:04d}',
-        'admin_email': f'admin-{_counter}@lab.com',
-        'admin_first_name': 'Admin',
-        'admin_last_name': 'User',
-        'admin_password': 'Str0ng!Pass#2026',
+        'first_name': 'Alice',
+        'last_name': 'Dupont',
+        'email': f'admin-{_counter}@example.com',
+        'phone': '+33 1 00 00 00 00',
     }
     base.update(overrides)
     return base
 
 
-# ---------------------------------------------------------------------------
-# Serializer validation
-# ---------------------------------------------------------------------------
-
-class TestSignupSerializer:
-
-    @pytest.mark.django_db(transaction=True)
-    def test_valid_full_payload(self):
-        data = _signup_data()
-        s = LaboratorySignupSerializer(data=data)
-        assert s.is_valid(), s.errors
-
-    @pytest.mark.django_db(transaction=True)
-    def test_auto_slug_from_name(self):
-        s = LaboratorySignupSerializer(data=_signup_data(
-            laboratory_name='Hôpital Saint-Luc',
-        ))
-        s.fields.pop('slug', None)  # let it auto-generate
-        # Re-create without slug
-        s = LaboratorySignupSerializer(data={
-            'laboratory_name': 'Hôpital Saint-Luc',
-            'admin_email': _signup_data()['admin_email'],
-            'admin_first_name': 'Bob',
-            'admin_last_name': 'Dupont',
-            'admin_password': 'Str0ng!Pass#2026',
-        })
-        assert s.is_valid(), s.errors
-        assert s.validated_data['slug'] == 'hopital-saint-luc'
-
-    @pytest.mark.django_db(transaction=True)
-    def test_reserved_slug_rejected(self):
-        s = LaboratorySignupSerializer(data=_signup_data(slug='admin'))
-        assert not s.is_valid()
-        assert 'slug' in s.errors
-
-    @pytest.mark.django_db(transaction=True)
-    def test_weak_password_rejected(self):
-        s = LaboratorySignupSerializer(data=_signup_data(admin_password='123'))
-        assert not s.is_valid()
-        assert 'admin_password' in s.errors
-
-    @pytest.mark.django_db(transaction=True)
-    def test_missing_required_fields(self):
-        s = LaboratorySignupSerializer(data={})
-        assert not s.is_valid()
-        for field in ('laboratory_name', 'admin_email', 'admin_first_name',
-                      'admin_last_name', 'admin_password'):
-            assert field in s.errors
-
-    @pytest.mark.django_db(transaction=True)
-    def test_duplicate_slug_rejected(self):
-        t = Tenant(name='Existing', subdomain='dup-slug-test', schema_name='schema_dup_slug_test')
-        t.save()
-        Domain.objects.create(domain='dup-slug-test.cytova.io', tenant=t, is_primary=True)
-
-        s = LaboratorySignupSerializer(data=_signup_data(slug='dup-slug-test'))
-        assert not s.is_valid()
-        assert 'slug' in s.errors
+def _lab_payload(slug):
+    return {
+        'laboratory_name': f'Lab {slug}',
+        'country': 'FR',
+        'city': 'Paris',
+        'slug': slug,
+        'password': 'Str0ng!Pass#2026',
+    }
 
 
 # ---------------------------------------------------------------------------
-# Full onboarding flow
+# start()
 # ---------------------------------------------------------------------------
 
 @pytest.mark.django_db(transaction=True)
-class TestOnboardingService:
+class TestOnboardingStart:
 
-    def test_signup_creates_tenant_and_admin(self, trial_plan):
-        data = _signup_data()
-        result = OnboardingService.signup(data)
+    def test_creates_pending_registration_without_tenant(self, captured_codes):
+        before = Tenant.objects.count()
+        registration = OnboardingService.start(**_identity())
+        assert registration.id is not None
+        assert registration.status == OnboardingStatus.PENDING_EMAIL
+        assert registration.tenant is None
+        assert Tenant.objects.count() == before  # zero tenants created
+        assert len(captured_codes) == 1
 
-        assert result.tenant.pk is not None
-        assert result.tenant.subdomain == data['slug']
-        assert result.tenant.is_active is True
-        assert result.domain == f'{data["slug"]}.cytova.io'
+    def test_persists_only_hashed_code_never_plaintext(self, captured_codes):
+        registration = OnboardingService.start(**_identity())
+        plaintext = captured_codes[-1]
+        assert plaintext.isdigit() and len(plaintext) == 6
+        assert plaintext not in registration.verification_code_hash
+        assert len(registration.verification_code_hash) == 64  # SHA-256 hex
 
-        with schema_context(f'schema_{data["slug"]}'):
-            from apps.users.models import StaffUser, Role
-            admin = StaffUser.objects.get(email=data['admin_email'])
-            assert admin.role == Role.LAB_ADMIN
-            assert admin.check_password(data['admin_password'])
+    def test_resumes_existing_pending_registration(self, captured_codes):
+        identity = _identity()
+        first = OnboardingService.start(**identity)
+        second = OnboardingService.start(**identity)
+        # Same email, both calls return the same row — no parallel pending duplicates.
+        assert first.id == second.id
+        assert OnboardingRegistration.objects.filter(
+            email=identity['email'],
+            status=OnboardingStatus.PENDING_EMAIL,
+        ).count() == 1
 
-    def test_signup_creates_trial_subscription(self, trial_plan):
-        result = OnboardingService.signup(_signup_data())
+    def test_resume_picks_up_verified_record_without_resending_code(self, captured_codes):
+        identity = _identity()
+        first = OnboardingService.start(**identity)
+        OnboardingService.verify_email(registration_id=first.id, code=captured_codes[-1])
 
-        assert result.subscription is not None
-        assert result.subscription.status == SubscriptionStatus.TRIAL
-        assert result.subscription.plan == trial_plan
-        assert result.subscription.plan.code == 'TRIAL'
-        assert result.subscription.plan.is_trial is True
-        assert result.subscription.trial_end_date is not None
-        assert result.subscription.is_usable is True
+        codes_before = len(captured_codes)
+        again = OnboardingService.start(**identity)
 
-    def test_trial_end_date_from_plan(self, trial_plan):
-        before = timezone.now()
-        result = OnboardingService.signup(_signup_data())
-        after = timezone.now()
+        assert again.id == first.id
+        assert again.status == OnboardingStatus.EMAIL_VERIFIED
+        assert len(captured_codes) == codes_before  # no new code sent
 
-        expected_min = before + timedelta(days=trial_plan.trial_duration_days)
-        expected_max = after + timedelta(days=trial_plan.trial_duration_days)
-        assert expected_min <= result.subscription.trial_end_date <= expected_max
 
-    def test_trial_duration_respects_plan_config(self):
-        """A 30-day trial plan → onboarding creates a 30-day trial."""
-        SubscriptionPlan.objects.update_or_create(
-            code='TRIAL',
-            defaults={
-                'name': 'Long Trial', 'is_trial': True,
-                'trial_duration_days': 30,
-            },
+# ---------------------------------------------------------------------------
+# verify_email()
+# ---------------------------------------------------------------------------
+
+@pytest.mark.django_db(transaction=True)
+class TestVerifyEmail:
+
+    def test_correct_code_marks_verified_and_clears_hash(self, captured_codes):
+        registration = OnboardingService.start(**_identity())
+        OnboardingService.verify_email(
+            registration_id=registration.id,
+            code=captured_codes[-1],
         )
-        result = OnboardingService.signup(_signup_data())
+        registration.refresh_from_db()
+        assert registration.status == OnboardingStatus.EMAIL_VERIFIED
+        assert registration.email_verified_at is not None
+        # Hash and expiration cleared after success.
+        assert registration.verification_code_hash == ''
+        assert registration.code_expires_at is None
+        assert registration.failed_attempts == 0
 
-        days = result.subscription.trial_days_remaining
-        assert days is not None
-        assert 29 <= days <= 30
+    def test_wrong_code_increments_failures(self, captured_codes):
+        registration = OnboardingService.start(**_identity())
+        with pytest.raises(InvalidVerificationCode) as exc_info:
+            OnboardingService.verify_email(registration_id=registration.id, code='000000')
+        registration.refresh_from_db()
+        assert registration.failed_attempts == 1
+        assert exc_info.value.attempts_remaining == 4
 
-    def test_signup_seeds_default_categories(self, trial_plan):
-        data = _signup_data()
-        OnboardingService.signup(data)
+    def test_lockout_after_max_attempts(self, captured_codes):
+        registration = OnboardingService.start(**_identity())
+        for _ in range(OnboardingService.MAX_FAILED_ATTEMPTS - 1):
+            with pytest.raises(InvalidVerificationCode):
+                OnboardingService.verify_email(registration_id=registration.id, code='000000')
+        with pytest.raises(VerificationLocked):
+            OnboardingService.verify_email(registration_id=registration.id, code='000000')
+        registration.refresh_from_db()
+        assert registration.is_locked
+        assert registration.locked_until is not None
+        # Code is invalidated alongside the lockout — even after the lockout
+        # window the attacker would need a fresh code.
+        assert registration.verification_code_hash == ''
 
-        with schema_context(f'schema_{data["slug"]}'):
-            from apps.catalog.models import ExamCategory
-            from apps.stock.models import StockCategory
-            assert ExamCategory.objects.filter(name='Hematology').exists()
-            assert StockCategory.objects.filter(name='Reagents').exists()
+    def test_expired_code_rejected(self, captured_codes):
+        registration = OnboardingService.start(**_identity())
+        registration.code_expires_at = timezone.now() - timedelta(seconds=1)
+        registration.save()
+        with pytest.raises(VerificationCodeExpired):
+            OnboardingService.verify_email(registration_id=registration.id, code=captured_codes[-1])
 
-    def test_signup_writes_audit_with_subscription_info(self, trial_plan):
-        data = _signup_data()
-        result = OnboardingService.signup(data)
-
-        with schema_context(f'schema_{data["slug"]}'):
-            from apps.audit.models import AuditLog
-            log = AuditLog.objects.filter(
-                entity_type='TenantOnboarding',
-                entity_id=result.tenant.id,
-            ).first()
-            assert log is not None
-            assert log.diff['plan_code'] == 'TRIAL'
-            assert log.diff['subscription_status'] == 'TRIAL'
-            assert log.diff['trial_duration_days'] == trial_plan.trial_duration_days
-
-    def test_tenant_isolation_after_signup(self, trial_plan):
-        d1 = _signup_data()
-        d2 = _signup_data()
-        r1 = OnboardingService.signup(d1)
-        r2 = OnboardingService.signup(d2)
-
-        with schema_context(f'schema_{d1["slug"]}'):
-            from apps.users.models import StaffUser
-            assert StaffUser.objects.count() == 1
-            assert StaffUser.objects.first().email == d1['admin_email']
-
-        with schema_context(f'schema_{d2["slug"]}'):
-            from apps.users.models import StaffUser
-            assert StaffUser.objects.count() == 1
-            assert StaffUser.objects.first().email == d2['admin_email']
-
-        assert Subscription.objects.filter(tenant=r1.tenant).count() == 1
-        assert Subscription.objects.filter(tenant=r2.tenant).count() == 1
+    def test_unknown_registration_id_404(self):
+        import uuid as _uuid
+        with pytest.raises(OnboardingNotFound):
+            OnboardingService.verify_email(registration_id=_uuid.uuid4(), code='000000')
 
 
 # ---------------------------------------------------------------------------
-# Error / edge cases
+# resend_code()
 # ---------------------------------------------------------------------------
 
 @pytest.mark.django_db(transaction=True)
-class TestOnboardingFailures:
+class TestResendCode:
 
-    def test_signup_fails_without_trial_plan(self):
-        data = _signup_data()
-        with pytest.raises(ValidationError, match='No active trial plan'):
-            OnboardingService.signup(data)
-        assert not Tenant.objects.filter(subdomain=data['slug']).exists()
+    def test_resend_blocked_during_cooldown(self, captured_codes):
+        registration = OnboardingService.start(**_identity())
+        # last_code_sent_at is "now" → cooldown active
+        with pytest.raises(ResendCooldown) as exc_info:
+            OnboardingService.resend_code(registration_id=registration.id)
+        assert exc_info.value.retry_after_seconds > 0
 
-    def test_duplicate_slug_blocked_by_serializer(self, trial_plan):
-        data = _signup_data()
-        OnboardingService.signup(data)
-
-        s = LaboratorySignupSerializer(data=data)
-        assert not s.is_valid()
-        assert 'slug' in s.errors
-
-    def test_no_duplicate_subscription_on_separate_signups(self, trial_plan):
-        d1 = _signup_data()
-        d2 = _signup_data()
-        r1 = OnboardingService.signup(d1)
-        r2 = OnboardingService.signup(d2)
-
-        assert Subscription.objects.filter(tenant=r1.tenant).count() == 1
-        assert Subscription.objects.filter(tenant=r2.tenant).count() == 1
+    def test_resend_after_cooldown_succeeds(self, captured_codes):
+        registration = OnboardingService.start(**_identity())
+        codes_before = len(captured_codes)
+        registration.last_code_sent_at = timezone.now() - timedelta(seconds=120)
+        registration.save()
+        OnboardingService.resend_code(registration_id=registration.id)
+        assert len(captured_codes) == codes_before + 1
 
 
 # ---------------------------------------------------------------------------
-# Bootstrap / seed_plans command
+# complete()
 # ---------------------------------------------------------------------------
 
 @pytest.mark.django_db(transaction=True)
-class TestSeedPlansCommand:
+class TestComplete:
 
-    def test_seed_plans_creates_trial_plan(self):
-        from django.core.management import call_command
-        call_command('seed_plans', verbosity=0)
+    def test_refuses_when_email_not_verified(self, trial_plan, captured_codes):
+        registration = OnboardingService.start(**_identity())
+        before = Tenant.objects.count()
+        with pytest.raises(OnboardingNotReady):
+            OnboardingService.complete(
+                registration_id=registration.id,
+                **_lab_payload(f'lab-not-ready-{_counter}'),
+            )
+        assert Tenant.objects.count() == before
+        registration.refresh_from_db()
+        assert registration.tenant is None
 
-        trial = SubscriptionPlan.objects.filter(code='TRIAL', is_trial=True).first()
-        assert trial is not None
-        assert trial.trial_duration_days == 14
-        assert trial.is_active is True
-        assert trial.is_public is False
+    def test_creates_tenant_admin_subscription_after_verify(self, trial_plan, captured_codes):
+        registration = OnboardingService.start(**_identity())
+        OnboardingService.verify_email(registration_id=registration.id, code=captured_codes[-1])
 
-    def test_seed_plans_idempotent(self):
-        from django.core.management import call_command
-        call_command('seed_plans', verbosity=0)
-        call_command('seed_plans', verbosity=0)
+        slug = f'lab-complete-{_counter}'
+        result = OnboardingService.complete(
+            registration_id=registration.id,
+            **_lab_payload(slug),
+        )
 
-        assert SubscriptionPlan.objects.filter(code='TRIAL').count() == 1
+        # Tenant created with the captured geography
+        assert result.tenant.subdomain == slug
+        assert result.tenant.country == 'FR'
+        assert result.tenant.city == 'Paris'
+        assert Domain.objects.filter(tenant=result.tenant, is_primary=True).exists()
 
-    def test_seed_plans_creates_all_plans(self):
-        from django.core.management import call_command
-        call_command('seed_plans', verbosity=0)
+        # Trial subscription
+        assert result.subscription is not None
+        assert result.subscription.plan.is_trial
+        assert result.subscription.trial_end_date is not None
 
-        codes = set(SubscriptionPlan.objects.values_list('code', flat=True))
-        assert {'TRIAL', 'STARTER', 'PRO', 'ENTERPRISE'}.issubset(codes)
+        # Admin user created in the tenant schema with identity from the registration
+        with schema_context(result.tenant.schema_name):
+            from apps.users.models import StaffUser, Role
+            user = StaffUser.objects.get(email=registration.email)
+            assert user.role == Role.LAB_ADMIN
+            assert user.first_name == registration.first_name
+            assert user.phone == registration.phone
 
-    def test_signup_works_after_seed(self):
-        from django.core.management import call_command
-        call_command('seed_plans', verbosity=0)
+        registration.refresh_from_db()
+        assert registration.status == OnboardingStatus.COMPLETED
+        assert registration.tenant_id == result.tenant.id
 
-        data = _signup_data()
-        result = OnboardingService.signup(data)
 
-        assert result.subscription.status == SubscriptionStatus.TRIAL
-        assert result.subscription.plan.code == 'TRIAL'
-        assert result.subscription.plan.is_trial is True
+# ---------------------------------------------------------------------------
+# Email enumeration defence
+# ---------------------------------------------------------------------------
+
+@pytest.mark.django_db(transaction=True)
+class TestEmailEnumeration:
+
+    def test_start_with_completed_email_creates_fresh_pending_record(self, trial_plan, captured_codes):
+        identity = _identity()
+        first = OnboardingService.start(**identity)
+        OnboardingService.verify_email(registration_id=first.id, code=captured_codes[-1])
+        OnboardingService.complete(
+            registration_id=first.id,
+            **_lab_payload(f'lab-enum-{_counter}'),
+        )
+
+        second = OnboardingService.start(**identity)
+        assert second.id != first.id
+        assert second.status == OnboardingStatus.PENDING_EMAIL
+        assert second.tenant is None

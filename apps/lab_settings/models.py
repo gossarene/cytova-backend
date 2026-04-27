@@ -102,6 +102,24 @@ class LabSettings(BaseModel):
         help_text='Hint text displayed to users who need to open the PDF.',
     )
 
+    # -- Patient notification channels --
+    notification_enable_secure_link = models.BooleanField(
+        default=True,
+        help_text='Allow generating secure access links for patient results.',
+    )
+    notification_enable_whatsapp_share = models.BooleanField(
+        default=True,
+        help_text='Show WhatsApp share option for patient result links.',
+    )
+    notification_enable_email = models.BooleanField(
+        default=False,
+        help_text='Enable email notification to patients (not yet implemented).',
+    )
+    notification_enable_sms = models.BooleanField(
+        default=False,
+        help_text='Enable SMS notification to patients (not yet implemented).',
+    )
+
     # -- Billing --
     financial_document_mode = models.CharField(
         max_length=30,

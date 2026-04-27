@@ -247,6 +247,23 @@ class Tenant(TenantMixin):
                   'prefix of generated label codes. Immutable once assigned.',
     )
     plan = models.CharField(max_length=20, choices=Plan.choices, default=Plan.STARTER)
+
+    # Geography — collected at onboarding. Optional at the model level so legacy
+    # tenants created before this field existed remain valid; the public signup
+    # serializer enforces them as required for new laboratories.
+    country = models.CharField(
+        max_length=2,
+        blank=True,
+        default='',
+        help_text='ISO 3166-1 alpha-2 country code (e.g. "FR", "US").',
+    )
+    city = models.CharField(
+        max_length=120,
+        blank=True,
+        default='',
+        help_text='Primary city of the laboratory.',
+    )
+
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     activated_at = models.DateTimeField(null=True, blank=True)
@@ -370,6 +387,98 @@ class PlatformAdmin(AbstractBaseUser):
         return self.role == PlatformRole.PLATFORM_OWNER
 
 
+# ---------------------------------------------------------------------------
+# Onboarding Registration (pre-tenant)
+# ---------------------------------------------------------------------------
+
+class OnboardingStatus(models.TextChoices):
+    PENDING_EMAIL = 'PENDING_EMAIL',  'Pending email verification'
+    EMAIL_VERIFIED = 'EMAIL_VERIFIED', 'Email verified'
+    COMPLETED = 'COMPLETED',     'Completed'
+    EXPIRED = 'EXPIRED',       'Expired'
+
+
+# Statuses past which no further state transitions are permitted.
+TERMINAL_ONBOARDING_STATUSES = frozenset({
+    OnboardingStatus.COMPLETED,
+    OnboardingStatus.EXPIRED,
+})
+
+
+class OnboardingRegistration(models.Model):
+    """
+    Pre-tenant onboarding state. Lives in the public schema.
+
+    Created when a user starts signup. The associated Tenant + StaffUser
+    + Subscription are created **only** at completion time, after email
+    verification has succeeded. This avoids orphan schemas from abandoned
+    signups and lets the platform garbage-collect stale registrations
+    without touching tenant data.
+
+    Sensitive data:
+      - The verification code is stored only as an HMAC-SHA256 hash,
+        never in plaintext (see ``OnboardingService._hash_code``).
+      - ``failed_attempts`` + ``locked_until`` provide brute-force defence
+        even if the row leaks.
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    # Admin identity (collected on Step 1)
+    first_name = models.CharField(max_length=100)
+    last_name = models.CharField(max_length=100)
+    email = models.EmailField(db_index=True)
+    phone = models.CharField(max_length=30, blank=True, default='')
+
+    # Email verification state
+    verification_code_hash = models.CharField(max_length=128, blank=True, default='')
+    code_expires_at = models.DateTimeField(null=True, blank=True)
+    failed_attempts = models.PositiveSmallIntegerField(default=0)
+    locked_until = models.DateTimeField(null=True, blank=True)
+    last_code_sent_at = models.DateTimeField(null=True, blank=True)
+    email_verified_at = models.DateTimeField(null=True, blank=True)
+
+    # Lifecycle
+    status = models.CharField(
+        max_length=20,
+        choices=OnboardingStatus.choices,
+        default=OnboardingStatus.PENDING_EMAIL,
+        db_index=True,
+    )
+    tenant = models.OneToOneField(
+        'tenants.Tenant',
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name='onboarding_registration',
+        help_text='Set at completion time — points to the tenant that was created from this registration.',
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Onboarding Registration'
+        verbose_name_plural = 'Onboarding Registrations'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['email', 'status']),
+        ]
+
+    def __str__(self):
+        return f'{self.email} [{self.status}]'
+
+    @property
+    def is_locked(self) -> bool:
+        return bool(self.locked_until and self.locked_until > timezone.now())
+
+    @property
+    def is_code_expired(self) -> bool:
+        return bool(self.code_expires_at and self.code_expires_at <= timezone.now())
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.status in TERMINAL_ONBOARDING_STATUSES
+
+
 # Import PlatformAuditLog so Django discovers it for migrations
 from .platform_audit import PlatformAuditLog, PlatformAction  # noqa: E402, F401
 
@@ -378,4 +487,5 @@ __all__ = [
     'Plan', 'Tenant', 'TenantCodeCounter', 'Domain',
     'PlatformRole', 'PlatformAdmin', 'PlatformAdminManager',
     'PlatformAuditLog', 'PlatformAction',
+    'OnboardingRegistration', 'OnboardingStatus', 'TERMINAL_ONBOARDING_STATUSES',
 ]

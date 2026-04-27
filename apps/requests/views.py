@@ -166,6 +166,21 @@ class AnalysisRequestViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet)
             return [IsAnyStaff()]
         if self.action in ('create_access_token', 'regenerate_access_token'):
             return [IsAnyStaff()]
+        if self.action == 'notify_patient':
+            # Patient-facing communication is a front-desk responsibility
+            # (receptionists handle patient outreach) plus lab admins for
+            # oversight. Same gate as ``confirm`` and ``create``, which are
+            # the other patient-touching operations on this ViewSet.
+            #
+            # Tightened from IsAnyStaff: technicians and inventory managers
+            # should not be able to email a patient on behalf of the lab,
+            # even though they can generate a secure link for internal use.
+            #
+            # TODO(rbac): introduce a fine-grained ``requests.notify_patient``
+            # permission in common/permissions_registry.py and switch to
+            # ``RequiresPermission`` once the dashboard exposes per-role
+            # editing for patient-communication permissions.
+            return [IsReceptionistOrLabAdmin()]
         # create, partial_update, confirm, preview_pricing
         return [IsReceptionistOrLabAdmin()]
 
@@ -496,6 +511,58 @@ class AnalysisRequestViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet)
         ar = _get_request_or_404(pk)
         token = ResultAccessService.create_token(ar)
         return Response(_serialize_access_token(token, request))
+
+    @action(detail=True, methods=['post'], url_path='notify-patient')
+    def notify_patient(self, request, pk=None):
+        """Send patient result-ready notifications over the channels enabled
+        in lab settings. V1 supports email only — WhatsApp share remains a
+        manual frontend action and SMS is not implemented yet.
+
+        Always-on contract:
+          - active access token is reused; only created if none exists
+          - secure link is built from the request host (tenant-aware)
+          - email body never contains medical data
+          - response shape exposes which channels succeeded/failed so the
+            frontend can render per-channel feedback
+        """
+        from .notification_service import (
+            ChannelOutcome, EmailChannelDisabled, NoChannelsRequested,
+            PatientEmailMissing, RequestNotificationService,
+        )
+
+        ar = _get_request_or_404(pk)
+        try:
+            outcome = RequestNotificationService.notify_patient(ar, request)
+        except (PatientEmailMissing, EmailChannelDisabled, NoChannelsRequested) as exc:
+            return Response(
+                {
+                    'data': None,
+                    'meta': None,
+                    'errors': [{
+                        'code': exc.code,
+                        'message': exc.message,
+                        'field': None,
+                        'detail': {},
+                    }],
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        return Response({
+            'secure_link': outcome.secure_link,
+            'expires_at': outcome.expires_at,
+            'channels_attempted': outcome.channels_attempted,
+            'channels_succeeded': outcome.channels_succeeded,
+            'channels_failed': [
+                {
+                    'channel': c.channel,
+                    'status': c.status,
+                    'provider': c.provider,
+                    'error': c.error,
+                }
+                for c in outcome.channels_failed
+            ],
+        })
 
     @action(detail=False, methods=['post'], url_path='preview-pricing')
     def preview_pricing(self, request):

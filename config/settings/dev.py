@@ -9,7 +9,11 @@ DEBUG = True
 ALLOWED_HOSTS = ['*']
 
 # ---------------------------------------------------------------------------
-# CORS — allow all local origins in development
+# CORS — local development origins.
+#
+# Wildcard origins (CORS_ALLOW_ALL_ORIGINS) are intentionally NOT used. Even
+# in dev, the allowlist is restricted to known dev hostnames so that a
+# rogue page on the network can't drive the dev backend.
 # ---------------------------------------------------------------------------
 CORS_ALLOWED_ORIGINS = [
     'http://localhost:5173',   # Vite default
@@ -17,7 +21,15 @@ CORS_ALLOWED_ORIGINS = [
     'http://localhost:8080',
 ]
 CORS_ALLOWED_ORIGIN_REGEXES = [
-    r'^http://.*\.localhost(:\d+)?$',  # any *.localhost subdomain
+    # Direct localhost — platform/signup dev.
+    r'^http://localhost(:\d+)?$',
+    r'^http://127\.0\.0\.1(:\d+)?$',
+
+    # *.localhost — legacy dev tenant hosts.
+    r'^http://[a-z0-9-]+\.localhost(:\d+)?$',
+
+    # *.cytova.io — local multi-tenant dev.
+    r'^http://[a-z0-9-]+\.cytova\.io(:\d+)?$',
 ]
 
 # ---------------------------------------------------------------------------

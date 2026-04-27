@@ -2,6 +2,8 @@
 Cytova — Authentication Serializers
 """
 from django.contrib.auth import authenticate
+from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError as DjangoValidationError
 from rest_framework import serializers
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.exceptions import TokenError
@@ -55,12 +57,19 @@ class PasswordResetRequestSerializer(serializers.Serializer):
 
 class PasswordResetConfirmSerializer(serializers.Serializer):
     token = serializers.CharField()
-    password = serializers.CharField(write_only=True, min_length=8)
-    password_confirm = serializers.CharField(write_only=True)
+    password = serializers.CharField(write_only=True, min_length=12)
+    confirm_password = serializers.CharField(write_only=True)
+
+    def validate_password(self, value):
+        try:
+            validate_password(value)
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(list(exc.messages))
+        return value
 
     def validate(self, attrs):
-        if attrs['password'] != attrs['password_confirm']:
+        if attrs['password'] != attrs['confirm_password']:
             raise serializers.ValidationError(
-                {'password_confirm': 'Passwords do not match.'}
+                {'confirm_password': 'Passwords do not match.'}
             )
         return attrs

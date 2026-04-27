@@ -89,13 +89,23 @@ TENANT_DOMAIN_MODEL = 'tenants.Domain'
 # Middleware
 # ---------------------------------------------------------------------------
 MIDDLEWARE = [
-    # Tenant resolution must be the very first middleware.
+    # CORS must be as high as possible per django-cors-headers docs:
+    # CORS_ALLOWED_ORIGIN_REGEXES is checked here, and Origin-matched
+    # preflight OPTIONS requests are short-circuited before tenant
+    # resolution runs. This also guarantees that any 4xx/5xx generated
+    # downstream (including by tenant resolution itself) carries CORS
+    # headers on the way back, so browsers can read the error body
+    # instead of reporting a misleading "CORS blocked" message.
+    'corsheaders.middleware.CorsMiddleware',
+
+    # Tenant resolution. Must run before any middleware/view that depends
+    # on tenant context, but does NOT need to run before CorsMiddleware
+    # (CORS only inspects request headers, never the tenant).
     'common.middleware.CytovaTenantMiddleware',
     # Subscription check must be immediately after tenant resolution.
     'common.middleware.SubscriptionEnforcementMiddleware',
 
     'django.middleware.security.SecurityMiddleware',
-    'corsheaders.middleware.CorsMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -311,6 +321,53 @@ SIMPLE_JWT = {
 }
 
 # ---------------------------------------------------------------------------
+# Onboarding — IP-based abuse protection
+#
+# Per-IP rate limits for the public onboarding endpoints, layered on top of
+# the per-registration lockout already enforced by OnboardingService. These
+# protect against IP-level abuse (e.g. credential stuffing, code-guessing
+# bots) without weakening or replacing registration-level controls.
+#
+# Rate format: 'N/Xunit' where unit ∈ {s, m, h, d}. Example '5/10m' = 5
+# requests per 10 minutes. See apps.tenants.onboarding_throttles.
+#
+# Set the value to None or omit the key to disable rate limiting for a
+# given scope (useful in tests / dev overrides).
+#
+# Setting any rate to None disables IP-based throttling for that scope.
+# ---------------------------------------------------------------------------
+ONBOARDING_RATE_LIMITS = {
+    'start':         '5/10m',   # max 5 starts per IP per 10 min
+    'verify_email':  '10/10m',  # max 10 verify attempts per IP per 10 min
+    'resend_code':   '3/10m',   # max 3 resends per IP per 10 min
+    'complete':      '5/10m',   # max 5 complete calls per IP per 10 min
+}
+
+# Temporary IP blacklist applied when an IP repeatedly trips a rate limit.
+# Independent from per-registration lockout — both layers are evaluated.
+ONBOARDING_IP_BLACKLIST_THRESHOLD = 3            # rate-limit hits to trigger
+ONBOARDING_IP_BLACKLIST_WINDOW_SECONDS = 3600    # observation window (1 hour)
+ONBOARDING_IP_BLACKLIST_DURATION_SECONDS = 1800  # blacklist duration (30 min)
+
+# ---------------------------------------------------------------------------
+# Password reset — per-IP rate limits
+#
+# Same extended format as ONBOARDING_RATE_LIMITS. Counters are separate
+# (different cache prefix) so onboarding and reset abuse don't pollute
+# each other. The per-account defence (single-use token + TTL +
+# invalidate-on-create) is independent from these IP limits.
+# ---------------------------------------------------------------------------
+PASSWORD_RESET_RATE_LIMITS = {
+    'request': '5/10m',   # 5 reset emails per IP per 10 min
+    'confirm': '10/10m',  # 10 confirm attempts per IP per 10 min
+}
+
+# Reset email link uses the request host (tenant subdomain). In dev the
+# backend listens on 8000 and the frontend on this port; in prod both
+# share an origin so this setting is unused.
+CYTOVA_DEV_FRONTEND_PORT = config('CYTOVA_DEV_FRONTEND_PORT', default=3000, cast=int)
+
+# ---------------------------------------------------------------------------
 # CORS — django-cors-headers
 # Specific origins configured in dev.py and prod.py.
 # ---------------------------------------------------------------------------
@@ -370,6 +427,24 @@ SPECTACULAR_SETTINGS = {
 # ---------------------------------------------------------------------------
 DEFAULT_FROM_EMAIL = config('DEFAULT_FROM_EMAIL', default='noreply@cytova.io')
 SERVER_EMAIL = config('SERVER_EMAIL', default='errors@cytova.io')
+
+# Transactional email provider (used by `common.email.EmailService`, which
+# powers onboarding verification codes and any future transactional flows).
+#
+# Independent from Django's EMAIL_BACKEND — that one stays for legacy paths
+# (password reset, etc.). This is provider-driven and selectable per env:
+#
+#   EMAIL_PROVIDER=console   → ConsoleEmailProvider (prints code to stdout)
+#   EMAIL_PROVIDER=brevo     → BrevoEmailProvider (real Brevo API call)
+#
+# Brevo can be enabled in local dev too — useful for testing real delivery
+# before deploying. Provider selection deliberately does NOT key on DEBUG.
+EMAIL_PROVIDER = config('EMAIL_PROVIDER', default='console')
+
+# Brevo (only required when EMAIL_PROVIDER=brevo)
+BREVO_API_KEY = config('BREVO_API_KEY', default='')
+BREVO_SENDER_EMAIL = config('BREVO_SENDER_EMAIL', default=DEFAULT_FROM_EMAIL)
+BREVO_SENDER_NAME = config('BREVO_SENDER_NAME', default='Cytova')
 
 # ---------------------------------------------------------------------------
 # Platform settings

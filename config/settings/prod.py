@@ -25,10 +25,31 @@ CSRF_COOKIE_SECURE = True
 CSRF_COOKIE_HTTPONLY = True
 
 # ---------------------------------------------------------------------------
-# CORS — explicit origin whitelist only
+# CORS — production
+#
+# Two lists working together:
+#
+#   1. CORS_ALLOWED_ORIGINS — explicit, env-driven. Use for custom domains or
+#      enterprise white-label hosts that don't live under cytova.io.
+#
+#   2. CORS_ALLOWED_ORIGIN_REGEXES — pinned to HTTPS direct subdomains of
+#      cytova.io. New tenants are reachable as soon as DNS is configured —
+#      no settings update or redeploy required. The regex deliberately:
+#        * requires https (no plain http in prod)
+#        * forbids ports (production traffic is on 443, behind the proxy)
+#        * forbids multi-level subdomains (only `<slug>.cytova.io`)
+#        * uses DNS-label characters only ([a-z0-9-])
+#        * does NOT match the apex domain `cytova.io` itself
+#
+# Wildcard origins (CORS_ALLOW_ALL_ORIGINS) are never set in production.
+# When the frontend and API share an origin behind the reverse proxy, CORS
+# is moot and these settings are a no-op — leaving them on is harmless and
+# covers cross-origin tooling (admin portal, embedded results viewer, etc.).
 # ---------------------------------------------------------------------------
 CORS_ALLOWED_ORIGINS = config('CORS_ALLOWED_ORIGINS', cast=Csv(), default='')
-# Dynamic subdomain CORS is handled by CytovaTenantMiddleware at request time.
+CORS_ALLOWED_ORIGIN_REGEXES = [
+    r'^https://[a-z0-9-]+\.cytova\.io$',
+]
 
 # ---------------------------------------------------------------------------
 # JWT — RS256 asymmetric signing in production

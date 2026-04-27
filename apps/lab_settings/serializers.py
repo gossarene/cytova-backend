@@ -40,6 +40,11 @@ class LabSettingsSerializer(serializers.ModelSerializer):
             'lab_secret_code',
             'result_pdf_password_enabled', 'result_pdf_password_mode',
             'result_pdf_password_hint',
+            # notification channels
+            'notification_enable_secure_link',
+            'notification_enable_whatsapp_share',
+            'notification_enable_email',
+            'notification_enable_sms',
             # billing
             'financial_document_mode', 'default_invoice_vat_rate',
             # label printing
@@ -100,6 +105,11 @@ class LabSettingsUpdateSerializer(serializers.ModelSerializer):
             'lab_secret_code',
             'result_pdf_password_enabled', 'result_pdf_password_mode',
             'result_pdf_password_hint',
+            # notification channels
+            'notification_enable_secure_link',
+            'notification_enable_whatsapp_share',
+            'notification_enable_email',
+            'notification_enable_sms',
             # billing
             'financial_document_mode', 'default_invoice_vat_rate',
             # label printing — explicit values allowed for fine-tuning,

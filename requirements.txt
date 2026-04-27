@@ -52,3 +52,7 @@ reportlab==4.4.10
 
 # PDF encryption — result report password protection
 pypdf==6.10.2
+
+# HTTP client — used by Brevo email provider (transactional email API).
+# Was already pulled in transitively via boto3; making it explicit.
+requests==2.32.3
