@@ -119,9 +119,14 @@ class AnalysisRequestListSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'request_number', 'public_reference',
             'patient_id', 'patient_name',
-            'status', 'source_type', 'billing_mode',
+            'status', 'closure_status',
+            'source_type', 'billing_mode',
             'partner_organization_id', 'partner_organization_name',
             'items_count', 'created_by_email', 'created_at',
+            # Surfaced on the list so a row badge can show the notification
+            # state without paging into the detail view.
+            'notified_by_email_at', 'notification_count',
+            'last_patient_notification_channel',
         ]
 
     def get_patient_name(self, obj):
@@ -167,12 +172,30 @@ class AnalysisRequestDetailSerializer(serializers.ModelSerializer):
     has_report = serializers.SerializerMethodField()
     current_report = serializers.SerializerMethodField()
 
+    # Aggregated patient summary for the detail header card. Same fields
+    # the patient list/detail already exposes — never bypasses the patient
+    # serializer's permission rules (the detail view is staff-authenticated
+    # and tenant-isolated; staff can already read these from /patients/).
+    patient_summary = serializers.SerializerMethodField()
+
+    # Notification tracking — surfaced so the UI renders the "Patient
+    # notified by email" badge + warns before re-notify.
+    notified_by_email_by_email = serializers.CharField(
+        source='notified_by_email_by.email', read_only=True, default=None,
+    )
+    delivered_by_email = serializers.CharField(
+        source='delivered_by.email', read_only=True, default=None,
+    )
+    archived_by_email = serializers.CharField(
+        source='archived_by.email', read_only=True, default=None,
+    )
+
     class Meta:
         model = AnalysisRequest
         fields = [
             'id', 'request_number', 'public_reference', 'patient_id',
-            'patient_email',
-            'status', 'notes',
+            'patient_email', 'patient_summary',
+            'status', 'closure_status', 'notes',
             'source_type', 'billing_mode',
             'partner_organization_id', 'partner_organization_name',
             'partner_organization_code', 'external_reference', 'source_notes',
@@ -181,8 +204,30 @@ class AnalysisRequestDetailSerializer(serializers.ModelSerializer):
             'created_by_email',
             'items',
             'has_report', 'current_report',
+            # Notification + lifecycle stamps
+            'notified_by_email_at', 'notified_by_email_by_email',
+            'notification_count', 'last_patient_notification_channel',
+            'delivered_at', 'delivered_by_email',
+            'archived_at', 'archived_by_email',
             'created_at', 'updated_at',
         ]
+
+    def get_patient_summary(self, obj):
+        p = obj.patient
+        if p is None:
+            return None
+        # Only expose what the patient list/detail already exposes to staff.
+        # No medical data, no insurance details — staff hit /patients/{id}/
+        # for the full record and the modal's "View patient details" link.
+        return {
+            'id': str(p.id),
+            'full_name': f'{p.first_name} {p.last_name}'.strip(),
+            'first_name': p.first_name,
+            'last_name': p.last_name,
+            'document_number': p.document_number,
+            'phone': p.phone or '',
+            'email': p.email or '',
+        }
 
     def _get_current_report(self, obj):
         # Use the queryset filter directly rather than obj.reports.all()

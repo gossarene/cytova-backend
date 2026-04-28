@@ -22,9 +22,13 @@ import logging
 from dataclasses import dataclass, field
 from typing import List, Optional
 
+from django.utils import timezone
+
 from apps.audit.models import ActorType, AuditAction, AuditLog
 from apps.lab_settings.models import LabSettings
-from apps.requests.models import AnalysisRequest, ResultAccessToken
+from apps.requests.models import (
+    AnalysisRequest, ClosureStatus, RequestStatus, ResultAccessToken,
+)
 from apps.requests.patient_access import ResultAccessService
 from common.email import get_email_service
 from common.utils.url import build_tenant_frontend_url
@@ -215,6 +219,11 @@ class RequestNotificationService:
                 provider_name, analysis_request.id, patient.id, token.id,
                 _email_domain(recipient_email),
             )
+
+            # Persist tracking + (when applicable) auto-advance to DELIVERED.
+            cls._persist_email_notification(analysis_request, request)
+            cls._maybe_auto_deliver(analysis_request, request)
+
             cls._audit(
                 analysis_request=analysis_request,
                 channel=EMAIL_CHANNEL,
@@ -222,6 +231,7 @@ class RequestNotificationService:
                 provider=provider_name,
                 error=None,
                 request=request,
+                notification_count=analysis_request.notification_count,
             )
         else:
             result.channels_failed.append(ChannelOutcome(
@@ -245,6 +255,79 @@ class RequestNotificationService:
                 request=request,
             )
 
+    # ----- Tracking + lifecycle hooks ---------------------------------
+
+    @staticmethod
+    def _persist_email_notification(analysis_request: AnalysisRequest, request) -> None:
+        """Stamp per-request notification tracking after a successful send.
+        Idempotent on a single call — only updates fields, no transitions."""
+        actor = getattr(request, 'user', None)
+        actor_pk = actor.pk if actor and getattr(actor, 'is_authenticated', False) else None
+
+        analysis_request.notified_by_email_at = timezone.now()
+        analysis_request.notified_by_email_by_id = actor_pk
+        analysis_request.notification_count = (analysis_request.notification_count or 0) + 1
+        analysis_request.last_patient_notification_channel = EMAIL_CHANNEL
+        analysis_request.save(update_fields=[
+            'notified_by_email_at',
+            'notified_by_email_by',
+            'notification_count',
+            'last_patient_notification_channel',
+            'updated_at',
+        ])
+
+    @staticmethod
+    def _maybe_auto_deliver(analysis_request: AnalysisRequest, request) -> None:
+        """A successful patient notification promotes closure_status to
+        DELIVERED when the workflow has reached VALIDATED (or a downstream
+        terminal state). Workflow ``status`` is NEVER changed — billing
+        queries that look at status=VALIDATED keep working unchanged.
+
+        Already-DELIVERED rows: idempotent (no-op).
+        Already-ARCHIVED rows:  preserved (closure is forward-only;
+                                we don't reopen a manually archived row
+                                because email happened to fire again).
+        Earlier workflow states (e.g. AWAITING_REVIEW): left as OPEN —
+                                a notification at this stage is a courtesy
+                                and shouldn't pre-close the request.
+        """
+        if analysis_request.closure_status != ClosureStatus.OPEN:
+            return
+        if analysis_request.status not in (
+            RequestStatus.VALIDATED,
+            RequestStatus.COMPLETED,
+        ):
+            return
+
+        actor = getattr(request, 'user', None)
+        actor_pk = actor.pk if actor and getattr(actor, 'is_authenticated', False) else None
+
+        previous_closure = analysis_request.closure_status
+        analysis_request.closure_status = ClosureStatus.DELIVERED
+        analysis_request.delivered_at = timezone.now()
+        analysis_request.delivered_by_id = actor_pk
+        analysis_request.save(update_fields=[
+            'closure_status', 'delivered_at', 'delivered_by', 'updated_at',
+        ])
+
+        # Separate audit row so the closure transition shows up alongside
+        # other lifecycle events, not buried inside a notification log.
+        AuditLog.objects.create(
+            actor_type=ActorType.STAFF_USER,
+            actor_id=actor_pk,
+            actor_email=actor.email if actor_pk else None,
+            action=AuditAction.UPDATE,
+            entity_type='AnalysisRequest',
+            entity_id=analysis_request.id,
+            ip_address=getattr(request, 'audit_ip', None),
+            user_agent=getattr(request, 'audit_user_agent', ''),
+            diff={
+                'closure_from': previous_closure,
+                'closure_to': ClosureStatus.DELIVERED.value,
+                'reason': 'auto_delivered_on_email_notification',
+            },
+        )
+
     # ----- Channel resolution -----------------------------------------
 
     @staticmethod
@@ -267,14 +350,31 @@ class RequestNotificationService:
         provider: Optional[str],
         error: Optional[str],
         request,
+        notification_count: Optional[int] = None,
     ) -> None:
         """Record one notification attempt. Diff payload deliberately
         excludes the secure link, the recipient email address (only its
         domain is logged via the service's logger above), and any
-        medical data."""
+        medical data.
+
+        ``notification_count`` distinguishes first-send from resends: a
+        value > 1 means this attempt is a resend, since the field is
+        incremented inside ``_persist_email_notification`` before the
+        audit row is written.
+        """
         actor = getattr(request, 'user', None)
         actor_id = actor.id if actor and getattr(actor, 'is_authenticated', False) else None
         actor_email = actor.email if actor and getattr(actor, 'is_authenticated', False) else None
+
+        diff = {
+            'channel': channel,
+            'status': status,
+            'provider': provider,
+            'error': error,
+        }
+        if notification_count is not None:
+            diff['notification_count'] = notification_count
+            diff['is_resend'] = notification_count > 1
 
         AuditLog.objects.create(
             actor_type=ActorType.STAFF_USER,
@@ -285,12 +385,7 @@ class RequestNotificationService:
             entity_id=analysis_request.id,
             ip_address=getattr(request, 'audit_ip', None),
             user_agent=getattr(request, 'audit_user_agent', ''),
-            diff={
-                'channel': channel,
-                'status': status,
-                'provider': provider,
-                'error': error,
-            },
+            diff=diff,
         )
 
 

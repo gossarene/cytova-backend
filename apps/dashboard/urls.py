@@ -2,16 +2,22 @@ from django.urls import path
 
 from .views import (
     DashboardAlertsView,
+    DashboardAnalyticsView,
+    DashboardCockpitView,
     DashboardOverviewView,
     DashboardPartnersView,
     DashboardPatientsView,
     DashboardProcurementView,
     DashboardRequestsView,
     DashboardResultsView,
+    DashboardSetupProgressView,
     DashboardStockView,
 )
 
 urlpatterns = [
+    path('cockpit/',         DashboardCockpitView.as_view(),         name='dashboard-cockpit'),
+    path('analytics/',       DashboardAnalyticsView.as_view(),       name='dashboard-analytics'),
+    path('setup-progress/',  DashboardSetupProgressView.as_view(),   name='dashboard-setup-progress'),
     path('overview/',    DashboardOverviewView.as_view(),    name='dashboard-overview'),
     path('patients/',    DashboardPatientsView.as_view(),    name='dashboard-patients'),
     path('requests/',    DashboardRequestsView.as_view(),    name='dashboard-requests'),

@@ -32,6 +32,13 @@ from common.models import BaseModel
 # ---------------------------------------------------------------------------
 
 class RequestStatus(models.TextChoices):
+    """Laboratory workflow status — the medical/operational state of the
+    request as it moves through collection, analysis, and validation.
+
+    DELIVERED and ARCHIVED used to live here in an earlier design but were
+    extracted to ``ClosureStatus`` below so post-processing closure does
+    not contaminate billing or the state-machine guards.
+    """
     DRAFT                   = 'DRAFT',                   'Draft'
     CONFIRMED               = 'CONFIRMED',               'Confirmed'
     COLLECTION_IN_PROGRESS  = 'COLLECTION_IN_PROGRESS',  'Collection In Progress'
@@ -43,6 +50,28 @@ class RequestStatus(models.TextChoices):
     IN_PROGRESS             = 'IN_PROGRESS',             'In Progress'
     COMPLETED               = 'COMPLETED',               'Completed'
     CANCELLED               = 'CANCELLED',               'Cancelled'
+
+
+class ClosureStatus(models.TextChoices):
+    """Post-processing closure state, orthogonal to workflow ``status``.
+
+    OPEN      — request is in the active worklist (default)
+    DELIVERED — patient has been notified / handed the result
+    ARCHIVED  — manually closed; hidden from the active list
+
+    Workflow status (DRAFT...VALIDATED/COMPLETED/CANCELLED) is unaffected by
+    closure transitions, which is what keeps billing queries that look at
+    ``status=VALIDATED`` correct after a request is delivered/archived.
+    """
+    OPEN      = 'OPEN',      'Open'
+    DELIVERED = 'DELIVERED', 'Delivered'
+    ARCHIVED  = 'ARCHIVED',  'Archived'
+
+
+# Closure values that are hidden from the default request list. The
+# lifecycle filter (``?lifecycle=delivered|archived|all``) opts them back
+# in. ``OPEN`` is the only closure value visible by default.
+ACTIVE_CLOSURE = ClosureStatus.OPEN
 
 
 class ItemStatus(models.TextChoices):
@@ -189,6 +218,55 @@ class AnalysisRequest(BaseModel):
         on_delete=models.SET_NULL,
         null=True,
         related_name='created_analysis_requests',
+    )
+
+    # ---- Patient notification tracking ----
+    # Lightweight per-request counters so the UI can render "Patient notified
+    # by email <when>" badges and warn before re-notifying. Detailed per-attempt
+    # records live in AuditLog (entity_type='PatientResultNotification').
+    notified_by_email_at = models.DateTimeField(null=True, blank=True)
+    notified_by_email_by = models.ForeignKey(
+        'users.StaffUser',
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='+',
+        help_text='Operator who sent the most recent successful email notification.',
+    )
+    notification_count = models.PositiveSmallIntegerField(
+        default=0,
+        help_text='How many successful patient notifications have been sent across all channels.',
+    )
+    last_patient_notification_channel = models.CharField(
+        max_length=20,
+        blank=True, default='',
+        help_text='Channel used for the most recent successful notification (e.g. "EMAIL").',
+    )
+
+    # ---- Closure lifecycle (orthogonal to workflow ``status``) ----
+    # Tracks the post-processing state without touching the medical/operational
+    # workflow status. Billing queries continue to filter on ``status`` only,
+    # so a request that has been delivered or archived still bills correctly.
+    closure_status = models.CharField(
+        max_length=15,
+        choices=ClosureStatus.choices,
+        default=ClosureStatus.OPEN,
+        db_index=True,
+    )
+
+    # ---- Lifecycle marker stamps (closure transitions) ----
+    delivered_at = models.DateTimeField(null=True, blank=True)
+    delivered_by = models.ForeignKey(
+        'users.StaffUser',
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='+',
+    )
+    archived_at = models.DateTimeField(null=True, blank=True)
+    archived_by = models.ForeignKey(
+        'users.StaffUser',
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='+',
     )
 
     class Meta:

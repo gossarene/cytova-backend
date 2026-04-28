@@ -512,6 +512,111 @@ class AnalysisRequestService:
 
         return analysis_request
 
+    @staticmethod
+    @transaction.atomic
+    def mark_delivered(
+        analysis_request: AnalysisRequest,
+        actor: StaffUser,
+        request,
+    ) -> AnalysisRequest:
+        """Mark a request's closure as DELIVERED. Workflow ``status`` is
+        deliberately untouched — billing keeps querying the same VALIDATED
+        rows it always did.
+
+        Idempotent on already-delivered requests; once ARCHIVED, a request
+        cannot be re-delivered (closure is a terminal forward sequence:
+        OPEN → DELIVERED → ARCHIVED).
+        """
+        from .models import ClosureStatus
+
+        if analysis_request.closure_status == ClosureStatus.DELIVERED:
+            return analysis_request
+        if analysis_request.closure_status == ClosureStatus.ARCHIVED:
+            raise ValidationError(
+                'Cannot mark an archived request as delivered.'
+            )
+
+        # Report must exist before closure transitions. The PDF is what the
+        # patient ultimately receives, so closing the request without one
+        # would leave the workflow in a half-finished state. Idempotent
+        # short-circuit above means already-delivered rows aren't penalised
+        # by this check (their report was required at the original action).
+        if not analysis_request.reports.filter(is_current=True).exists():
+            raise ValidationError(
+                'Generate the report before marking this request as '
+                'delivered or archived.'
+            )
+
+        previous = analysis_request.closure_status
+        analysis_request.closure_status = ClosureStatus.DELIVERED
+        analysis_request.delivered_at = timezone.now()
+        analysis_request.delivered_by = actor
+        analysis_request.save(update_fields=[
+            'closure_status', 'delivered_at', 'delivered_by', 'updated_at',
+        ])
+
+        _audit(
+            actor=actor,
+            action=AuditAction.UPDATE,
+            entity_type='AnalysisRequest',
+            entity_id=analysis_request.id,
+            diff={
+                'closure_from': previous,
+                'closure_to': ClosureStatus.DELIVERED.value,
+                'reason': 'manual_mark_delivered',
+            },
+            request=request,
+        )
+        return analysis_request
+
+    @staticmethod
+    @transaction.atomic
+    def archive(
+        analysis_request: AnalysisRequest,
+        actor: StaffUser,
+        request,
+    ) -> AnalysisRequest:
+        """Set a request's closure to ARCHIVED. Workflow ``status`` is
+        deliberately untouched.
+
+        Idempotent on already-archived requests; ARCHIVED is terminal.
+        """
+        from .models import ClosureStatus
+
+        if analysis_request.closure_status == ClosureStatus.ARCHIVED:
+            return analysis_request
+
+        # Same gate as ``mark_delivered``: a request without a generated
+        # report is not in a state that should be archived. See the
+        # docstring on ``mark_delivered`` for the rationale.
+        if not analysis_request.reports.filter(is_current=True).exists():
+            raise ValidationError(
+                'Generate the report before marking this request as '
+                'delivered or archived.'
+            )
+
+        previous = analysis_request.closure_status
+        analysis_request.closure_status = ClosureStatus.ARCHIVED
+        analysis_request.archived_at = timezone.now()
+        analysis_request.archived_by = actor
+        analysis_request.save(update_fields=[
+            'closure_status', 'archived_at', 'archived_by', 'updated_at',
+        ])
+
+        _audit(
+            actor=actor,
+            action=AuditAction.UPDATE,
+            entity_type='AnalysisRequest',
+            entity_id=analysis_request.id,
+            diff={
+                'closure_from': previous,
+                'closure_to': ClosureStatus.ARCHIVED.value,
+                'reason': 'manual_archive',
+            },
+            request=request,
+        )
+        return analysis_request
+
 
 # ---------------------------------------------------------------------------
 # AnalysisRequestItemService

@@ -88,7 +88,7 @@ class RequestStateMachine:
             RequestStatus.COMPLETED,
         },
         RequestStatus.COMPLETED: set(),
-        RequestStatus.CANCELLED:  set(),
+        RequestStatus.CANCELLED: set(),
     }
 
     @classmethod

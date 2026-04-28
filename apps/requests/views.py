@@ -135,6 +135,27 @@ class AnalysisRequestViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet)
             .prefetch_related(Prefetch('items', queryset=items_qs))
         )
 
+    def filter_queryset(self, queryset):
+        """Skip the FilterSet for non-list actions.
+
+        ``AnalysisRequestFilter`` excludes DELIVERED + ARCHIVED rows by
+        default to keep the front-desk list focused on active work. Without
+        this guard, that exclusion also fires on ``retrieve`` (and any
+        other action that goes through ``get_object()``) — which would
+        return 404 the moment a request transitions to ARCHIVED, even
+        though the row exists and the user has explicit access to it
+        (just clicked "Archive" or opened the link from search/filters).
+
+        Detail actions on this ViewSet that don't go through
+        ``get_object()`` (the ones using ``_get_request_or_404`` directly:
+        archive, mark_delivered, notify_patient, etc.) are unaffected
+        either way — but routing them through the unfiltered queryset
+        when they DO hit get_object() keeps the rule consistent.
+        """
+        if self.action != 'list':
+            return queryset
+        return super().filter_queryset(queryset)
+
     def get_permissions(self):
         if self.action in ('list', 'retrieve'):
             return [IsAnyStaff()]
@@ -142,6 +163,12 @@ class AnalysisRequestViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet)
             return [IsLabAdmin()]
         if self.action == 'finalize_validation':
             return [IsBiologistOrAbove()]
+        if self.action == 'mark_delivered':
+            # Same gate as notify_patient — both are patient-comms surfaces.
+            return [IsReceptionistOrLabAdmin()]
+        if self.action == 'archive':
+            # Archival is an oversight action, not part of daily operations.
+            return [IsLabAdmin()]
         if self.action == 'labels':
             # GET can be read by any staff (so viewers can see metadata
             # and the signed download URL). POST (generation) is gated
@@ -268,6 +295,38 @@ class AnalysisRequestViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet)
         ar = AnalysisRequestService.finalize_validation(
             analysis_request=ar,
             finalized_by=request.user,
+            request=request,
+        )
+        return Response(AnalysisRequestDetailSerializer(ar).data)
+
+    @action(detail=True, methods=['post'], url_path='mark-delivered')
+    def mark_delivered(self, request, pk=None):
+        """Manually mark a request as DELIVERED.
+
+        Useful when the patient was reached through a non-tracked channel
+        (printed copy, in-person handover, WhatsApp manual share). The
+        notification flow auto-promotes VALIDATED → DELIVERED on email
+        success — this endpoint is for everything else.
+        """
+        from .services import AnalysisRequestService
+        ar = _get_request_or_404(pk)
+        ar = AnalysisRequestService.mark_delivered(
+            analysis_request=ar,
+            actor=request.user,
+            request=request,
+        )
+        return Response(AnalysisRequestDetailSerializer(ar).data)
+
+    @action(detail=True, methods=['post'], url_path='archive')
+    def archive(self, request, pk=None):
+        """Archive a request — hides it from the default list view.
+        Permitted from terminal states (DELIVERED / COMPLETED / CANCELLED /
+        VALIDATED); the state machine guards illegal transitions."""
+        from .services import AnalysisRequestService
+        ar = _get_request_or_404(pk)
+        ar = AnalysisRequestService.archive(
+            analysis_request=ar,
+            actor=request.user,
             request=request,
         )
         return Response(AnalysisRequestDetailSerializer(ar).data)

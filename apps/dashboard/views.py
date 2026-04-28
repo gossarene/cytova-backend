@@ -6,6 +6,7 @@ Each view runs a small number of bulk queries with annotations —
 no N+1 patterns, no per-row service calls.
 
     GET /overview/      — lightweight summary across all domains
+    GET /cockpit/       — role-aware KPIs + actions + charts (single round-trip)
     GET /patients/      — patient registration metrics
     GET /requests/      — request lifecycle + execution mode stats
     GET /partners/      — partner organization analytics + revenue
@@ -52,6 +53,181 @@ def _status_breakdown(qs):
     return dict(
         qs.values_list('status', 'count')
     )
+
+
+# ---------------------------------------------------------------------------
+# Analytics — ranked insights for the dashboard analytics row
+# ---------------------------------------------------------------------------
+
+class DashboardAnalyticsView(APIView):
+    """
+    Ranked insights consumed by the dashboard "Analytics" row:
+
+      - top_exams      : five most-requested exams (count of items)
+      - top_partners   : five top partner organizations by billed amount
+                         (with request count alongside, for the Volume toggle)
+      - abnormal_exams : five exams with the most abnormal published results
+                         (count of abnormal versions + total versions for ratio)
+
+    All three series are scoped to the *current month* via ``created_at``
+    (matches the spec for the analytics card row). Counts come from bulk
+    GROUP-BY queries — no per-row work.
+
+    Permission: any authenticated tenant staff (matches the rest of the
+    dashboard endpoints).
+    """
+    permission_classes = [IsAnyStaff]
+
+    LIMIT = 5
+
+    def get(self, request):
+        from apps.requests.models import (
+            AnalysisRequestItem,
+            SourceType,
+        )
+        from apps.results.models import ResultStatus, ResultVersion
+
+        _, _, start_of_month = _period_boundaries()
+        items_this_month = AnalysisRequestItem.objects.filter(
+            analysis_request__created_at__date__gte=start_of_month,
+        )
+
+        # ---- top exams (by item count, this month) ----
+        top_exams = list(
+            items_this_month
+            .values(
+                code=F('exam_definition__code'),
+                name=F('exam_definition__name'),
+            )
+            .annotate(count=Count('id'))
+            .order_by('-count')[:self.LIMIT]
+        )
+
+        # ---- top partners (by billed amount, this month) ----
+        # Aggregating at the item level — that's where ``billed_price`` lives.
+        # ``requests`` is a distinct count of parent AnalysisRequest rows so
+        # the Volume toggle on the frontend reflects request count, not items.
+        partner_rows = list(
+            items_this_month
+            .filter(
+                analysis_request__source_type=SourceType.PARTNER_ORGANIZATION,
+                analysis_request__partner_organization__isnull=False,
+            )
+            .values(
+                name=F('analysis_request__partner_organization__name'),
+            )
+            .annotate(
+                amount=Coalesce(
+                    Sum('billed_price'),
+                    Value(Decimal('0')),
+                    output_field=DecimalField(),
+                ),
+                requests=Count('analysis_request', distinct=True),
+            )
+            .order_by('-amount')[:self.LIMIT]
+        )
+        # Decimal → string for JSON (matches the rest of the dashboard).
+        for row in partner_rows:
+            row['amount'] = str(row['amount'])
+
+        # ---- abnormal exams (current validated/published versions, this month) ----
+        # ``is_current=True`` keeps one row per item; status restricted to
+        # VALIDATED or PUBLISHED so we count results the biologist has
+        # signed off on. Crucially, VALIDATED rows are included even when
+        # the request's final PDF report has not yet been generated — the
+        # earlier PUBLISHED-only filter hid that whole bucket.
+        #
+        # Date filter uses ``validated_at`` because that is the moment
+        # the biologist approved the result; both VALIDATED and PUBLISHED
+        # rows have it set (PUBLISHED transitions go through VALIDATED).
+        validated_versions = ResultVersion.objects.filter(
+            is_current=True,
+            status__in=[ResultStatus.VALIDATED, ResultStatus.PUBLISHED],
+            validated_at__date__gte=start_of_month,
+        )
+        # Build (count, total) per exam in two passes, then join in Python.
+        abnormal_by_exam = dict(
+            validated_versions
+            .filter(is_abnormal=True)
+            .values_list('item__exam_definition_id')
+            .annotate(c=Count('id'))
+            .values_list('item__exam_definition_id', 'c')
+        )
+        total_by_exam = (
+            validated_versions
+            .values(
+                exam_id=F('item__exam_definition_id'),
+                code=F('item__exam_definition__code'),
+                name=F('item__exam_definition__name'),
+            )
+            .annotate(total=Count('id'))
+        )
+        abnormal_exams = sorted(
+            [
+                {
+                    'code': row['code'],
+                    'name': row['name'],
+                    'count': abnormal_by_exam.get(row['exam_id'], 0),
+                    'total': row['total'],
+                }
+                for row in total_by_exam
+                if abnormal_by_exam.get(row['exam_id'], 0) > 0
+            ],
+            key=lambda r: r['count'],
+            reverse=True,
+        )[:self.LIMIT]
+
+        return Response({
+            'top_exams': top_exams,
+            'top_partners': partner_rows,
+            'abnormal_exams': abnormal_exams,
+        })
+
+
+# ---------------------------------------------------------------------------
+# Cockpit — role-aware KPIs / actions / charts in a single round-trip
+# ---------------------------------------------------------------------------
+
+class DashboardSetupProgressView(APIView):
+    """
+    Returns the lab-onboarding checklist for LAB_ADMIN users, or ``null``
+    for any other role. Each task carries a ``completed`` flag derived
+    from real database state — no faked progress.
+
+    Response (LAB_ADMIN):
+        {
+          "percentage": 57,           # required-task completion only
+          "completed_count": 4,       # incl. recommended tasks
+          "total_count": 7,
+          "tasks": [{key, label, description, completed, required, href}]
+        }
+
+    Permission: any authenticated tenant staff. Non-LAB_ADMIN gets
+    ``null`` so the frontend hook can branch on it.
+    """
+    permission_classes = [IsAnyStaff]
+
+    def get(self, request):
+        from .setup_progress import build_setup_progress
+        return Response(build_setup_progress(request.user))
+
+
+class DashboardCockpitView(APIView):
+    """
+    Returns the entire cockpit payload for the logged-in staff user. The
+    response shape and the KPI/action selection depend on the user's role
+    (see ``apps.dashboard.cockpit.build_cockpit``); chart series are
+    role-agnostic and shared.
+
+    Permission: any authenticated tenant staff. Per-metric gating
+    (e.g. revenue only for LAB_ADMIN / BILLING_OFFICER) lives in the
+    composer so the surface stays in one place.
+    """
+    permission_classes = [IsAnyStaff]
+
+    def get(self, request):
+        from .cockpit import build_cockpit
+        return Response(build_cockpit(request.user))
 
 
 # ---------------------------------------------------------------------------
