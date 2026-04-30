@@ -104,18 +104,25 @@ class ResultVersionDetailSerializer(serializers.ModelSerializer):
     entered_by_email = serializers.CharField(
         source='entered_by.email', read_only=True, default=None,
     )
+    entered_by_display = serializers.SerializerMethodField()
     submitted_by_email = serializers.CharField(
         source='submitted_by.email', read_only=True, default=None,
     )
+    submitted_by_display = serializers.SerializerMethodField()
     validated_by_email = serializers.CharField(
         source='validated_by.email', read_only=True, default=None,
     )
+    # Validator is a medical/signature context — surface the title-prefixed
+    # name so the UI can render "Dr René GOSSA" without recomposing.
+    validated_by_display = serializers.SerializerMethodField()
     rejected_by_email = serializers.CharField(
         source='rejected_by.email', read_only=True, default=None,
     )
+    rejected_by_display = serializers.SerializerMethodField()
     published_by_email = serializers.CharField(
         source='published_by.email', read_only=True, default=None,
     )
+    published_by_display = serializers.SerializerMethodField()
     files = ResultFileSerializer(many=True, read_only=True)
     values = ResultValueSerializer(many=True, read_only=True)
 
@@ -127,16 +134,36 @@ class ResultVersionDetailSerializer(serializers.ModelSerializer):
             'result_value', 'result_unit', 'reference_range',
             'is_abnormal', 'comments', 'internal_notes',
             'notes',
-            'entered_by_email', 'entered_at',
-            'submitted_by_email', 'submitted_at',
+            'entered_by_email', 'entered_by_display', 'entered_at',
+            'submitted_by_email', 'submitted_by_display', 'submitted_at',
             'validation_notes',
-            'validated_by_email', 'validated_at',
+            'validated_by_email', 'validated_by_display', 'validated_at',
             'rejection_notes',
-            'rejected_by_email', 'rejected_at',
-            'published_by_email', 'published_at',
+            'rejected_by_email', 'rejected_by_display', 'rejected_at',
+            'published_by_email', 'published_by_display', 'published_at',
             'files', 'values',
             'created_at', 'updated_at',
         ]
+
+    @staticmethod
+    def _user_display(user):
+        return user.display_name if user is not None else None
+
+    def get_entered_by_display(self, obj):
+        return self._user_display(obj.entered_by)
+
+    def get_submitted_by_display(self, obj):
+        return self._user_display(obj.submitted_by)
+
+    def get_validated_by_display(self, obj):
+        # Medical signature context — title-prefixed name.
+        return obj.validated_by.professional_display_name if obj.validated_by else None
+
+    def get_rejected_by_display(self, obj):
+        return self._user_display(obj.rejected_by)
+
+    def get_published_by_display(self, obj):
+        return self._user_display(obj.published_by)
 
 
 # ---------------------------------------------------------------------------

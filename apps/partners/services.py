@@ -18,6 +18,21 @@ from .models import PartnerExamPrice, PartnerOrganization
 logger = logging.getLogger(__name__)
 
 
+def _branding_audit_value(value):
+    """Coerce a branding field value into something JSON-safe + concise
+    for the audit log. ``ImageFieldFile`` instances are surfaced as
+    their storage path (``str(field)``) rather than the file bytes."""
+    if value is None:
+        return None
+    # ``ImageFieldFile`` carries a ``name`` attribute that is the storage
+    # key (or empty string when no file is attached). It evaluates truthy
+    # only when a file is set, so falsy → empty payload.
+    name_attr = getattr(value, 'name', None)
+    if name_attr is not None and not isinstance(value, str):
+        return name_attr or ''
+    return value
+
+
 def _audit(*, actor: StaffUser, action: str, entity_type: str, entity_id,
            diff: dict, request) -> None:
     AuditLog.objects.create(
@@ -82,6 +97,80 @@ class PartnerOrganizationService:
             diff={'before': before, 'after': after},
             request=request,
         )
+
+        return partner
+
+    # Branding fields persisted by ``update_branding``. ``clear_logo`` is
+    # excluded — it's a write-only flag that maps to deleting the logo
+    # file rather than to a stored field.
+    BRANDING_FIELDS = (
+        'custom_report_branding_enabled',
+        'report_header_name', 'report_header_subtitle',
+        'report_header_address', 'report_header_phone',
+        'report_header_email', 'report_header_logo',
+        'report_footer_text',
+    )
+
+    @staticmethod
+    def update_branding(
+        partner: PartnerOrganization,
+        validated_data: dict,
+        updated_by: StaffUser,
+        request,
+    ) -> PartnerOrganization:
+        """
+        Apply the optional report-branding override.
+
+        - ``clear_logo`` removes any existing uploaded file (delete on
+          storage) before saving — it's intentionally distinct from
+          uploading a replacement, which the serializer rejects in the
+          same payload.
+        - The ``ImageField`` itself handles writing the new file to
+          storage when ``report_header_logo`` is supplied as an
+          UploadedFile.
+        - The audit diff records which field names changed but not the
+          full file contents (only the storage key, via ``str(field)``)
+          to keep the audit log readable.
+        """
+        clear_logo = validated_data.pop('clear_logo', False)
+
+        before = {
+            k: _branding_audit_value(getattr(partner, k))
+            for k in PartnerOrganizationService.BRANDING_FIELDS
+            if k in validated_data or (k == 'report_header_logo' and clear_logo)
+        }
+
+        if clear_logo and partner.report_header_logo:
+            # ``ImageField.delete`` removes the underlying file via the
+            # storage backend. Falling back to setting the field to None
+            # alone would leave the file orphaned on disk.
+            partner.report_header_logo.delete(save=False)
+
+        update_fields = []
+        for field, value in validated_data.items():
+            setattr(partner, field, value)
+            update_fields.append(field)
+
+        if clear_logo and 'report_header_logo' not in update_fields:
+            update_fields.append('report_header_logo')
+
+        if update_fields:
+            partner.save(update_fields=update_fields + ['updated_at'])
+
+        after = {
+            k: _branding_audit_value(getattr(partner, k))
+            for k in before.keys()
+        }
+
+        if before:
+            _audit(
+                actor=updated_by,
+                action=AuditAction.UPDATE,
+                entity_type='PartnerOrganization',
+                entity_id=partner.id,
+                diff={'before': before, 'after': after},
+                request=request,
+            )
 
         return partner
 

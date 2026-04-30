@@ -19,6 +19,7 @@ class StaffUserListSerializer(serializers.ModelSerializer):
 class StaffUserDetailSerializer(serializers.ModelSerializer):
     full_name = serializers.SerializerMethodField()
     display_name = serializers.SerializerMethodField()
+    professional_display_name = serializers.SerializerMethodField()
     created_by = serializers.SerializerMethodField()
     has_signature = serializers.SerializerMethodField()
 
@@ -26,7 +27,7 @@ class StaffUserDetailSerializer(serializers.ModelSerializer):
         model = StaffUser
         fields = [
             'id', 'email', 'title', 'first_name', 'last_name',
-            'full_name', 'display_name',
+            'full_name', 'display_name', 'professional_display_name',
             'role', 'is_active', 'has_signature',
             'created_by', 'created_at', 'updated_at',
         ]
@@ -35,7 +36,12 @@ class StaffUserDetailSerializer(serializers.ModelSerializer):
         return obj.get_full_name()
 
     def get_display_name(self, obj):
-        return obj.get_display_name()
+        # Plain "René GOSSA" — without title. UI defaults to this
+        # whenever no medical/signature context is implied.
+        return obj.display_name
+
+    def get_professional_display_name(self, obj):
+        return obj.professional_display_name
 
     def get_has_signature(self, obj):
         return bool(obj.signature_file_key)
@@ -51,6 +57,9 @@ class StaffUserDetailSerializer(serializers.ModelSerializer):
 
 class StaffUserCreateSerializer(serializers.Serializer):
     email = serializers.EmailField()
+    title = serializers.CharField(
+        max_length=20, required=False, allow_blank=True, default='',
+    )
     first_name = serializers.CharField(max_length=100)
     last_name = serializers.CharField(max_length=100)
     role = serializers.ChoiceField(choices=Role.choices)
@@ -76,6 +85,7 @@ class StaffUserUpdateSerializer(serializers.Serializer):
 class MeSerializer(serializers.ModelSerializer):
     full_name = serializers.SerializerMethodField()
     display_name = serializers.SerializerMethodField()
+    professional_display_name = serializers.SerializerMethodField()
     has_signature = serializers.SerializerMethodField()
     permissions = serializers.SerializerMethodField()
 
@@ -83,7 +93,7 @@ class MeSerializer(serializers.ModelSerializer):
         model = StaffUser
         fields = [
             'id', 'email', 'title', 'first_name', 'last_name',
-            'full_name', 'display_name',
+            'full_name', 'display_name', 'professional_display_name',
             'role', 'is_active', 'has_signature',
             'created_at', 'updated_at', 'permissions',
         ]
@@ -92,7 +102,10 @@ class MeSerializer(serializers.ModelSerializer):
         return obj.get_full_name()
 
     def get_display_name(self, obj):
-        return obj.get_display_name()
+        return obj.display_name
+
+    def get_professional_display_name(self, obj):
+        return obj.professional_display_name
 
     def get_has_signature(self, obj):
         return bool(obj.signature_file_key)
@@ -104,10 +117,15 @@ class MeSerializer(serializers.ModelSerializer):
 
 class MeUpdateSerializer(serializers.Serializer):
     """
-    Self-update: change name fields and/or rotate password.
-    Password change requires the current password for verification.
-    Email is not changeable via this endpoint (LAB_ADMIN action).
+    Self-update: change name fields, professional title, and/or rotate
+    password. Password change requires the current password. Email is
+    not changeable via this endpoint (LAB_ADMIN action).
+
+    ``title`` is included so biologists / lab admins can set their own
+    professional title (e.g. "Dr") without round-tripping through an
+    admin — it surfaces on the report PDF signature block they sign.
     """
+    title = serializers.CharField(max_length=20, required=False, allow_blank=True)
     first_name = serializers.CharField(max_length=100, required=False)
     last_name = serializers.CharField(max_length=100, required=False)
     current_password = serializers.CharField(write_only=True, required=False)

@@ -98,6 +98,37 @@ class PartnerOrganization(BaseModel):
     notes = models.TextField(blank=True, default='')
     is_active = models.BooleanField(default=True, db_index=True)
 
+    # ---- Optional report branding (per-partner) ----
+    # When ``custom_report_branding_enabled`` is True AND the relevant
+    # field is non-empty, the result PDF for requests sourced from this
+    # partner uses the partner's identity instead of the lab's. Each
+    # field falls back to the lab's equivalent independently so a
+    # partial configuration (e.g. partner name set, no logo) still
+    # produces a clean report.
+    custom_report_branding_enabled = models.BooleanField(
+        default=False,
+        help_text='When enabled, result PDFs for requests from this '
+                  'partner use the partner-specific header/logo/footer '
+                  'instead of the laboratory branding.',
+    )
+    report_header_name = models.CharField(max_length=255, blank=True, default='')
+    report_header_subtitle = models.CharField(max_length=255, blank=True, default='')
+    report_header_address = models.TextField(blank=True, default='')
+    report_header_phone = models.CharField(max_length=50, blank=True, default='')
+    report_header_email = models.EmailField(blank=True, default='')
+    report_header_logo = models.ImageField(
+        upload_to='partners/branding/logos/',
+        blank=True,
+        null=True,
+        help_text='Partner logo printed on result PDFs. PNG or JPEG, '
+                  'recommended at least 600px wide for crisp rendering.',
+    )
+    report_footer_text = models.TextField(
+        blank=True, default='',
+        help_text='Confidentiality / legal text printed at the bottom of '
+                  'result PDFs in place of the lab footer.',
+    )
+
     class Meta:
         verbose_name = 'Partner Organization'
         verbose_name_plural = 'Partner Organizations'

@@ -43,6 +43,7 @@ from reportlab.pdfgen import canvas
 from apps.audit.models import ActorType, AuditAction, AuditLog
 from apps.catalog.models import ResultStructure
 from apps.lab_settings.models import LabSettings
+from apps.requests.branding import ReportBranding, resolve_result_report_branding
 from apps.requests.models import (
     AnalysisRequest, AnalysisRequestReport, RequestStatus,
 )
@@ -183,6 +184,12 @@ def _create_version(
     unique constraint holds throughout the transaction.
     """
     settings = LabSettings.get_solo()
+    # Optional partner-specific branding (header / logo / footer). Falls
+    # back field-by-field to the lab's own values, so behaviour for any
+    # request without partner branding is unchanged. Behaviour toggles
+    # (``show_logo``, ``logo_position``, etc.) and PDF password
+    # protection still come from ``LabSettings``.
+    branding = resolve_result_report_branding(analysis_request)
     sections = _collect_sections(analysis_request)
 
     # Two-pass rendering: first pass counts pages so the second pass
@@ -190,13 +197,13 @@ def _create_version(
     ctx_dry = _RenderContext()
     buf_dry = io.BytesIO()
     c_dry = canvas.Canvas(buf_dry, pagesize=A4)
-    _render_report(c_dry, analysis_request, settings, sections, ctx_dry)
+    _render_report(c_dry, analysis_request, settings, branding, sections, ctx_dry)
     c_dry.save()
 
     ctx = _RenderContext(total_pages=ctx_dry.current_page)
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
-    _render_report(c, analysis_request, settings, sections, ctx)
+    _render_report(c, analysis_request, settings, branding, sections, ctx)
     c.save()
     pdf_bytes = buffer.getvalue()
 
@@ -446,14 +453,14 @@ def _accent(settings: LabSettings):
 
 def _render_report(
     c: canvas.Canvas, ar: AnalysisRequest, settings: LabSettings,
-    sections: list[dict], ctx: '_RenderContext',
+    branding: ReportBranding, sections: list[dict], ctx: '_RenderContext',
 ):
     def _on_page_break():
-        _draw_page_footer(c, ar, settings, ctx)
+        _draw_page_footer(c, ar, settings, branding, ctx)
         ctx.current_page += 1
 
     def _on_new_page(cursor: 'PageCursor'):
-        _draw_header(cursor, settings)
+        _draw_header(cursor, settings, branding)
         cursor.gap(2 * mm)
         _draw_continuation_line(cursor, ar)
         cursor.gap(4 * mm)
@@ -467,7 +474,7 @@ def _render_report(
     )
 
     # Page 1: full header + patient/request block
-    _draw_header(cursor, settings)
+    _draw_header(cursor, settings, branding)
     cursor.gap(5 * mm)
     _draw_patient_request_block(cursor, ar, settings)
     cursor.gap(8 * mm)
@@ -492,14 +499,17 @@ def _render_report(
         _draw_validation_block(cursor, ar)
 
     # Last page footer (pagination + legal only)
-    _draw_page_footer(c, ar, settings, ctx)
+    _draw_page_footer(c, ar, settings, branding, ctx)
 
 
 # ---------------------------------------------------------------------------
 # Logo
 # ---------------------------------------------------------------------------
 
-def _draw_logo(c: canvas.Canvas, cursor: 'PageCursor', settings: LabSettings):
+def _draw_logo(
+    c: canvas.Canvas, cursor: 'PageCursor', settings: LabSettings,
+    branding: ReportBranding,
+):
     """
     Render the logo inside a fixed bounding box anchored to the page
     top-right (or top-left / top-center per ``logo_position``).
@@ -508,14 +518,18 @@ def _draw_logo(c: canvas.Canvas, cursor: 'PageCursor', settings: LabSettings):
     stable position regardless of where the cursor is. The image is
     centered both horizontally and vertically inside the box, scaled
     down to fit, with aspect ratio preserved.
+
+    Logo *source* comes from ``branding`` (lab or partner depending on
+    request); position + max box size still come from ``LabSettings``.
     """
-    if not settings.logo_file_key:
+    logo_key = branding.logo_file_key
+    if not logo_key:
         return
     try:
         from reportlab.lib.utils import ImageReader
         from django.core.files.storage import default_storage
 
-        with default_storage.open(settings.logo_file_key, 'rb') as f:
+        with default_storage.open(logo_key, 'rb') as f:
             img = ImageReader(f)
 
         max_w = settings.logo_max_width_mm * mm
@@ -544,7 +558,7 @@ def _draw_logo(c: canvas.Canvas, cursor: 'PageCursor', settings: LabSettings):
         c.drawImage(img, x, y, width=w, height=h,
                     preserveAspectRatio=True, mask='auto')
     except Exception as e:  # noqa: BLE001
-        logger.warning('Failed to render lab logo: %s', e)
+        logger.warning('Failed to render report logo: %s', e)
 
 
 # ---------------------------------------------------------------------------
@@ -554,7 +568,9 @@ def _draw_logo(c: canvas.Canvas, cursor: 'PageCursor', settings: LabSettings):
 _HEADER_GAP = 5 * mm  # horizontal gap between logo box and text zone
 
 
-def _draw_header(cursor: 'PageCursor', settings: LabSettings):
+def _draw_header(
+    cursor: 'PageCursor', settings: LabSettings, branding: ReportBranding,
+):
     """
     Two-zone header layout.
 
@@ -565,14 +581,20 @@ def _draw_header(cursor: 'PageCursor', settings: LabSettings):
     - **Logo zone** — positioned per ``logo_position`` (LEFT / CENTER
       / RIGHT), image centered inside its bounding box.
     - **Text zone** — occupies the remaining width, top-aligned to the
-      same starting Y as the logo zone. Contains: lab name, subtitle,
+      same starting Y as the logo zone. Contains: header name, subtitle,
       address, contact info.
 
     Both zones share the same top anchor (``cursor.y``) and the cursor
     advances past the taller of the two once drawing is complete.
+
+    Identity data (name/subtitle/address/contact/logo source) comes
+    from ``branding`` so that partner overrides apply transparently.
+    Display toggles (``show_logo``, ``show_lab_address``,
+    ``logo_position``, ``logo_max_*``) still come from ``settings`` —
+    partners don't override layout decisions.
     """
     c = cursor.canvas
-    has_logo = settings.show_logo and settings.logo_file_key
+    has_logo = settings.show_logo and bool(branding.logo_file_key)
 
     logo_box_w = settings.logo_max_width_mm * mm if has_logo else 0
     logo_box_h = settings.logo_max_height_mm * mm if has_logo else 0
@@ -595,44 +617,44 @@ def _draw_header(cursor: 'PageCursor', settings: LabSettings):
 
     # -- Draw logo in its zone --
     if has_logo:
-        _draw_logo(c, cursor, settings)
+        _draw_logo(c, cursor, settings, branding)
 
     # -- Draw text in its zone (top-aligned to header_top) --
     text_y = header_top
     line_h = 0  # tracks how far down the text extends
 
-    if settings.lab_name:
+    if branding.name:
         c.setFont('Helvetica-Bold', 16)
         c.setFillColor(black)
-        c.drawString(text_x, text_y, settings.lab_name)
+        c.drawString(text_x, text_y, branding.name)
         text_y -= 18
         line_h += 18
 
-    if settings.lab_subtitle:
+    if branding.subtitle:
         text_y -= 1
         c.setFont('Helvetica', 9)
         c.setFillColor(grey)
-        c.drawString(text_x, text_y, settings.lab_subtitle)
+        c.drawString(text_x, text_y, branding.subtitle)
         text_y -= 11
         line_h += 12
 
     if settings.show_lab_address:
         text_y -= 3
         line_h += 3
-        if settings.address:
+        if branding.address:
             c.setFont('Helvetica', 8)
             c.setFillColor(grey)
-            for line in settings.address.splitlines():
+            for line in branding.address.splitlines():
                 c.drawString(text_x, text_y, line)
                 text_y -= 10
                 line_h += 10
         contact_parts = []
-        if settings.phone:
-            contact_parts.append(f'Tel: {settings.phone}')
-        if settings.email:
-            contact_parts.append(settings.email)
-        if settings.website:
-            contact_parts.append(settings.website)
+        if branding.phone:
+            contact_parts.append(f'Tel: {branding.phone}')
+        if branding.email:
+            contact_parts.append(branding.email)
+        if branding.website:
+            contact_parts.append(branding.website)
         if contact_parts:
             c.setFont('Helvetica', 8)
             c.setFillColor(grey)
@@ -977,7 +999,7 @@ def _draw_param_table(
 
 def _draw_page_footer(
     c: canvas.Canvas, ar: AnalysisRequest, settings: LabSettings,
-    ctx: '_RenderContext',
+    branding: ReportBranding, ctx: '_RenderContext',
 ):
     """
     Repeating footer drawn at a fixed Y on every page.
@@ -985,6 +1007,10 @@ def _draw_page_footer(
     Contains only pagination and legal text — the validation block is
     rendered as final business content via the cursor (see
     ``_draw_validation_block``), not repeated per page.
+
+    The legal text source comes from ``branding`` so a partner-supplied
+    footer overrides the lab's; the toggle ``show_legal_footer`` stays
+    on ``LabSettings``.
     """
     y = MARGIN_BOTTOM + FOOTER_ZONE - 4 * mm
 
@@ -1002,11 +1028,11 @@ def _draw_page_footer(
         )
 
     # -- Legal text (bottom, centered) --
-    if settings.show_legal_footer and settings.legal_footer:
+    if settings.show_legal_footer and branding.legal_footer:
         c.setFont('Helvetica-Oblique', 7)
         c.setFillColor(grey)
         legal_y = MARGIN_BOTTOM
-        for i, line in enumerate(settings.legal_footer.splitlines()[:3]):
+        for i, line in enumerate(branding.legal_footer.splitlines()[:3]):
             c.drawCentredString(
                 PAGE_WIDTH / 2, legal_y + (2 - i) * 3 * mm, line,
             )

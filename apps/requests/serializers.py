@@ -147,12 +147,15 @@ class AnalysisRequestDetailSerializer(serializers.ModelSerializer):
     confirmed_by_email = serializers.CharField(
         source='confirmed_by.email', read_only=True, default=None,
     )
+    confirmed_by_display = serializers.SerializerMethodField()
     cancelled_by_email = serializers.CharField(
         source='cancelled_by.email', read_only=True, default=None,
     )
+    cancelled_by_display = serializers.SerializerMethodField()
     created_by_email = serializers.CharField(
         source='created_by.email', read_only=True, default=None,
     )
+    created_by_display = serializers.SerializerMethodField()
     # Patient email surfaced so the UI can pre-validate "Notify by email"
     # actions without a second round-trip. The notify-patient endpoint
     # still validates server-side and returns PATIENT_EMAIL_MISSING if
@@ -183,12 +186,15 @@ class AnalysisRequestDetailSerializer(serializers.ModelSerializer):
     notified_by_email_by_email = serializers.CharField(
         source='notified_by_email_by.email', read_only=True, default=None,
     )
+    notified_by_email_by_display = serializers.SerializerMethodField()
     delivered_by_email = serializers.CharField(
         source='delivered_by.email', read_only=True, default=None,
     )
+    delivered_by_display = serializers.SerializerMethodField()
     archived_by_email = serializers.CharField(
         source='archived_by.email', read_only=True, default=None,
     )
+    archived_by_display = serializers.SerializerMethodField()
 
     class Meta:
         model = AnalysisRequest
@@ -199,18 +205,46 @@ class AnalysisRequestDetailSerializer(serializers.ModelSerializer):
             'source_type', 'billing_mode',
             'partner_organization_id', 'partner_organization_name',
             'partner_organization_code', 'external_reference', 'source_notes',
-            'confirmed_at', 'confirmed_by_email',
-            'cancelled_at', 'cancelled_by_email',
-            'created_by_email',
+            'confirmed_at', 'confirmed_by_email', 'confirmed_by_display',
+            'cancelled_at', 'cancelled_by_email', 'cancelled_by_display',
+            'created_by_email', 'created_by_display',
             'items',
             'has_report', 'current_report',
             # Notification + lifecycle stamps
             'notified_by_email_at', 'notified_by_email_by_email',
+            'notified_by_email_by_display',
             'notification_count', 'last_patient_notification_channel',
-            'delivered_at', 'delivered_by_email',
-            'archived_at', 'archived_by_email',
+            'delivered_at', 'delivered_by_email', 'delivered_by_display',
+            'archived_at', 'archived_by_email', 'archived_by_display',
             'created_at', 'updated_at',
         ]
+
+    # ---- Display-name resolvers -------------------------------------
+    # Each ``*_by_display`` mirrors its ``*_by_email`` companion but
+    # surfaces the StaffUser's ``display_name`` (no title — general UI
+    # context). The frontend reads ``*_by_display || *_by_email`` so old
+    # records without a live actor still render the snapshotted email.
+    @staticmethod
+    def _user_display(user):
+        return user.display_name if user is not None else None
+
+    def get_created_by_display(self, obj):
+        return self._user_display(obj.created_by)
+
+    def get_confirmed_by_display(self, obj):
+        return self._user_display(obj.confirmed_by)
+
+    def get_cancelled_by_display(self, obj):
+        return self._user_display(obj.cancelled_by)
+
+    def get_delivered_by_display(self, obj):
+        return self._user_display(obj.delivered_by)
+
+    def get_archived_by_display(self, obj):
+        return self._user_display(obj.archived_by)
+
+    def get_notified_by_email_by_display(self, obj):
+        return self._user_display(obj.notified_by_email_by)
 
     def get_patient_summary(self, obj):
         p = obj.patient

@@ -61,6 +61,7 @@ TENANT_APPS = [
     'apps.procurement',  # Thin routing app — no models, re-exports suppliers views
     'apps.partners',
     'apps.invoicing',
+    'apps.financial_reports',  # Read-only simulation surface; no models.
     'apps.alerts',
     'apps.dashboard',
     'apps.audit',

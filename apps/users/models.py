@@ -116,11 +116,31 @@ class StaffUser(AbstractBaseUser, PermissionsMixin):
         return f'{self.first_name} {self.last_name}'.strip()
 
     def get_display_name(self):
-        """Full name prefixed with professional title when available."""
+        """Backwards-compatible alias for ``professional_display_name``.
+        Returns the title-prefixed name (e.g. "Dr René GOSSA") so existing
+        callers — notably the result PDF renderer's signature block —
+        keep working unchanged. New code should prefer the explicit
+        ``display_name`` / ``professional_display_name`` properties.
+        """
+        return self.professional_display_name
+
+    @property
+    def display_name(self):
+        """Human-readable name without title — "René GOSSA". Falls back
+        to the email when no name parts are populated yet (e.g. an
+        invited user who hasn't filled their profile)."""
         name = self.get_full_name()
+        return name or self.email
+
+    @property
+    def professional_display_name(self):
+        """Title-prefixed name for medical / signature contexts —
+        "Dr René GOSSA". Falls back to ``display_name`` when no title
+        is set. Used by report PDFs and validator attribution."""
+        base = self.display_name
         if self.title:
-            return f'{self.title} {name}'
-        return name
+            return f'{self.title} {base}'
+        return base
 
     def get_short_name(self):
         return self.first_name

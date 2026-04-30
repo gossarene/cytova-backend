@@ -51,9 +51,11 @@ class InvoiceDetailSerializer(serializers.ModelSerializer):
     generated_by_email = serializers.CharField(
         source='generated_by.email', read_only=True, default=None,
     )
+    generated_by_display = serializers.SerializerMethodField()
     confirmed_by_email = serializers.CharField(
         source='confirmed_by.email', read_only=True, default=None,
     )
+    confirmed_by_display = serializers.SerializerMethodField()
     lines = InvoiceLineSerializer(many=True, read_only=True)
     has_pdf = serializers.SerializerMethodField()
     pdf_url = serializers.SerializerMethodField()
@@ -69,14 +71,20 @@ class InvoiceDetailSerializer(serializers.ModelSerializer):
             'gross_total', 'discount_rate_snapshot',
             'discount_amount', 'subtotal_after_discount',
             'vat_rate_snapshot', 'vat_amount', 'net_total',
-            'generated_by_email', 'generated_at',
-            'confirmed_by_email', 'confirmed_at',
+            'generated_by_email', 'generated_by_display', 'generated_at',
+            'confirmed_by_email', 'confirmed_by_display', 'confirmed_at',
             'cancelled_at', 'notes',
             'has_pdf', 'pdf_url',
             'has_statement', 'statement_url',
             'lines',
             'created_at',
         ]
+
+    def get_generated_by_display(self, obj):
+        return obj.generated_by.display_name if obj.generated_by else None
+
+    def get_confirmed_by_display(self, obj):
+        return obj.confirmed_by.display_name if obj.confirmed_by else None
 
     def get_has_pdf(self, obj):
         return bool(obj.pdf_file_key)

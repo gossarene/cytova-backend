@@ -21,6 +21,13 @@ class PartnerOrganizationListSerializer(serializers.ModelSerializer):
 
 
 class PartnerOrganizationDetailSerializer(serializers.ModelSerializer):
+    # Surfaced as a URL — the model field resolves through the configured
+    # storage (FileSystemStorage in dev, S3 in prod). DRF's
+    # ImageField.to_representation builds an absolute URL when a request
+    # is present in the serializer context, which is the case here
+    # because the viewset always passes ``context={'request': request}``.
+    report_header_logo = serializers.ImageField(read_only=True)
+
     class Meta:
         model = PartnerOrganization
         fields = [
@@ -29,6 +36,12 @@ class PartnerOrganizationDetailSerializer(serializers.ModelSerializer):
             'default_billing_mode', 'payment_terms_days',
             'invoice_discount_rate', 'billing_notes',
             'notes', 'is_active', 'created_at', 'updated_at',
+            # Optional report branding (per-partner)
+            'custom_report_branding_enabled',
+            'report_header_name', 'report_header_subtitle',
+            'report_header_address', 'report_header_phone',
+            'report_header_email', 'report_header_logo',
+            'report_footer_text',
         ]
 
 
@@ -64,6 +77,80 @@ class PartnerOrganizationCreateSerializer(serializers.Serializer):
                 'A partner organization with this code already exists.'
             )
         return code
+
+
+# Allowed image content types for partner-supplied report logos. Kept
+# narrow on purpose: the result PDF renderer feeds the file straight to
+# reportlab's ``ImageReader`` (PIL under the hood), which only handles
+# raster formats. SVG would require an additional rasterisation step
+# and a strict policy check against XML payload risks — out of scope
+# for this opt-in branding feature.
+LOGO_ALLOWED_CONTENT_TYPES = ('image/png', 'image/jpeg')
+LOGO_MAX_BYTES = 2 * 1024 * 1024  # 2 MiB hard cap.
+
+
+class PartnerBrandingUpdateSerializer(serializers.Serializer):
+    """
+    Multipart-friendly partial update for partner-specific report branding.
+
+    Field semantics
+    ---------------
+    - ``custom_report_branding_enabled`` toggles the override; the lab
+      branding is always restored as fallback when this is False or any
+      individual branding field is empty.
+    - ``report_header_logo`` is an actual uploaded file. Validated for
+      content type + size here; the model's ``ImageField`` then enforces
+      that the bytes can be opened by Pillow.
+    - ``clear_logo`` is a write-only flag that lets the UI delete an
+      existing logo without uploading a replacement. Useful for the
+      "Remove logo" button in the branding drawer.
+    """
+    custom_report_branding_enabled = serializers.BooleanField(required=False)
+    report_header_name = serializers.CharField(
+        max_length=255, required=False, allow_blank=True,
+    )
+    report_header_subtitle = serializers.CharField(
+        max_length=255, required=False, allow_blank=True,
+    )
+    report_header_address = serializers.CharField(required=False, allow_blank=True)
+    report_header_phone = serializers.CharField(
+        max_length=50, required=False, allow_blank=True,
+    )
+    report_header_email = serializers.EmailField(required=False, allow_blank=True)
+    report_header_logo = serializers.ImageField(required=False, allow_null=True)
+    report_footer_text = serializers.CharField(required=False, allow_blank=True)
+    clear_logo = serializers.BooleanField(required=False, write_only=True)
+
+    def validate_report_header_logo(self, value):
+        if value is None:
+            return value
+        if value.size > LOGO_MAX_BYTES:
+            raise serializers.ValidationError(
+                f'Logo file is too large ({value.size // 1024} KB). '
+                f'Maximum allowed: {LOGO_MAX_BYTES // 1024} KB.'
+            )
+        # ``content_type`` is the browser-supplied MIME — fast first check.
+        # The serializer's underlying ImageField already calls Pillow to
+        # confirm the bytes parse as a real image, so a spoofed MIME with
+        # garbage payload still fails downstream.
+        ctype = (value.content_type or '').lower()
+        if ctype not in LOGO_ALLOWED_CONTENT_TYPES:
+            raise serializers.ValidationError(
+                'Unsupported logo format. Allowed: PNG or JPEG.'
+            )
+        return value
+
+    def validate(self, attrs):
+        # ``clear_logo`` and ``report_header_logo`` are mutually exclusive
+        # — uploading a new logo and asking to clear the existing one in
+        # the same request is contradictory and almost always a UI bug.
+        if attrs.get('clear_logo') and attrs.get('report_header_logo') is not None:
+            raise serializers.ValidationError({
+                'clear_logo': (
+                    'Cannot clear and upload a new logo in the same request.'
+                ),
+            })
+        return attrs
 
 
 class PartnerOrganizationUpdateSerializer(serializers.Serializer):

@@ -11,6 +11,7 @@ from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters, status
 from rest_framework.decorators import action
 from rest_framework.mixins import ListModelMixin, RetrieveModelMixin
+from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.response import Response
 from rest_framework.viewsets import GenericViewSet
 
@@ -18,6 +19,7 @@ from common.permissions import IsAnyStaff, IsLabAdmin
 from .filters import PartnerOrganizationFilter
 from .models import PartnerExamPrice, PartnerOrganization
 from .serializers import (
+    PartnerBrandingUpdateSerializer,
     PartnerExamPriceCreateSerializer,
     PartnerExamPriceListSerializer,
     PartnerExamPriceUpdateSerializer,
@@ -62,7 +64,7 @@ class PartnerOrganizationViewSet(ListModelMixin, RetrieveModelMixin, GenericView
             request=request,
         )
         return Response(
-            PartnerOrganizationDetailSerializer(partner).data,
+            PartnerOrganizationDetailSerializer(partner, context={'request': request}).data,
             status=status.HTTP_201_CREATED,
         )
 
@@ -71,14 +73,14 @@ class PartnerOrganizationViewSet(ListModelMixin, RetrieveModelMixin, GenericView
         serializer = PartnerOrganizationUpdateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         if not serializer.validated_data:
-            return Response(PartnerOrganizationDetailSerializer(partner).data)
+            return Response(PartnerOrganizationDetailSerializer(partner, context={'request': request}).data)
         partner = PartnerOrganizationService.update(
             partner=partner,
             validated_data=serializer.validated_data,
             updated_by=request.user,
             request=request,
         )
-        return Response(PartnerOrganizationDetailSerializer(partner).data)
+        return Response(PartnerOrganizationDetailSerializer(partner, context={'request': request}).data)
 
     @action(detail=True, methods=['post'], url_path='deactivate')
     def deactivate(self, request, pk=None):
@@ -88,7 +90,36 @@ class PartnerOrganizationViewSet(ListModelMixin, RetrieveModelMixin, GenericView
             deactivated_by=request.user,
             request=request,
         )
-        return Response(PartnerOrganizationDetailSerializer(partner).data)
+        return Response(PartnerOrganizationDetailSerializer(partner, context={'request': request}).data)
+
+    # ------------------------------------------------------------------
+    # Report branding — separate endpoint with multipart parsers so the
+    # logo file can be uploaded alongside the text fields in a single
+    # request. Kept distinct from ``partial_update`` to keep the regular
+    # JSON edit flow free of multipart-only concerns.
+    # ------------------------------------------------------------------
+    @action(
+        detail=True,
+        methods=['post'],
+        url_path='branding',
+        parser_classes=[MultiPartParser, FormParser],
+        permission_classes=[IsLabAdmin],
+    )
+    def update_branding(self, request, pk=None):
+        partner = self.get_object()
+        serializer = PartnerBrandingUpdateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        partner = PartnerOrganizationService.update_branding(
+            partner=partner,
+            validated_data=serializer.validated_data,
+            updated_by=request.user,
+            request=request,
+        )
+        return Response(
+            PartnerOrganizationDetailSerializer(
+                partner, context={'request': request},
+            ).data,
+        )
 
 
 # ---------------------------------------------------------------------------

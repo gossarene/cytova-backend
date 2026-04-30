@@ -119,18 +119,29 @@ def _render_invoice_pdf(invoice: Invoice, doc_type: str = DOC_INVOICE) -> bytes:
     ctx = {'current_page': 1, 'total_pages': 0}
     buf_dry = io.BytesIO()
     c_dry = canvas.Canvas(buf_dry, pagesize=A4)
-    _draw_invoice(c_dry, invoice, settings, lines, ctx, is_invoice)
+    draw_document_body(c_dry, invoice, settings, lines, ctx, is_invoice)
     c_dry.save()
 
     ctx2 = {'current_page': 1, 'total_pages': ctx['current_page']}
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
-    _draw_invoice(c, invoice, settings, lines, ctx2, is_invoice)
+    draw_document_body(c, invoice, settings, lines, ctx2, is_invoice)
     c.save()
     return buf.getvalue()
 
 
-def _draw_invoice(c, invoice, settings, lines, ctx, is_invoice=True):
+def draw_document_body(c, invoice, settings, lines, ctx, is_invoice=True):
+    """
+    Public entry-point reused by the financial-reports module. Renders the
+    full body (header → metadata → lines → totals → footer) onto the
+    given canvas using a duck-typed ``invoice`` context — any object that
+    exposes the attributes ``_draw_invoice_block`` and ``_draw_totals``
+    expect (``invoice_number``, ``generated_at``, ``partner.name``,
+    ``period_start/period_end``, totals) works. The financial-reports
+    renderer builds an in-memory shim that satisfies this contract,
+    so its PDFs are visually identical to the invoicing FINANCIAL
+    STATEMENT mode without creating any Invoice rows.
+    """
     bottom = MARGIN_BOTTOM + FOOTER_ZONE
 
     def on_page_break():
