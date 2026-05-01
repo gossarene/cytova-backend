@@ -19,6 +19,13 @@ urlpatterns = [
     # Platform admin + public onboarding (mounted in apps.tenants.urls)
     path('api/v1/platform/', include('apps.tenants.urls')),
 
+    # Global Cytova patient signup (PatientAccount/Profile/Consent live in
+    # the public schema). Same routes are also mounted on the tenant URL
+    # conf — see ``config/urls.py`` — so the endpoint is reachable from
+    # any host the deployment serves without the caller having to know
+    # which subdomain hits which urlconf.
+    path('api/v1/patient-portal/', include('apps.patient_portal.urls')),
+
     # Health check
     path('health/', include('common.urls')),
 ]

@@ -62,3 +62,44 @@ def delete_stored_file(file_key: str) -> None:
         # Log but do not raise — physical delete failure should not
         # block the DB record from being cleaned up.
         logger.exception('Failed to delete stored file: %s', file_key)
+
+
+def copy_file(source_key: str, destination_key: str) -> bool:
+    """
+    Copy a stored object from ``source_key`` to ``destination_key``.
+
+    Returns ``True`` on success, ``False`` on any failure. Failures are
+    logged but never raised — callers (e.g. patient-portal share copy)
+    must keep working with the source reference when the copy can't be
+    completed, so the patient still has access.
+
+    Implementation
+    --------------
+    Streams source bytes through Python and writes them under the new
+    key via the storage backend. Not atomic in the multi-machine sense
+    (we don't lock the destination), but the destination key is
+    expected to be unique-per-row so concurrent writers can't collide.
+    Backend-native server-side copy (e.g. S3 ``CopyObject``) would be
+    a future optimisation; for now the simple read-write keeps the
+    behaviour identical across FileSystemStorage and S3.
+    """
+    if not source_key or not destination_key:
+        return False
+    if source_key == destination_key:
+        return False
+    try:
+        with default_storage.open(source_key, 'rb') as src:
+            payload = src.read()
+        default_storage.save(destination_key, ContentFile(payload))
+        return True
+    except FileNotFoundError:
+        logger.warning(
+            'copy_file: source missing source_key=%s', source_key,
+        )
+        return False
+    except Exception:
+        logger.exception(
+            'copy_file failed source_key=%s destination_key=%s',
+            source_key, destination_key,
+        )
+        return False

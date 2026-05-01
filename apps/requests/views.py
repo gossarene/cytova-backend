@@ -18,6 +18,7 @@ from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound
 from rest_framework.mixins import ListModelMixin, RetrieveModelMixin
 from rest_framework.response import Response
+from rest_framework.throttling import SimpleRateThrottle
 from rest_framework.viewsets import GenericViewSet
 
 from common.permissions import (
@@ -27,6 +28,8 @@ from common.permissions import (
     IsReceptionistOrLabAdmin,
     IsTechnicianOrAbove,
 )
+
+from apps.audit.models import ActorType, AuditAction, AuditLog
 from .filters import AnalysisRequestFilter, AnalysisRequestItemFilter
 from .models import AnalysisRequest, AnalysisRequestItem, AnalysisRequestReport
 from .serializers import (
@@ -52,6 +55,23 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+class NotifyCytovaThrottle(SimpleRateThrottle):
+    """Per-user throttle for ``POST .../notify-cytova/``. Reads its
+    rate from ``DEFAULT_THROTTLE_RATES['notify_cytova']``. A small
+    dedicated subclass keeps the per-action throttle declaration
+    declarative — DRF's ``ScopedRateThrottle`` resolves its scope
+    from a view-level attribute that ``@action`` cannot supply.
+    """
+    scope = 'notify_cytova'
+
+    def get_cache_key(self, request, view):
+        ident = (
+            str(request.user.pk) if request.user.is_authenticated
+            else self.get_ident(request)
+        )
+        return self.cache_format % {'scope': self.scope, 'ident': ident}
+
 
 def _get_request_or_404(pk) -> AnalysisRequest:
     try:
@@ -189,10 +209,39 @@ class AnalysisRequestViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet)
             # Generating the final patient report is a biologist-level
             # responsibility — the same user who finalizes the request.
             return [IsBiologistOrAbove()]
-        if self.action in ('report_download', 'report_versions', 'report_version_download'):
+        if self.action in (
+            'report_download', 'report_versions', 'report_version_download',
+            'report_history',
+        ):
             return [IsAnyStaff()]
         if self.action in ('create_access_token', 'regenerate_access_token'):
             return [IsAnyStaff()]
+        if self.action == 'notify_cytova':
+            # Sharing a result with a global patient portal account is
+            # a patient-comms action — but unlike ``notify_patient``
+            # (email blast) the lab user doing it might be the
+            # technician who just finished the run. Per spec, gate at
+            # technician-or-above so receptionists, techs, biologists,
+            # and lab admins can all share; viewers and inventory
+            # managers cannot.
+            return [IsTechnicianOrAbove()]
+        if self.action == 'cytova_share_status':
+            # Read-only badge for the request detail page — any
+            # authenticated staff who can already see the request can
+            # see whether it has been shared with the patient portal.
+            return [IsAnyStaff()]
+        if self.action == 'revoke_cytova_share':
+            # Revocation is a stricter gate than sharing: it removes a
+            # patient's existing access. Restrict to receptionist + lab
+            # admin (same as ``notify_patient``) so a technician who
+            # could share it can't unilaterally yank it back.
+            return [IsReceptionistOrLabAdmin()]
+        if self.action == 'reopen_result':
+            # Walking an issued result back to VALIDATED is the most
+            # consequential action on the request — the new report
+            # version will overwrite what the patient currently sees.
+            # Restrict to biologists + lab admins.
+            return [IsBiologistOrAbove()]
         if self.action == 'notify_patient':
             # Patient-facing communication is a front-desk responsibility
             # (receptionists handle patient outreach) plus lab admins for
@@ -522,6 +571,146 @@ class AnalysisRequestViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet)
             filename=f'report_{ar.public_reference or ar.request_number}_v{report.version_number}.pdf',
         )
 
+    @action(detail=True, methods=['get'], url_path='report-history')
+    def report_history(self, request, pk=None):
+        """``GET /requests/{id}/report-history/`` — staff-only
+        traceability that joins the lab-internal ``AnalysisRequestReport``
+        version line with the patient-portal ``PatientSharedResult``
+        rows that referenced each version. Lets the lab UI render a
+        single panel answering: "for this request, what versions did we
+        generate, which were shared with the patient, through which
+        channel, and when?"
+
+        Distinct from ``report/versions`` (which is purely the lab
+        version list) by adding the patient-side cross-reference, the
+        issuance lifecycle snapshot, and a ``channels_used`` aggregate.
+
+        Cross-schema lookup
+        -------------------
+        Lab versions live in the tenant schema (resolved by
+        ``CytovaTenantMiddleware``). Patient share rows live in the
+        public schema. The join is performed in two queries — never via
+        a cross-schema FK — and is scoped on
+        ``(source_tenant_schema, source_request_id)`` so a UUID
+        collision across two tenants could never bleed history across
+        labs.
+
+        Privacy contract
+        ----------------
+        Internal storage paths (``pdf_file_key``, ``storage_key``,
+        ``patient_storage_key``) are never serialised. The download
+        path returned per version reuses the existing authenticated
+        ``report/versions/{id}/download`` endpoint — same access-control
+        surface as ``report_versions``.
+
+        Patient-side history is intentionally NOT filtered to ACTIVE
+        rows — staff should be able to see the full lifecycle including
+        revoked / hidden shares. The patient-portal view (Phase 2) hides
+        those; the lab view does not.
+        """
+        from django.db import connection as _conn
+        from apps.patient_portal.models import PatientSharedResult
+
+        ar = _get_request_or_404(pk)
+
+        lab_versions = list(
+            AnalysisRequestReport.objects
+            .filter(analysis_request=ar)
+            .select_related('generated_by')
+            .order_by('-version_number')
+        )
+
+        # Pull every share row this request ever had — including
+        # revoked + hidden — so the lab traceability surface mirrors
+        # what actually happened. The Phase-2 patient-portal endpoint
+        # filters those out; the lab one must not.
+        tenant_schema = getattr(_conn, 'schema_name', '') or ''
+        share_events = list(
+            PatientSharedResult.objects
+            .filter(
+                source_tenant_schema=tenant_schema,
+                source_request_id=ar.id,
+            )
+            .order_by('-shared_at', '-created_at')
+        )
+
+        # Bucket share events by the lab version_number they referenced.
+        # Pre-Phase-1 share rows may carry ``report_version_number=None``
+        # — those land in an "unversioned" bucket, surfaced separately
+        # so they aren't silently dropped.
+        by_version: dict[int, list] = {}
+        unversioned_shares: list = []
+        for evt in share_events:
+            if evt.report_version_number is None:
+                unversioned_shares.append(evt)
+            else:
+                by_version.setdefault(evt.report_version_number, []).append(evt)
+
+        def _serialize_share_event(evt) -> dict:
+            return {
+                'shared_result_id': str(evt.id),
+                'shared_at': (
+                    evt.shared_at.isoformat() if evt.shared_at
+                    else evt.created_at.isoformat()
+                ),
+                'shared_channel': evt.shared_channel or '',
+                'share_status': evt.status,
+                'is_current_for_patient': evt.is_current_for_patient,
+                'patient_account_id': str(evt.patient_account_id),
+            }
+
+        return Response({
+            'data': {
+                'request_id': str(ar.id),
+                'request_number': ar.request_number,
+                'request_status': ar.status,
+                'issued_at': ar.issued_at.isoformat() if ar.issued_at else None,
+                'issued_by_email': (
+                    ar.issued_by.email if ar.issued_by_id else None
+                ),
+                'reopened_at': (
+                    ar.reopened_at.isoformat() if ar.reopened_at else None
+                ),
+                'reopened_by_email': (
+                    ar.reopened_by.email if ar.reopened_by_id else None
+                ),
+                'reopen_reason': ar.reopen_reason or '',
+                'lab_versions': [
+                    {
+                        'id': str(v.id),
+                        'version_number': v.version_number,
+                        'is_current': v.is_current,
+                        'generated_at': v.generated_at.isoformat(),
+                        'generated_by_email': (
+                            v.generated_by.email if v.generated_by else None
+                        ),
+                        'downloadable': bool(v.pdf_file_key),
+                        'pdf_url': (
+                            f'/api/v1/requests/{ar.id}/report/versions/'
+                            f'{v.id}/download/'
+                        ),
+                        'shared_with_patient': [
+                            _serialize_share_event(evt)
+                            for evt in by_version.get(v.version_number, [])
+                        ],
+                    }
+                    for v in lab_versions
+                ],
+                'unversioned_shares': [
+                    _serialize_share_event(evt) for evt in unversioned_shares
+                ],
+                # Distinct channel set across patient-facing shares.
+                # Sorted for stable response shape — frontend renders a
+                # comma-separated badge from this without re-deriving.
+                'channels_used': sorted({
+                    evt.shared_channel for evt in share_events
+                    if evt.shared_channel
+                }),
+            },
+            'meta': None,
+            'errors': [],
+        })
+
     @action(detail=True, methods=['get'], url_path='report/download')
     def report_download(self, request, pk=None):
         """
@@ -550,8 +739,14 @@ class AnalysisRequestViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet)
         """
         GET  — return the current active token state (or null).
         POST — get-or-create a token (idempotent).
+
+        On the first POST that actually creates a token (no active
+        token previously), the request transitions to RESULT_ISSUED.
+        Subsequent POSTs that just return the existing active token
+        do NOT re-trigger issuance; they're idempotent reads.
         """
         from .patient_access import ResultAccessService
+        from .issuance import CHANNEL_SHARE_LINK, mark_request_issued
         ar = _get_request_or_404(pk)
 
         if request.method == 'GET':
@@ -560,15 +755,58 @@ class AnalysisRequestViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet)
                 return Response({'status': 'not_generated'})
             return Response(_serialize_access_token(token, request))
 
+        had_active_token = ResultAccessService.get_active_token(ar) is not None
         token = ResultAccessService.get_or_create_token(ar)
+        if not had_active_token:
+            # First time we mint a patient-facing link → issuance fires.
+            mark_request_issued(
+                analysis_request=ar, channel=CHANNEL_SHARE_LINK,
+                actor=request.user, request=request,
+            )
         return Response(_serialize_access_token(token, request))
 
     @action(detail=True, methods=['post'], url_path='access-token/regenerate')
     def regenerate_access_token(self, request, pk=None):
-        """Force-create a new token, deactivating the previous one."""
+        """Force-create a new token, deactivating the previous one.
+
+        Once the request has been issued, regeneration is a deliberate
+        re-emission and requires ``force_resend=true`` in the body.
+        Without it the endpoint returns an ALREADY_ISSUED error so the
+        frontend can surface a confirmation modal.
+        """
         from .patient_access import ResultAccessService
+        from .issuance import (
+            AlreadyIssued, CHANNEL_SHARE_LINK,
+            enforce_resend_gate, mark_request_issued,
+        )
         ar = _get_request_or_404(pk)
+        force_resend = bool(request.data.get('force_resend')) if hasattr(request, 'data') else False
+        try:
+            enforce_resend_gate(
+                analysis_request=ar, channel=CHANNEL_SHARE_LINK,
+                force_resend=force_resend,
+                actor=request.user, request=request,
+            )
+        except AlreadyIssued as exc:
+            return Response(
+                {
+                    'data': None,
+                    'meta': None,
+                    'errors': [{
+                        'code': exc.code,
+                        'message': exc.detail.get('message') if hasattr(exc, 'detail') else str(exc),
+                        'field': None,
+                        'detail': {},
+                    }],
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
         token = ResultAccessService.create_token(ar)
+        # Pre-issuance regen still flips the request to issued.
+        mark_request_issued(
+            analysis_request=ar, channel=CHANNEL_SHARE_LINK,
+            actor=request.user, request=request,
+        )
         return Response(_serialize_access_token(token, request))
 
     @action(detail=True, methods=['post'], url_path='notify-patient')
@@ -588,8 +826,38 @@ class AnalysisRequestViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet)
             ChannelOutcome, EmailChannelDisabled, NoChannelsRequested,
             PatientEmailMissing, RequestNotificationService,
         )
+        from .issuance import (
+            AlreadyIssued, CHANNEL_EMAIL,
+            enforce_resend_gate, mark_request_issued,
+        )
 
         ar = _get_request_or_404(pk)
+        force_resend = bool(request.data.get('force_resend')) if hasattr(request, 'data') else False
+
+        # Enforce the issuance gate BEFORE we hit the email provider so
+        # an already-issued request doesn't burn a delivery quota only
+        # to be silently ignored.
+        try:
+            enforce_resend_gate(
+                analysis_request=ar, channel=CHANNEL_EMAIL,
+                force_resend=force_resend,
+                actor=request.user, request=request,
+            )
+        except AlreadyIssued as exc:
+            return Response(
+                {
+                    'data': None,
+                    'meta': None,
+                    'errors': [{
+                        'code': exc.code,
+                        'message': exc.detail.get('message') if hasattr(exc, 'detail') else str(exc),
+                        'field': None,
+                        'detail': {},
+                    }],
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
         try:
             outcome = RequestNotificationService.notify_patient(ar, request)
         except (PatientEmailMissing, EmailChannelDisabled, NoChannelsRequested) as exc:
@@ -607,6 +875,16 @@ class AnalysisRequestViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet)
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        # Issuance fires only when at least one channel actually
+        # succeeded. A 0-success outcome (provider down, etc.) leaves
+        # the request in VALIDATED so the lab can retry without
+        # resend-gate friction.
+        if outcome.channels_succeeded:
+            mark_request_issued(
+                analysis_request=ar, channel=CHANNEL_EMAIL,
+                actor=request.user, request=request,
+            )
+
         return Response({
             'secure_link': outcome.secure_link,
             'expires_at': outcome.expires_at,
@@ -621,6 +899,316 @@ class AnalysisRequestViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet)
                 }
                 for c in outcome.channels_failed
             ],
+        })
+
+    @action(
+        detail=True, methods=['post'], url_path='notify-cytova',
+        throttle_classes=[NotifyCytovaThrottle],
+    )
+    def notify_cytova(self, request, pk=None):
+        """Share the current report with a global Cytova patient
+        account after verifying identity. See
+        ``apps/requests/notify_cytova_service.py`` for the snapshot
+        rationale + identity-verification policy.
+        """
+        from .notify_cytova_service import (
+            IdentityVerificationFailed,
+            NotifyCytovaError,
+            notify_cytova as notify_cytova_service,
+        )
+        from .serializers import NotifyCytovaSerializer
+        from .issuance import CHANNEL_CYTOVA, mark_request_issued
+        from apps.patient_portal.models import (
+            PatientSharedResult, SharedResultStatus,
+        )
+        from apps.users.models import Role
+        from django.db import connection as _conn
+
+        ar = _get_request_or_404(pk)
+        serializer = NotifyCytovaSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        force_share = serializer.validated_data.pop('force_share', False)
+
+        # One-shot guard: if a non-revoked share already exists for
+        # this lab request, refuse unless the caller is a privileged
+        # role AND explicitly passed ``force_share=true``. Revoked
+        # shares are excluded — once a previous share was actively
+        # withdrawn, re-sharing is a normal lab decision (still gated
+        # by the standard role + identity flow that follows).
+        existing = (
+            PatientSharedResult.objects
+            .filter(
+                source_tenant_schema=getattr(_conn, 'schema_name', '') or '',
+                source_request_id=ar.id,
+            )
+            .exclude(status=SharedResultStatus.REVOKED)
+            .order_by('-created_at')
+            .first()
+        )
+        if existing is not None:
+            actor_role = getattr(request.user, 'role', None)
+            privileged = actor_role in {Role.LAB_ADMIN, Role.BIOLOGIST}
+            if not (force_share and privileged):
+                return Response(
+                    {
+                        'data': None,
+                        'meta': None,
+                        'errors': [{
+                            'code': 'CYTOVA_ALREADY_SHARED',
+                            'message': 'This result has already been shared '
+                                       'with the patient via Cytova.',
+                            'field': None,
+                            'detail': {
+                                'shared_result_id': str(existing.id),
+                                'requires_role': ['LAB_ADMIN', 'BIOLOGIST'],
+                            },
+                        }],
+                    },
+                    status=status.HTTP_409_CONFLICT,
+                )
+
+        try:
+            shared, email_status = notify_cytova_service(
+                analysis_request=ar,
+                cytova_patient_id=serializer.validated_data['cytova_patient_id'],
+                first_name=serializer.validated_data['first_name'],
+                last_name=serializer.validated_data['last_name'],
+                date_of_birth=serializer.validated_data['date_of_birth'],
+                actor=request.user,
+                request=request,
+            )
+        except IdentityVerificationFailed as exc:
+            # Single non-distinguishing failure — never tell the lab
+            # user which field went wrong. The service has already
+            # written an audit row.
+            return Response(
+                {
+                    'data': None,
+                    'meta': None,
+                    'errors': [{
+                        'code': exc.code,
+                        'message': exc.message,
+                        'field': None,
+                        'detail': {},
+                    }],
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        except NotifyCytovaError as exc:
+            return Response(
+                {
+                    'data': None,
+                    'meta': None,
+                    'errors': [{
+                        'code': exc.code,
+                        'message': exc.message,
+                        'field': None,
+                        'detail': {},
+                    }],
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # First successful Cytova share also flips the request to
+        # RESULT_ISSUED. Subsequent (force-share) shares stay in
+        # RESULT_ISSUED — mark_request_issued is idempotent.
+        mark_request_issued(
+            analysis_request=ar, channel=CHANNEL_CYTOVA,
+            actor=request.user, request=request,
+        )
+
+        return Response({
+            'data': {
+                'shared_result_id': str(shared.id),
+                'email_notification': email_status,  # 'SENT' | 'FAILED'
+                'message': "Result successfully shared with patient.",
+            },
+            'meta': None,
+            'errors': [],
+        })
+
+    @action(detail=True, methods=['get'], url_path='cytova-share')
+    def cytova_share_status(self, request, pk=None):
+        """``GET /requests/{id}/cytova-share/`` — lab-side lookup that
+        powers the "Shared with Cytova patient" badge on the request
+        detail page.
+
+        Reads the public-schema ``PatientSharedResult`` table scoped to
+        the current tenant + this request's UUID. Returns the latest
+        share's status (or ``null`` when no share exists). Patient PII
+        is never exposed: just status, IDs, and timestamps.
+        """
+        from apps.patient_portal.models import PatientSharedResult
+        from django.db import connection as _conn
+
+        ar = _get_request_or_404(pk)
+        share = (
+            PatientSharedResult.objects
+            .filter(
+                source_tenant_schema=getattr(_conn, 'schema_name', '') or '',
+                source_request_id=ar.id,
+            )
+            .order_by('-created_at')
+            .first()
+        )
+        if share is None:
+            return Response({
+                'data': {'status': None, 'shared_result_id': None},
+                'meta': None, 'errors': [],
+            })
+        return Response({
+            'data': {
+                'status': share.status,
+                'shared_result_id': str(share.id),
+                'created_at': share.created_at.isoformat(),
+                'revoked_at': share.revoked_at.isoformat() if share.revoked_at else None,
+                'email_notification_status': share.email_notification_status or None,
+            },
+            'meta': None, 'errors': [],
+        })
+
+    @action(detail=True, methods=['post'], url_path='revoke-cytova-share')
+    def revoke_cytova_share(self, request, pk=None):
+        """``POST /requests/{id}/revoke-cytova-share/`` — flip every
+        active patient share spawned from this lab request to
+        ``REVOKED``.
+
+        The lab-side audit row is written here; the patient-side audit
+        row(s) are written by the service for each affected share.
+        Idempotent — repeated calls after the first revoke return
+        ``revoked_count=0``. Lab data (``AnalysisRequest``,
+        ``AnalysisRequestReport``, the PDF blob on storage) is
+        untouched.
+        """
+        from apps.patient_portal.services import revoke_shares_for_lab_request
+        from django.db import connection as _conn
+
+        ar = _get_request_or_404(pk)
+        actor_email = getattr(request.user, 'email', '') or ''
+        revoked_count = revoke_shares_for_lab_request(
+            tenant_schema=getattr(_conn, 'schema_name', '') or '',
+            source_request_id=ar.id,
+            revoked_by_lab=actor_email or 'lab',
+            request=request,
+        )
+
+        # Tenant audit — mirrors the share-side AuditLog row written by
+        # ``notify_cytova_service`` so the lab's audit history shows
+        # the full lifecycle.
+        AuditLog.objects.create(
+            actor_type=ActorType.STAFF_USER,
+            actor_id=getattr(request.user, 'id', None),
+            actor_email=actor_email,
+            action=AuditAction.CYTOVA_SHARE_REVOKED,
+            entity_type='AnalysisRequest',
+            entity_id=ar.id,
+            diff={'after': {
+                'notify_cytova_outcome': 'REVOKED',
+                'revoked_count': revoked_count,
+                'request_number': ar.request_number,
+            }},
+            ip_address=getattr(request, 'audit_ip', None),
+            user_agent=getattr(request, 'audit_user_agent', ''),
+        )
+
+        return Response({
+            'data': {
+                'revoked_count': revoked_count,
+                'message': 'Cytova sharing has been revoked for this request.',
+            },
+            'meta': None, 'errors': [],
+        })
+
+    @action(detail=True, methods=['post'], url_path='reopen-result')
+    def reopen_result(self, request, pk=None):
+        """``POST /requests/{id}/reopen-result/`` — controlled
+        correction flow.
+
+        Walks an issued request back to ``VALIDATED`` so the lab can
+        produce a new report version. Marks the current report as
+        no-longer-current (preserved as history) and resets the
+        Cytova-share single-shot lock indirectly by recording the
+        reopen — the lab still has to share again deliberately.
+
+        Permissions are stricter than notify: BIOLOGIST or LAB_ADMIN
+        only. The endpoint refuses unless the request is currently
+        ``RESULT_ISSUED`` — reopen is meaningless before issuance.
+        Audit row uses the dedicated ``RESULT_REOPENED`` action so an
+        audit reader can spot the correction trail.
+        """
+        from .serializers import ReopenResultSerializer
+        from .state_machine import RequestStateMachine
+        from .models import AnalysisRequestReport, RequestStatus
+
+        ar = _get_request_or_404(pk)
+        if ar.status != RequestStatus.RESULT_ISSUED:
+            return Response(
+                {
+                    'data': None,
+                    'meta': None,
+                    'errors': [{
+                        'code': 'NOT_ISSUED',
+                        'message': 'Only issued requests can be reopened.',
+                        'field': None,
+                        'detail': {'current_status': ar.status},
+                    }],
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        serializer = ReopenResultSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        reason = serializer.validated_data['reason'].strip()
+
+        from django.db import transaction as _tx
+        from django.utils import timezone as _tz
+        with _tx.atomic():
+            RequestStateMachine.transition(ar, RequestStatus.VALIDATED)
+            ar.reopened_at = _tz.now()
+            ar.reopened_by = request.user
+            ar.reopen_reason = reason
+            ar.save(update_fields=[
+                'status', 'reopened_at', 'reopened_by', 'reopen_reason',
+                'updated_at',
+            ])
+
+            # Mark the current report version as not-current so the
+            # lab can regenerate. The row is preserved (versions are
+            # history); a new version will be produced on next
+            # ``RequestReportService.regenerate``.
+            superseded_count = AnalysisRequestReport.objects.filter(
+                analysis_request=ar, is_current=True,
+            ).update(is_current=False, updated_at=_tz.now())
+
+            AuditLog.objects.create(
+                actor_type=ActorType.STAFF_USER,
+                actor_id=getattr(request.user, 'id', None),
+                actor_email=getattr(request.user, 'email', '') or '',
+                action=AuditAction.RESULT_REOPENED,
+                entity_type='AnalysisRequest',
+                entity_id=ar.id,
+                # ``reason`` IS the correction context the regulator
+                # cares about — this is the one place we deliberately
+                # store free-text from the lab user. Truncated as a
+                # belt-and-braces against accidentally pasted PII or
+                # giant blobs.
+                diff={'after': {
+                    'request_number': ar.request_number,
+                    'reason': reason[:2000],
+                    'superseded_report_versions': superseded_count,
+                }},
+                ip_address=getattr(request, 'audit_ip', None),
+                user_agent=getattr(request, 'audit_user_agent', ''),
+            )
+
+        return Response({
+            'data': {
+                'status': ar.status,
+                'reopened_at': ar.reopened_at.isoformat(),
+                'superseded_report_versions': superseded_count,
+                'message': 'Result reopened. Generate a new report version when ready.',
+            },
+            'meta': None, 'errors': [],
         })
 
     @action(detail=False, methods=['post'], url_path='preview-pricing')

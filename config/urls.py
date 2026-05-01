@@ -51,6 +51,11 @@ urlpatterns = [
         path('dashboard/',    include('apps.dashboard.urls')),
         path('lab-settings/', include('apps.lab_settings.urls')),
         path('audit/',        include('apps.audit.urls')),
+        # Global patient portal — also mounted on the public urlconf
+        # (``config/urls_public.py``). Listed here too so requests hitting
+        # a tenant subdomain still resolve, instead of returning 404 just
+        # because the user landed on the wrong host.
+        path('patient-portal/', include('apps.patient_portal.urls')),
         # path('files/',        include('apps.files.urls')),
         # path('portal/',       include('apps.portal.urls')),
 

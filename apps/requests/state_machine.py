@@ -81,6 +81,19 @@ class RequestStateMachine:
             RequestStatus.CANCELLED,
         },
         RequestStatus.VALIDATED: {
+            # First patient-facing notification flips this to RESULT_ISSUED
+            # via the ``mark_request_issued`` helper. Going straight to
+            # COMPLETED / CANCELLED stays legal so the legacy "no
+            # notification, just close it out" path keeps working.
+            RequestStatus.RESULT_ISSUED,
+            RequestStatus.COMPLETED,
+            RequestStatus.CANCELLED,
+        },
+        RequestStatus.RESULT_ISSUED: {
+            # Reopen-result walks the request back to VALIDATED so a
+            # correction can be applied. Re-issuing or re-notifying
+            # does NOT transition (status stays RESULT_ISSUED).
+            RequestStatus.VALIDATED,
             RequestStatus.COMPLETED,
             RequestStatus.CANCELLED,
         },

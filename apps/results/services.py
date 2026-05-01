@@ -33,6 +33,27 @@ from rest_framework.exceptions import ValidationError
 
 from apps.audit.models import AuditLog, AuditAction, ActorType
 from apps.files.signed_urls import generate_download_url
+from apps.requests.models import RequestStatus
+
+
+def _assert_not_issued(item) -> None:
+    """Hard lock: once the parent request reaches ``RESULT_ISSUED``,
+    every result-mutating action refuses with the spec's exact copy.
+    The lab must walk the request through ``reopen-result`` first.
+
+    The check resolves through ``item.analysis_request`` rather than
+    relying on a cached attribute, so a freshly-issued request blocks
+    even if the in-memory item handle is stale.
+    """
+    ar = item.analysis_request
+    # Refresh in case the caller is operating on an instance loaded
+    # before the recent issuance — extremely cheap and removes a class
+    # of test-flake / race surface.
+    ar.refresh_from_db(fields=['status'])
+    if ar.status == RequestStatus.RESULT_ISSUED:
+        raise ValidationError(
+            'This result has already been issued and is locked.'
+        )
 from apps.files.storage import delete_stored_file, store_result_file
 from apps.requests.models import (
     AnalysisRequestItem, ItemStatus, RequestStatus,
@@ -253,6 +274,7 @@ class ResultVersionService:
         request,
     ) -> ResultVersion:
         """Update result data. Only allowed on current DRAFT versions."""
+        _assert_not_issued(version.item)
         if version.status != ResultStatus.DRAFT:
             raise ValidationError(
                 f'Results can only be edited in DRAFT state '
@@ -301,6 +323,7 @@ class ResultVersionService:
         request has not been finalized. Once the request reaches
         VALIDATED, the comments are locked.
         """
+        _assert_not_issued(version.item)
         if version.status not in {ResultStatus.SUBMITTED, ResultStatus.VALIDATED}:
             raise ValidationError(
                 'Comments can only be edited on SUBMITTED or VALIDATED results.'
@@ -355,6 +378,7 @@ class ResultVersionService:
         """
         from apps.catalog.models import ResultStructure
 
+        _assert_not_issued(version.item)
         if not version.is_current:
             raise ValidationError('Only the current version can be submitted.')
 
@@ -430,6 +454,7 @@ class ResultVersionService:
         Item transitions to VALIDATED. Request may advance to
         READY_FOR_RELEASE if all active items are validated.
         """
+        _assert_not_issued(version.item)
         if not version.is_current:
             raise ValidationError('Only the current version can be validated.')
 
@@ -485,6 +510,7 @@ class ResultVersionService:
         transitions back to RESULT_ENTERED so the technician can
         create a new version.
         """
+        _assert_not_issued(version.item)
         if not version.is_current:
             raise ValidationError('Only the current version can be rejected.')
 

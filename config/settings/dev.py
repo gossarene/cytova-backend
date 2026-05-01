@@ -57,6 +57,8 @@ REST_FRAMEWORK = {
         'auth_login': '100/minute',
         'auth_signup': '5/hour',
         'slug_check': '30/hour',
+        # Dev/tests use a generous cap; the prod default is in base.py.
+        'notify_cytova': '1000/hour',
     },
 }
 

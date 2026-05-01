@@ -47,6 +47,13 @@ class RequestStatus(models.TextChoices):
     RETEST_REQUIRED         = 'RETEST_REQUIRED',         'Retest Required'
     READY_FOR_RELEASE       = 'READY_FOR_RELEASE',       'Ready For Release'
     VALIDATED               = 'VALIDATED',               'Validated'
+    # Locked finality state — set by the first patient-facing
+    # notification (email blast, secure-link regeneration, or Cytova
+    # share). Once issued the result + report are immutable; further
+    # notifications must carry an explicit ``force_resend`` flag, and
+    # any correction must go through the ``reopen-result`` flow which
+    # transitions back to VALIDATED.
+    RESULT_ISSUED           = 'RESULT_ISSUED',           'Result Issued'
     IN_PROGRESS             = 'IN_PROGRESS',             'In Progress'
     COMPLETED               = 'COMPLETED',               'Completed'
     CANCELLED               = 'CANCELLED',               'Cancelled'
@@ -208,6 +215,29 @@ class AnalysisRequest(BaseModel):
         blank=True,
         related_name='cancelled_requests',
     )
+    # Set the FIRST time a patient-facing notification fires for this
+    # request (any channel). Subsequent re-notifications keep these
+    # values — they record when the result was OFFICIALLY issued, not
+    # when it was last touched.
+    issued_at = models.DateTimeField(null=True, blank=True)
+    issued_by = models.ForeignKey(
+        'users.StaffUser',
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='issued_requests',
+        help_text='Operator who triggered the first patient-facing notification.',
+    )
+    # Reopen-result trail. Set when the lab walks the request back from
+    # RESULT_ISSUED to VALIDATED to fix something. ``reopen_reason``
+    # is the staff-supplied explanation; required by the endpoint.
+    reopened_at = models.DateTimeField(null=True, blank=True)
+    reopened_by = models.ForeignKey(
+        'users.StaffUser',
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='reopened_requests',
+    )
+    reopen_reason = models.TextField(blank=True, default='')
     final_conclusion = models.TextField(
         blank=True,
         default='',

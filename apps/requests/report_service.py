@@ -125,8 +125,11 @@ class RequestReportService:
         - Writes an ``UPDATE`` audit entry — distinct from the CREATE
           action used on first generation — so the audit log is
           unambiguous about version lineage.
+
+        Refuses outright once the request has reached
+        ``RESULT_ISSUED`` — the lab must reopen the result first.
         """
-        _assert_validated(analysis_request)
+        _assert_report_writable(analysis_request)
 
         # Lock the existing versions for the duration of the transaction
         # to serialise concurrent regenerate calls.
@@ -162,6 +165,42 @@ class RequestReportService:
 # ---------------------------------------------------------------------------
 
 def _assert_validated(analysis_request: AnalysisRequest) -> None:
+    """The original gate said "VALIDATED only". After the issuance
+    lifecycle landed, a request that has reached ``RESULT_ISSUED`` has
+    by definition already had a report generated — the patient is
+    reading it — so READ paths must not refuse.
+
+    Write paths (``regenerate``) keep the stricter rule via the
+    ``_assert_report_writable`` helper below: regenerating a report on
+    an issued request would silently swap what the patient sees, which
+    is exactly what the issuance lock exists to prevent.
+    """
+    if analysis_request.status not in (
+        RequestStatus.VALIDATED, RequestStatus.RESULT_ISSUED,
+    ):
+        raise ValidationError(
+            'Final report can only be generated for validated requests '
+            f'(current status: {analysis_request.status}).'
+        )
+
+
+def _assert_report_writable(analysis_request: AnalysisRequest) -> None:
+    """Stricter gate for actions that PRODUCE a new report version
+    (``regenerate``). Refuses once the result has been officially
+    issued — the lab must walk the request back through
+    ``reopen-result`` first, which transitions to VALIDATED and
+    legitimises the new version.
+
+    Refreshes status from the DB so a stale in-memory handle (e.g.
+    when a parallel request flipped the row to RESULT_ISSUED between
+    the caller's load and this check) doesn't slip past the gate.
+    """
+    analysis_request.refresh_from_db(fields=['status'])
+    if analysis_request.status == RequestStatus.RESULT_ISSUED:
+        raise ValidationError(
+            'This result has already been issued and is locked. '
+            'Reopen the result to generate a new report version.'
+        )
     if analysis_request.status != RequestStatus.VALIDATED:
         raise ValidationError(
             'Final report can only be generated for validated requests '

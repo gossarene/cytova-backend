@@ -328,3 +328,187 @@ def render_patient_result_ready(
             footer=footer,
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Patient Portal — email verification (link, not code)
+# ---------------------------------------------------------------------------
+
+_PATIENT_VERIFY_HTML_TEMPLATE = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Verify your Cytova account</title>
+</head>
+<body style="margin:0; padding:0; background:#f8fafc; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif; color:#0f172a;">
+  <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="background:#f8fafc; padding:40px 16px;">
+    <tr>
+      <td align="center">
+        <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="480" style="max-width:480px; background:#ffffff; border:1px solid #e2e8f0; border-radius:16px; padding:40px;">
+          <tr>
+            <td align="center" style="padding-bottom:24px;">
+              <span style="display:inline-block; font-size:20px; font-weight:600; letter-spacing:-0.02em; color:#2563eb;">Cytova</span>
+            </td>
+          </tr>
+          <tr>
+            <td style="font-size:18px; font-weight:600; color:#0f172a; padding-bottom:8px;">
+              Verify your Cytova account
+            </td>
+          </tr>
+          <tr>
+            <td style="font-size:14px; line-height:1.6; color:#475569; padding-bottom:24px;">
+              Hi {first_name}, welcome to Cytova. Please confirm your email address to activate your patient account.
+            </td>
+          </tr>
+          <tr>
+            <td align="center" style="padding:8px 0 24px 0;">
+              <a href="{verify_url}" style="display:inline-block; padding:12px 28px; background:#2563eb; color:#ffffff; font-size:14px; font-weight:600; text-decoration:none; border-radius:10px;">
+                Verify my email
+              </a>
+            </td>
+          </tr>
+          <tr>
+            <td style="font-size:13px; line-height:1.6; color:#64748b; padding-bottom:24px;">
+              This link is valid for {expires_hours} hours and can be used only once.
+            </td>
+          </tr>
+          <tr>
+            <td style="border-top:1px solid #e2e8f0; padding-top:20px; font-size:12px; line-height:1.5; color:#94a3b8;">
+              If you did not create a Cytova account, you can safely ignore this email.
+            </td>
+          </tr>
+        </table>
+        <div style="font-size:11px; color:#94a3b8; padding-top:16px;">© Cytova</div>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
+"""
+
+
+_PATIENT_VERIFY_TEXT_TEMPLATE = """\
+Hi {first_name},
+
+Welcome to Cytova. Please confirm your email address by opening the link below:
+
+  {verify_url}
+
+This link is valid for {expires_hours} hours and can be used only once.
+
+If you did not create a Cytova account, you can safely ignore this email.
+
+— Cytova
+"""
+
+
+def render_patient_verification(
+    *, first_name: str, verify_url: str, expires_hours: int,
+) -> Tuple[str, str]:
+    """Return (html_body, text_body) for the patient email-verification email."""
+    safe_name = (first_name or 'there').strip() or 'there'
+    return (
+        _PATIENT_VERIFY_HTML_TEMPLATE.format(
+            first_name=html.escape(safe_name),
+            verify_url=verify_url,
+            expires_hours=expires_hours,
+        ),
+        _PATIENT_VERIFY_TEXT_TEMPLATE.format(
+            first_name=safe_name,
+            verify_url=verify_url,
+            expires_hours=expires_hours,
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Patient Portal — "new shared result" notification
+#
+# IMPORTANT — confidentiality contract: this template MUST NOT include
+# any medical content (no exam names, no values, no result reference,
+# no clinical comments, no PDF). The email is a generic "log in to
+# Cytova" prompt. The patient sees the actual result only after they
+# authenticate to the portal and download via the per-file token
+# endpoint.
+# ---------------------------------------------------------------------------
+
+_PATIENT_SHARED_HTML_TEMPLATE = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>New lab result available in Cytova</title>
+</head>
+<body style="margin:0; padding:0; background:#f8fafc; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif; color:#0f172a;">
+  <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="background:#f8fafc; padding:40px 16px;">
+    <tr>
+      <td align="center">
+        <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="480" style="max-width:480px; background:#ffffff; border:1px solid #e2e8f0; border-radius:16px; padding:40px;">
+          <tr>
+            <td align="center" style="padding-bottom:24px;">
+              <span style="display:inline-block; font-size:20px; font-weight:600; letter-spacing:-0.02em; color:#2563eb;">Cytova</span>
+            </td>
+          </tr>
+          <tr>
+            <td style="font-size:18px; font-weight:600; color:#0f172a; padding-bottom:8px;">
+              New lab result available
+            </td>
+          </tr>
+          <tr>
+            <td style="font-size:14px; line-height:1.6; color:#475569; padding-bottom:24px;">
+              A laboratory has shared a result with your Cytova patient space.
+            </td>
+          </tr>
+          <tr>
+            <td align="center" style="padding:8px 0 24px 0;">
+              <a href="{view_url}" style="display:inline-block; padding:12px 28px; background:#2563eb; color:#ffffff; font-size:14px; font-weight:600; text-decoration:none; border-radius:10px;">
+                View my results
+              </a>
+            </td>
+          </tr>
+          <tr>
+            <td style="font-size:13px; line-height:1.6; color:#64748b; padding-bottom:24px;">
+              For your privacy, sign in to your Cytova account to view or download your result.
+            </td>
+          </tr>
+          <tr>
+            <td style="border-top:1px solid #e2e8f0; padding-top:20px; font-size:12px; line-height:1.5; color:#94a3b8;">
+              If you were not expecting this result, contact the laboratory that performed the analysis.
+            </td>
+          </tr>
+        </table>
+        <div style="font-size:11px; color:#94a3b8; padding-top:16px;">© Cytova</div>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
+"""
+
+
+_PATIENT_SHARED_TEXT_TEMPLATE = """\
+New lab result available
+
+A laboratory has shared a result with your Cytova patient space.
+
+For your privacy, sign in to your Cytova account to view or download your result.
+
+  {view_url}
+
+If you were not expecting this result, contact the laboratory that performed the analysis.
+
+— Cytova
+"""
+
+
+def render_patient_shared_result(*, view_url: str) -> Tuple[str, str]:
+    """Return (html_body, text_body) for the "result shared with you"
+    patient email. Caller MUST NOT pass any medical content; this
+    template renders only the generic prompt + sign-in CTA."""
+    return (
+        _PATIENT_SHARED_HTML_TEMPLATE.format(view_url=view_url),
+        _PATIENT_SHARED_TEXT_TEMPLATE.format(view_url=view_url),
+    )

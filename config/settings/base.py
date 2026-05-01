@@ -35,6 +35,14 @@ SHARED_APPS = [
     # Platform-managed label print presets (shared catalog)
     'apps.labels',
 
+    # Global Cytova patient identity (portal accounts). Lives in the
+    # ``public`` schema only — explicitly NOT in TENANT_APPS so the
+    # patient portal tables never appear inside a lab tenant schema.
+    # See ``apps/patient_portal/__init__.py`` for the architecture
+    # rationale and the migration path to a dedicated ``patients``
+    # schema once justified by traffic / isolation requirements.
+    'apps.patient_portal',
+
     # Standard Django shared apps
     'django.contrib.contenttypes',
     'django.contrib.auth',
@@ -284,6 +292,11 @@ REST_FRAMEWORK = {
         'auth_login': '5/minute',
         'auth_signup': '5/hour',
         'slug_check': '30/hour',
+        # Notify-Cytova: lab user shares a result with a patient portal
+        # account. Per-user cap to deter brute-forcing identity matches
+        # against a known Cytova ID — the service also writes an audit
+        # row on each failed verification so abuse is observable.
+        'notify_cytova': '20/hour',
     },
 }
 
@@ -476,6 +489,11 @@ DASHBOARD_TOP_N_LIMIT = 20
 SUBSCRIPTION_EXEMPT_PATH_PREFIXES = [
     '/health/',
     '/api/v1/auth/',
+    # Global patient portal — endpoints serve all patients regardless of
+    # whether a particular lab tenant has an active subscription. They
+    # are also mounted on the public urlconf, but a request landing on
+    # a tenant subdomain by accident must still resolve.
+    '/api/v1/patient-portal/',
 ]
 
 # Maximum alert IDs accepted in a single bulk-acknowledge request.
@@ -483,3 +501,40 @@ ALERT_BULK_ACKNOWLEDGE_MAX = 200
 
 # Platform dashboard: trial expiry warning window (days).
 PLATFORM_TRIAL_WARNING_DAYS = 7
+
+# ---------------------------------------------------------------------------
+# Patient Portal (global Cytova patient identity)
+# ---------------------------------------------------------------------------
+# Versions of the Terms of Service and Privacy Policy presented to
+# patients during portal signup. Snapshotted onto each ``PatientConsent``
+# row so that a future change here never rewrites consent history. Bump
+# whenever the legal text changes; existing patients continue to carry
+# the version they originally accepted.
+PATIENT_TERMS_VERSION = config('PATIENT_TERMS_VERSION', default='v1')
+PATIENT_PRIVACY_VERSION = config('PATIENT_PRIVACY_VERSION', default='v1')
+
+# Per-IP rate limits for the patient portal public endpoints. Same
+# extended-rate format as ``ONBOARDING_RATE_LIMITS`` (e.g. ``'5/10m'``).
+# Tests can wipe the limit by overriding this dict to ``{}``.
+PATIENT_PORTAL_RATE_LIMITS = {
+    'signup':        '5/10m',
+    'login':         '5/10m',
+    'verify_email':  '10/10m',
+}
+
+# Public-facing URL the verification email points at. Tokens are
+# appended as ``?token=...``. Override per environment so dev /
+# staging emails don't link patients into prod.
+PATIENT_PORTAL_VERIFY_EMAIL_URL = config(
+    'PATIENT_PORTAL_VERIFY_EMAIL_URL',
+    default='https://www.cytova.io/verify-email',
+)
+
+# Base URL of the patient portal frontend. Used by transactional
+# emails (e.g. "a result was shared with you") to link patients to
+# the right deployment. Override per environment so dev/staging
+# emails don't bounce patients into prod.
+PATIENT_PORTAL_FRONTEND_BASE_URL = config(
+    'PATIENT_PORTAL_FRONTEND_BASE_URL',
+    default='https://www.cytova.io',
+)

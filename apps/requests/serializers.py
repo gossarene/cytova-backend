@@ -645,3 +645,36 @@ class RequestLabelBatchSerializer(serializers.ModelSerializer):
         if not obj.pdf_file_key:
             return None
         return f'/requests/{obj.analysis_request_id}/labels/download/'
+
+
+# ---------------------------------------------------------------------------
+# Notify Cytova — input shape for ``POST /requests/{id}/notify-cytova/``
+# ---------------------------------------------------------------------------
+
+class NotifyCytovaSerializer(serializers.Serializer):
+    """All four identity fields are required. The view delegates the
+    case-insensitive name match + DOB exact match to
+    ``apps.patient_portal.lookup.verify_patient_identity`` — the
+    serializer just enforces presence + basic type.
+
+    ``force_share`` is the override flag for the one-shot rule: if a
+    Cytova share already exists for this request, the second attempt
+    is rejected unless the caller passes ``force_share=true`` AND has
+    a privileged role (LAB_ADMIN or BIOLOGIST). Default ``False``."""
+    cytova_patient_id = serializers.CharField(min_length=4, max_length=32)
+    first_name = serializers.CharField(max_length=100)
+    last_name = serializers.CharField(max_length=100)
+    date_of_birth = serializers.DateField()
+    force_share = serializers.BooleanField(required=False, default=False)
+
+
+# ---------------------------------------------------------------------------
+# Reopen result — controlled correction flow
+# ---------------------------------------------------------------------------
+
+class ReopenResultSerializer(serializers.Serializer):
+    """``POST /requests/{id}/reopen-result/`` input shape. The reason
+    is REQUIRED — the whole point of the reopen flow is to force the
+    lab to record WHY the issued result needs to be corrected, so the
+    audit log carries the context."""
+    reason = serializers.CharField(min_length=3, max_length=2000)

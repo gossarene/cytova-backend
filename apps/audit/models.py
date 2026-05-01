@@ -31,6 +31,17 @@ class AuditAction(models.TextChoices):
     PASSWORD_RESET = 'PASSWORD_RESET', 'Password Reset'
     ROLE_ASSIGN = 'ROLE_ASSIGN', 'Role Assign'
     PERMISSION_OVERRIDE = 'PERMISSION_OVERRIDE', 'Permission Override'
+    # Result issuance lifecycle. ``RESULT_ISSUED`` fires once on the
+    # first patient-facing notification (any channel); ``RESULT_REISSUED``
+    # marks each subsequent ``force_resend`` re-emission so an audit
+    # reader can distinguish the original delivery from later resends.
+    # ``RESULT_REOPENED`` records the explicit correction flow that
+    # walks the request from RESULT_ISSUED back to VALIDATED.
+    RESULT_ISSUED = 'RESULT_ISSUED', 'Result Issued'
+    RESULT_REISSUED = 'RESULT_REISSUED', 'Result Reissued'
+    RESULT_REOPENED = 'RESULT_REOPENED', 'Result Reopened'
+    RESULT_SHARED_CYTOVA = 'RESULT_SHARED_CYTOVA', 'Result Shared via Cytova'
+    CYTOVA_SHARE_REVOKED = 'CYTOVA_SHARE_REVOKED', 'Cytova Share Revoked'
 
 
 class AuditLog(models.Model):

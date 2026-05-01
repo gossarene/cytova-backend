@@ -16,6 +16,8 @@ from .providers.console import ConsoleEmailProvider
 from .templates import (
     render_password_reset,
     render_patient_result_ready,
+    render_patient_shared_result,
+    render_patient_verification,
     render_verification,
 )
 
@@ -24,6 +26,8 @@ logger = logging.getLogger(__name__)
 VERIFICATION_SUBJECT = 'Your Cytova verification code'
 PASSWORD_RESET_SUBJECT = 'Reset your Cytova password'
 PATIENT_RESULT_READY_SUBJECT = 'Your lab result is ready'
+PATIENT_VERIFY_SUBJECT = 'Verify your Cytova account'
+PATIENT_SHARED_RESULT_SUBJECT = 'New lab result available in Cytova'
 
 # Provider name → human-readable label used in startup logs.
 _PROVIDERS = ('console', 'brevo')
@@ -149,6 +153,68 @@ class EmailService:
             to_email=recipient_email,
             to_name=recipient_name or '',
             subject=PASSWORD_RESET_SUBJECT,
+            text=text_body,
+            html=html_body,
+        )
+        return self.provider.send(message)
+
+
+    def send_patient_verification_email(
+        self,
+        *,
+        recipient_email: str,
+        recipient_name: str,
+        verify_link: str,
+        expires_hours: int = 24,
+    ) -> EmailResult:
+        """Render and dispatch the patient-portal email-verification email.
+
+        Same delivery contract as the other ``send_*`` methods — failures
+        return ``EmailResult(ok=False, error=...)`` rather than raising,
+        so the signup flow doesn't crash if SMTP is down. The verification
+        link contains the raw single-use token; this method does not log
+        the link under any provider, and callers MUST NOT log it either.
+        """
+        html_body, text_body = render_patient_verification(
+            first_name=recipient_name,
+            verify_url=verify_link,
+            expires_hours=expires_hours,
+        )
+        message = EmailMessage(
+            to_email=recipient_email,
+            to_name=recipient_name or '',
+            subject=PATIENT_VERIFY_SUBJECT,
+            text=text_body,
+            html=html_body,
+        )
+        return self.provider.send(message)
+
+
+    def send_patient_shared_result_email(
+        self,
+        *,
+        recipient_email: str,
+        view_url: str,
+    ) -> EmailResult:
+        """Notify a patient that a lab has shared a result with their
+        Cytova patient space.
+
+        Confidentiality contract — caller MUST NOT pass any medical
+        content. The template renders a generic "log in to Cytova"
+        prompt + the CTA URL, and nothing else. The patient sees the
+        actual result only after authenticating to the portal and
+        downloading via the per-file token endpoint.
+
+        Same delivery contract as the other ``send_*`` methods —
+        failures return ``EmailResult(ok=False, error=...)`` rather
+        than raising, so the caller can record the failure without
+        crashing the share.
+        """
+        html_body, text_body = render_patient_shared_result(view_url=view_url)
+        message = EmailMessage(
+            to_email=recipient_email,
+            to_name='',
+            subject=PATIENT_SHARED_RESULT_SUBJECT,
             text=text_body,
             html=html_body,
         )
