@@ -22,6 +22,7 @@ from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound, ValidationError
 from rest_framework.mixins import ListModelMixin, RetrieveModelMixin
 from rest_framework.response import Response
+from rest_framework.throttling import SimpleRateThrottle
 from rest_framework.viewsets import GenericViewSet
 
 from common.permissions import IsAnyStaff, IsLabAdmin, IsReceptionistOrLabAdmin
@@ -30,6 +31,7 @@ from apps.requests.models import AnalysisRequest
 from .filters import PatientFilter
 from .models import Patient, PatientPortalAccount
 from .serializers import (
+    CytovaIdentityLinkSerializer,
     PatientListSerializer,
     PatientDetailSerializer,
     PatientCreateSerializer,
@@ -38,7 +40,30 @@ from .serializers import (
     PortalAccountCreateSerializer,
     PortalAccountSerializer,
 )
-from .services import PatientService
+from .services import (
+    AlreadyLinked, CytovaLinkError, IdentityVerificationFailed,
+    PatientService,
+)
+
+
+# ---------------------------------------------------------------------------
+# Throttle — same band as Notify-Cytova
+# ---------------------------------------------------------------------------
+
+class LinkCytovaIdentityThrottle(SimpleRateThrottle):
+    """Per-user cap on link attempts. The link endpoint shares its
+    identity-verification surface with Notify-Cytova, so we cap it at
+    the same band — a brute-forcer probing identity through this
+    surface burns the same per-hour budget.
+    """
+    scope = 'link_cytova_identity'
+
+    def get_cache_key(self, request, view):
+        ident = (
+            str(request.user.pk) if request.user.is_authenticated
+            else self.get_ident(request)
+        )
+        return self.cache_format % {'scope': self.scope, 'ident': ident}
 
 
 # ---------------------------------------------------------------------------
@@ -90,6 +115,13 @@ class PatientViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet):
         if self.action in ('list', 'retrieve', 'requests', 'request_stats'):
             return [IsAnyStaff()]
         if self.action in ('create', 'partial_update', 'portal_account_create'):
+            return [IsReceptionistOrLabAdmin()]
+        if self.action in ('link_cytova_identity', 'unlink_cytova_identity'):
+            # Same gate as Notify-Cytova / notify-by-email — patient-
+            # comms-adjacent action, receptionist + lab admin both
+            # legitimate. Unlink is held at the same level as link
+            # because both are reversible and the audit trail keeps
+            # the lineage.
             return [IsReceptionistOrLabAdmin()]
         # deactivate, portal_account_delete
         return [IsLabAdmin()]
@@ -255,3 +287,120 @@ class PatientViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet):
             'requests_by_status': by_status,
             'requests_by_source': by_source,
         })
+
+    # ------------------------------------------------------------------
+    # Cytova patient-identity link
+    # ------------------------------------------------------------------
+    #
+    # Two endpoints share a permission gate (IsReceptionistOrLabAdmin)
+    # and a throttle (LinkCytovaIdentityThrottle):
+    #
+    #   POST /patients/{id}/link-cytova-identity/
+    #   POST /patients/{id}/unlink-cytova-identity/
+    #
+    # The link path delegates verification to the same lookup helper
+    # Notify-Cytova uses, so the matching rules and the
+    # non-distinguishing failure surface stay aligned across the two
+    # entrypoints. Both endpoints return the patient detail payload on
+    # success — the frontend re-uses the same renderer used by GET
+    # /patients/{id}/, and the linked-state badges flip
+    # automatically.
+
+    @action(
+        detail=True, methods=['post'],
+        url_path='link-cytova-identity',
+        throttle_classes=[LinkCytovaIdentityThrottle],
+    )
+    def link_cytova_identity(self, request, pk=None):
+        """Verify and store a snapshot link from this local Patient to a
+        global Cytova ``PatientAccount``. See
+        ``apps/patients/services.py::PatientService.link_cytova_identity``
+        for the verification + audit policy.
+
+        Failure mapping
+        ---------------
+        - ``IDENTITY_VERIFICATION_FAILED`` → 400 (single
+          non-distinguishing message; never says which field failed).
+        - ``ALREADY_LINKED``               → 409 (operator must
+          unlink first).
+        """
+        patient = self.get_object()
+        serializer = CytovaIdentityLinkSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            patient = PatientService.link_cytova_identity(
+                patient=patient,
+                cytova_patient_id=serializer.validated_data['cytova_patient_id'],
+                first_name=serializer.validated_data['first_name'],
+                last_name=serializer.validated_data['last_name'],
+                date_of_birth=serializer.validated_data['date_of_birth'],
+                actor=request.user,
+                request=request,
+            )
+        except AlreadyLinked as exc:
+            return Response(
+                {
+                    'data': None,
+                    'meta': None,
+                    'errors': [{
+                        'code': exc.code,
+                        'message': exc.message,
+                        'field': None,
+                        'detail': {},
+                    }],
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+        except IdentityVerificationFailed as exc:
+            return Response(
+                {
+                    'data': None,
+                    'meta': None,
+                    'errors': [{
+                        'code': exc.code,
+                        'message': exc.message,
+                        'field': None,
+                        'detail': {},
+                    }],
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        except CytovaLinkError as exc:
+            # Fallback for any future subclass of CytovaLinkError —
+            # keeps the envelope shape consistent.
+            return Response(
+                {
+                    'data': None,
+                    'meta': None,
+                    'errors': [{
+                        'code': exc.code,
+                        'message': exc.message,
+                        'field': None,
+                        'detail': {},
+                    }],
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        return Response(
+            PatientDetailSerializer(patient, context={'request': request}).data,
+        )
+
+    @action(
+        detail=True, methods=['post'],
+        url_path='unlink-cytova-identity',
+    )
+    def unlink_cytova_identity(self, request, pk=None):
+        """Clear the patient's Cytova link snapshot. Idempotent — see
+        ``PatientService.unlink_cytova_identity`` for audit and
+        no-op semantics. Returns the refreshed patient detail."""
+        patient = self.get_object()
+        patient = PatientService.unlink_cytova_identity(
+            patient=patient,
+            actor=request.user,
+            request=request,
+        )
+        return Response(
+            PatientDetailSerializer(patient, context={'request': request}).data,
+        )

@@ -912,12 +912,15 @@ class AnalysisRequestViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet)
         rationale + identity-verification policy.
         """
         from .notify_cytova_service import (
+            CytovaChannelDisabled,
             IdentityVerificationFailed,
+            MissingIdentity,
             NotifyCytovaError,
             notify_cytova as notify_cytova_service,
         )
         from .serializers import NotifyCytovaSerializer
         from .issuance import CHANNEL_CYTOVA, mark_request_issued
+        from apps.lab_settings.models import LabSettings
         from apps.patient_portal.models import (
             PatientSharedResult, SharedResultStatus,
         )
@@ -925,6 +928,28 @@ class AnalysisRequestViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet)
         from django.db import connection as _conn
 
         ar = _get_request_or_404(pk)
+
+        # Lab-level kill switch. Pre-check before serializer
+        # validation so a disabled tenant gets a clear error code
+        # instead of a generic 400 about missing fields. Mirrors the
+        # ``EmailChannelDisabled`` shape used by notify-by-email so
+        # the frontend handles both channels with the same branch.
+        if not LabSettings.get_solo().notification_enable_cytova:
+            exc = CytovaChannelDisabled()
+            return Response(
+                {
+                    'data': None,
+                    'meta': None,
+                    'errors': [{
+                        'code': exc.code,
+                        'message': exc.message,
+                        'field': None,
+                        'detail': {},
+                    }],
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         serializer = NotifyCytovaSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         force_share = serializer.validated_data.pop('force_share', False)
@@ -968,14 +993,37 @@ class AnalysisRequestViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet)
                 )
 
         try:
+            # Identity fields are optional after Phase D — the linked
+            # path lets the operator submit an empty body when the
+            # patient has been previously linked. ``.get(...)`` with
+            # safe defaults preserves that contract; the service
+            # decides which path to use.
             shared, email_status = notify_cytova_service(
                 analysis_request=ar,
-                cytova_patient_id=serializer.validated_data['cytova_patient_id'],
-                first_name=serializer.validated_data['first_name'],
-                last_name=serializer.validated_data['last_name'],
-                date_of_birth=serializer.validated_data['date_of_birth'],
+                cytova_patient_id=serializer.validated_data.get('cytova_patient_id', '') or '',
+                first_name=serializer.validated_data.get('first_name', '') or '',
+                last_name=serializer.validated_data.get('last_name', '') or '',
+                date_of_birth=serializer.validated_data.get('date_of_birth'),
                 actor=request.user,
                 request=request,
+            )
+        except MissingIdentity as exc:
+            # Caller bypassed the UX hint and tried to share an
+            # unlinked patient with no identity payload. Surface a
+            # distinct code so the frontend can tell the operator
+            # what to do (link first).
+            return Response(
+                {
+                    'data': None,
+                    'meta': None,
+                    'errors': [{
+                        'code': exc.code,
+                        'message': exc.message,
+                        'field': None,
+                        'detail': {},
+                    }],
+                },
+                status=status.HTTP_400_BAD_REQUEST,
             )
         except IdentityVerificationFailed as exc:
             # Single non-distinguishing failure — never tell the lab

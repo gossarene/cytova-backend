@@ -119,6 +119,13 @@ class LabSettings(BaseModel):
         default=False,
         help_text='Enable SMS notification to patients (not yet implemented).',
     )
+    notification_enable_cytova = models.BooleanField(
+        default=True,
+        help_text='Allow sharing patient results into the global Cytova '
+                  'patient portal (Notify Cytova). When disabled, the '
+                  'endpoint refuses with CYTOVA_CHANNEL_DISABLED and the '
+                  'lab UI hides the channel.',
+    )
 
     # -- Billing --
     financial_document_mode = models.CharField(

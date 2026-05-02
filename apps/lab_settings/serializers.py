@@ -45,6 +45,7 @@ class LabSettingsSerializer(serializers.ModelSerializer):
             'notification_enable_whatsapp_share',
             'notification_enable_email',
             'notification_enable_sms',
+            'notification_enable_cytova',
             # billing
             'financial_document_mode', 'default_invoice_vat_rate',
             # label printing
@@ -110,6 +111,7 @@ class LabSettingsUpdateSerializer(serializers.ModelSerializer):
             'notification_enable_whatsapp_share',
             'notification_enable_email',
             'notification_enable_sms',
+            'notification_enable_cytova',
             # billing
             'financial_document_mode', 'default_invoice_vat_rate',
             # label printing — explicit values allowed for fine-tuning,

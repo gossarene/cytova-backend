@@ -261,6 +261,14 @@ class AnalysisRequestDetailSerializer(serializers.ModelSerializer):
             'document_number': p.document_number,
             'phone': p.phone or '',
             'email': p.email or '',
+            # Cytova-link snapshot (Phase F): the request-detail UI
+            # gates the "Send to Cytova" CTA on these fields so the
+            # drawer doesn't have to round-trip back to /patients/{id}/
+            # just to know if the patient is linked. Same fields that
+            # are already on the patient detail serializer (Phase C);
+            # never exposes the internal account_id snapshot.
+            'has_cytova_identity': p.has_cytova_identity,
+            'cytova_patient_id': p.cytova_patient_id or '',
         }
 
     def _get_current_report(self, obj):
@@ -652,19 +660,37 @@ class RequestLabelBatchSerializer(serializers.ModelSerializer):
 # ---------------------------------------------------------------------------
 
 class NotifyCytovaSerializer(serializers.Serializer):
-    """All four identity fields are required. The view delegates the
-    case-insensitive name match + DOB exact match to
-    ``apps.patient_portal.lookup.verify_patient_identity`` — the
-    serializer just enforces presence + basic type.
+    """Identity fields became optional in Phase D. There are now two
+    valid call shapes:
+
+    1. **Linked-patient call (Phase E+ default)** — empty body. The
+       service consults ``patient.has_cytova_identity`` and reuses
+       the verified link. The view's UX layer hides this surface
+       until the patient is linked, so the typical empty-body call
+       always finds a link.
+
+    2. **Explicit-identity call (back-compat)** — all four fields
+       supplied. The service runs the original
+       ``verify_patient_identity`` flow. Kept for unlinked patients
+       and for any external caller still on the pre-Phase-D contract.
+
+    The serializer validates only what's present; the link-vs-explicit
+    decision lives in the service layer (single source of truth).
 
     ``force_share`` is the override flag for the one-shot rule: if a
     Cytova share already exists for this request, the second attempt
     is rejected unless the caller passes ``force_share=true`` AND has
     a privileged role (LAB_ADMIN or BIOLOGIST). Default ``False``."""
-    cytova_patient_id = serializers.CharField(min_length=4, max_length=32)
-    first_name = serializers.CharField(max_length=100)
-    last_name = serializers.CharField(max_length=100)
-    date_of_birth = serializers.DateField()
+    cytova_patient_id = serializers.CharField(
+        min_length=4, max_length=32, required=False, allow_blank=True,
+    )
+    first_name = serializers.CharField(
+        max_length=100, required=False, allow_blank=True,
+    )
+    last_name = serializers.CharField(
+        max_length=100, required=False, allow_blank=True,
+    )
+    date_of_birth = serializers.DateField(required=False, allow_null=True)
     force_share = serializers.BooleanField(required=False, default=False)
 
 

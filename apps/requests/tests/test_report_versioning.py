@@ -489,3 +489,233 @@ class TestReportHistory:
             f'{API}/{ar.id}/report/versions/{report_id}/download/',
         )
         assert resp.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# Post-reopen regeneration via the /report/ POST endpoint
+# ---------------------------------------------------------------------------
+#
+# Regression: ``POST /requests/{id}/report/`` after ``reopen-result``
+# used to 500 with an IntegrityError. The legacy ``generate_or_get``
+# hard-coded ``version_number=1`` on the no-current branch, which
+# collided with the existing v1 row (still present, ``is_current=False``)
+# under the unique ``(analysis_request, version_number)`` constraint.
+#
+# Fix: ``generate_or_get`` now computes the next version as
+# ``max(version_number) + 1`` from the locked existing set, gates the
+# write on ``_assert_report_writable`` (so RESULT_ISSUED still
+# refuses), and demotes any stale current row before insert.
+
+def _issue_request_directly(ar, *, actor=None):
+    """Promote the request to RESULT_ISSUED without going through any
+    notify-* endpoint — keeps these tests focused on the report
+    lifecycle rather than the patient-comms wiring. ``mark_request_issued``
+    is the canonical helper every notify path goes through anyway.
+    """
+    from apps.requests.issuance import CHANNEL_EMAIL, mark_request_issued
+    from rest_framework.test import APIRequestFactory
+    factory = APIRequestFactory()
+    fake_request = factory.get('/')
+    mark_request_issued(
+        analysis_request=ar, channel=CHANNEL_EMAIL,
+        actor=actor, request=fake_request,
+    )
+    ar.refresh_from_db()
+
+
+class TestPostReopenRegeneration:
+    """The ``reopen-result`` flow walks an issued request back to
+    VALIDATED and marks the previous report not-current. Hitting
+    ``POST /report/`` afterwards must produce the next version
+    (``max+1``) without colliding with the existing row, without
+    auto-reissuing the request, and without overwriting the previous
+    PDF.
+    """
+
+    def _issue_and_reopen(self, admin_client, ar):
+        _issue_request_directly(ar)
+        # Reopen via the actual HTTP endpoint — exercises exactly
+        # what the lab UI hits, including the report-not-current and
+        # state-machine transitions.
+        resp = admin_client.post(
+            f'{API}/{ar.id}/reopen-result/',
+            data={'reason': 'Recalibrated analyzer; reissuing.'},
+            format='json',
+        )
+        assert resp.status_code == 200, resp.content
+        ar.refresh_from_db()
+        assert ar.status == RequestStatus.VALIDATED
+
+    def test_generate_after_reopen_creates_v2_and_returns_200(
+        self, admin_client, patient, exam,
+        lab_admin, technician, biologist, make_request,
+    ):
+        """Primary regression test for the 500 → 200 fix."""
+        ar = _finalize_request(patient, lab_admin, technician, biologist, make_request, exam)
+        admin_client.post(f'{API}/{ar.id}/report/')
+        v1 = AnalysisRequestReport.objects.get(analysis_request=ar)
+        v1_file_key = v1.pdf_file_key
+
+        self._issue_and_reopen(admin_client, ar)
+
+        resp = admin_client.post(f'{API}/{ar.id}/report/')
+        assert resp.status_code == 200, resp.content
+        body = _data(resp)
+        assert body['version_number'] == 2
+        assert body['is_current'] is True
+
+        # v1 preserved untouched: its PDF key stays the same — the
+        # service must NEVER overwrite the previous PDF.
+        v1.refresh_from_db()
+        assert v1.is_current is False
+        assert v1.pdf_file_key == v1_file_key
+
+        # Two rows total, exactly one current, distinct file keys.
+        rows = list(
+            AnalysisRequestReport.objects
+            .filter(analysis_request=ar)
+            .order_by('version_number')
+        )
+        assert [r.version_number for r in rows] == [1, 2]
+        assert sum(1 for r in rows if r.is_current) == 1
+        assert rows[1].is_current is True
+        assert rows[0].pdf_file_key != rows[1].pdf_file_key
+
+    def test_generate_after_reopen_does_not_reissue_request(
+        self, admin_client, patient, exam,
+        lab_admin, technician, biologist, make_request,
+    ):
+        """Per spec strict rule: regeneration after reopen must NOT
+        flip the request back to RESULT_ISSUED. Issuance happens only
+        on the next deliberate notify-* call."""
+        ar = _finalize_request(patient, lab_admin, technician, biologist, make_request, exam)
+        admin_client.post(f'{API}/{ar.id}/report/')
+        self._issue_and_reopen(admin_client, ar)
+
+        admin_client.post(f'{API}/{ar.id}/report/')
+        ar.refresh_from_db()
+        assert ar.status == RequestStatus.VALIDATED
+
+    def test_repeated_post_report_after_reopen_is_idempotent(
+        self, admin_client, patient, exam,
+        lab_admin, technician, biologist, make_request,
+    ):
+        """Once v2 is generated post-reopen, a second POST /report/
+        must return v2 — never silently produce v3. Same idempotence
+        contract that pre-existed for v1, now preserved post-reopen."""
+        ar = _finalize_request(patient, lab_admin, technician, biologist, make_request, exam)
+        admin_client.post(f'{API}/{ar.id}/report/')
+        self._issue_and_reopen(admin_client, ar)
+        admin_client.post(f'{API}/{ar.id}/report/')
+
+        resp = admin_client.post(f'{API}/{ar.id}/report/')
+        assert resp.status_code == 200
+        assert _data(resp)['version_number'] == 2
+        assert AnalysisRequestReport.objects.filter(analysis_request=ar).count() == 2
+        assert AnalysisRequestReport.objects.filter(
+            analysis_request=ar, is_current=True,
+        ).count() == 1
+
+    def test_get_report_returns_404_after_reopen_until_regenerated(
+        self, admin_client, patient, exam,
+        lab_admin, technician, biologist, make_request,
+    ):
+        """Between ``reopen-result`` and the next regenerate, no row
+        is current — GET /report/ must 404. This is the visible
+        signal that the prior PDF is intentionally not the one to
+        ship; the lab MUST regenerate before re-sharing."""
+        ar = _finalize_request(patient, lab_admin, technician, biologist, make_request, exam)
+        admin_client.post(f'{API}/{ar.id}/report/')
+        self._issue_and_reopen(admin_client, ar)
+
+        resp = admin_client.get(f'{API}/{ar.id}/report/')
+        assert resp.status_code == 404
+
+    def test_regenerate_endpoint_still_blocked_when_issued(
+        self, admin_client, patient, exam,
+        lab_admin, technician, biologist, make_request,
+    ):
+        """Strict rule: ``/report/regenerate/`` must refuse on a
+        RESULT_ISSUED request. Only ``reopen-result`` is the
+        legitimate path back to writable. The fix to ``generate_or_get``
+        does not loosen this lock."""
+        ar = _finalize_request(patient, lab_admin, technician, biologist, make_request, exam)
+        admin_client.post(f'{API}/{ar.id}/report/')
+        _issue_request_directly(ar)
+
+        resp = admin_client.post(f'{API}/{ar.id}/report/regenerate/')
+        assert resp.status_code == 400, resp.content
+        # The error message names the recovery action so the operator
+        # sees what to do next without trial and error.
+        assert 'eopen' in resp.content.decode()
+
+    def test_post_report_blocked_when_issued_and_no_current_pdf(
+        self, patient, exam, lab_admin, technician, biologist, make_request,
+    ):
+        """Defence-in-depth: a hypothetical RESULT_ISSUED state with
+        no current PDF (impossible via the lifecycle, but a valid
+        guard surface) must NOT silently produce a new version. The
+        fix routes the no-current branch through
+        ``_assert_report_writable``, which refuses on RESULT_ISSUED."""
+        ar = _finalize_request(patient, lab_admin, technician, biologist, make_request, exam)
+        RequestReportService.generate_or_get(ar, biologist, make_request(biologist))
+        _issue_request_directly(ar, actor=biologist)
+        # Manually clear is_current to simulate the impossible state.
+        # The writable-gate must still refuse — we never want a path
+        # where RESULT_ISSUED can be bypassed by DB drift.
+        AnalysisRequestReport.objects.filter(
+            analysis_request=ar, is_current=True,
+        ).update(is_current=False)
+
+        with pytest.raises(ValidationError, match='already been issued'):
+            RequestReportService.generate_or_get(
+                ar, biologist, make_request(biologist),
+            )
+
+    def test_service_level_post_reopen_uses_max_plus_one_not_one(
+        self, patient, exam, lab_admin, technician, biologist, make_request,
+    ):
+        """Service-level: after a request has both v1 and v2 in its
+        history and is reopened, ``generate_or_get`` must pick v3 —
+        not v1, not v2, not "next current+1" (current is None). This
+        is the exact computation the bug fix introduced."""
+        from django.db import transaction as _tx
+        from django.utils import timezone as _tz
+        from apps.requests.state_machine import RequestStateMachine
+
+        ar = _finalize_request(patient, lab_admin, technician, biologist, make_request, exam)
+        v1 = RequestReportService.generate_or_get(ar, biologist, make_request(biologist))
+        v2 = RequestReportService.regenerate(ar, biologist, make_request(biologist))
+        assert (v1.version_number, v2.version_number) == (1, 2)
+
+        _issue_request_directly(ar, actor=biologist)
+        # Mirror what the reopen-result view does, without going
+        # through HTTP (this test is service-level).
+        with _tx.atomic():
+            RequestStateMachine.transition(ar, RequestStatus.VALIDATED)
+            ar.reopened_at = _tz.now()
+            ar.reopen_reason = 'service-level reopen for test'
+            ar.save(update_fields=[
+                'status', 'reopened_at', 'reopen_reason', 'updated_at',
+            ])
+            AnalysisRequestReport.objects.filter(
+                analysis_request=ar, is_current=True,
+            ).update(is_current=False)
+        ar.refresh_from_db()
+
+        v3 = RequestReportService.generate_or_get(
+            ar, biologist, make_request(biologist),
+        )
+        assert v3.version_number == 3
+        assert v3.is_current is True
+        # All three preserved; only v3 is current.
+        rows = list(
+            AnalysisRequestReport.objects
+            .filter(analysis_request=ar)
+            .order_by('version_number')
+        )
+        assert [r.version_number for r in rows] == [1, 2, 3]
+        assert [r.is_current for r in rows] == [False, False, True]
+        # File keys are unique per version+row UUID — no overwrites.
+        keys = [r.pdf_file_key for r in rows]
+        assert len(keys) == len(set(keys))

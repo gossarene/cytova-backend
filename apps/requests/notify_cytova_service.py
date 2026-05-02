@@ -85,11 +85,43 @@ class ReportNotAvailable(NotifyCytovaError):
 class IdentityVerificationFailed(NotifyCytovaError):
     """Single non-distinguishing failure for any verification mismatch
     (unknown Cytova ID, wrong name, wrong DOB, inactive account).
-    Mirrors the spec: never tell the lab user which field failed."""
+    Mirrors the spec: never tell the lab user which field failed.
+
+    Phase D extension: also raised when a previously-linked patient's
+    global account has been deactivated since the link was created.
+    The lab user sees the same message in either path — the audit
+    metadata distinguishes the two via ``notify_cytova_outcome``
+    (``IDENTITY_MISMATCH`` for the explicit-payload path,
+    ``LINKED_ACCOUNT_INACTIVE`` for the linked path) so an audit
+    reader can still tell what happened without leaking it to the UI."""
     code = 'IDENTITY_VERIFICATION_FAILED'
     message = (
         'Identity verification failed. Please check the Cytova ID or '
         'patient information.'
+    )
+
+
+class MissingIdentity(NotifyCytovaError):
+    """Raised when the call shape doesn't carry an identity claim AND
+    the local patient has no Cytova link to fall back on. The UI should
+    drive the operator to link the patient first (Phase E) — this
+    error is the safety net for callers that bypassed the UX hint."""
+    code = 'MISSING_IDENTITY'
+    message = (
+        'Patient identity is required. Either link this patient to a '
+        'Cytova account first, or supply the Cytova ID and patient '
+        'information.'
+    )
+
+
+class CytovaChannelDisabled(NotifyCytovaError):
+    """Lab toggled ``LabSettings.notification_enable_cytova`` off.
+    Mirrors the ``EmailChannelDisabled`` shape used by notify-by-email
+    so the frontend can branch on the same error code shape across
+    channels."""
+    code = 'CYTOVA_CHANNEL_DISABLED'
+    message = (
+        'Cytova patient-portal sharing is disabled in lab settings.'
     )
 
 
@@ -140,6 +172,45 @@ def _copy_pdf_to_patient_storage(*, sfile, profile) -> None:
             'Patient PDF copy fell back to lab storage: shared_result_id=%s '
             'file_id=%s', sfile.shared_result_id, sfile.id,
         )
+
+
+def _resolve_linked_profile(patient):
+    """Re-fetch the global ``PatientProfile`` for a patient who carries
+    a verified Cytova link snapshot, but only if the underlying
+    ``PatientAccount`` is still active.
+
+    Returns the profile on success, or ``None`` when the link is no
+    longer usable (account deactivated, account UUID orphaned, or the
+    profile row was removed). The caller maps ``None`` to
+    ``IdentityVerificationFailed`` — the UI sees the same generic
+    message either way; the audit metadata is what distinguishes
+    "the operator typed the wrong DOB" from "the global account
+    was deactivated since you linked" so an audit reader can still
+    tell what happened.
+
+    Cross-schema rule: this is the only legitimate use of the stored
+    ``cytova_patient_account_id`` snapshot — re-checking validity at
+    use time. The snapshot is never published to clients (Phase C);
+    the read is server-side only.
+    """
+    if not getattr(patient, 'has_cytova_identity', False):
+        return None
+    from apps.patient_portal.models import PatientAccount, PatientProfile
+    try:
+        account = PatientAccount.objects.get(
+            id=patient.cytova_patient_account_id,
+            is_active=True,
+        )
+    except PatientAccount.DoesNotExist:
+        return None
+    try:
+        return (
+            PatientProfile.objects
+            .select_related('account')
+            .get(account=account)
+        )
+    except PatientProfile.DoesNotExist:
+        return None
 
 
 def _suggested_filename(ar: AnalysisRequest, report: AnalysisRequestReport) -> str:
@@ -229,15 +300,39 @@ def _send_share_notification(
 def notify_cytova(
     *,
     analysis_request: AnalysisRequest,
-    cytova_patient_id: str,
-    first_name: str,
-    last_name: str,
-    date_of_birth,
+    cytova_patient_id: str = '',
+    first_name: str = '',
+    last_name: str = '',
+    date_of_birth=None,
     actor,
     request,
 ) -> tuple[PatientSharedResult, str]:
     """Share an analysis request's current report with a patient
-    portal account, after verifying identity.
+    portal account.
+
+    Two valid call shapes (Phase D):
+
+    1. **Linked-patient call (default)** — empty identity payload.
+       The service consults
+       ``analysis_request.patient.has_cytova_identity`` and
+       re-verifies the linked ``PatientAccount`` is still active
+       (``_resolve_linked_profile``). The link itself was already
+       verified once at link time (Phase B), so we don't re-run the
+       interactive name/DOB match — re-checking ``is_active`` is
+       enough to catch a global-account deactivation since the link.
+
+    2. **Explicit-identity call (back-compat)** — all four identity
+       fields supplied. The service runs the original
+       ``verify_patient_identity`` path. Kept for unlinked patients
+       and for any external caller still on the pre-Phase-D contract.
+
+    Failure modes:
+      - ``MissingIdentity``           — neither path applies (no link
+        AND no identity payload).
+      - ``IdentityVerificationFailed``— either the explicit-payload
+        verification failed OR the linked account is no longer
+        active. Single non-distinguishing message; audit metadata
+        carries the distinguishing ``notify_cytova_outcome`` marker.
 
     Returns
     -------
@@ -281,29 +376,74 @@ def notify_cytova(
     if report is None or not report.pdf_file_key:
         raise ReportNotAvailable()
 
-    # --- Step 2: identity verification (NOT in atomic) -------------
-    profile = verify_patient_identity(
-        cytova_patient_id, first_name, last_name, date_of_birth,
+    # --- Step 2: identity resolution (NOT in atomic) ---------------
+    # Two paths converge here. The explicit-payload path is kept for
+    # back-compat with the pre-Phase-D contract; the linked path is
+    # the new default that the Phase E UI will exercise.
+    explicit_supplied = bool(
+        cytova_patient_id or first_name or last_name or date_of_birth
     )
-    if profile is None:
-        # Audit the *failed* attempt with the supplied Cytova ID only
-        # — name/DOB never recorded. Helps detect brute-force patterns
-        # against a single known ID without storing PII per attempt.
-        AuditLog.objects.create(
-            actor_type=ActorType.STAFF_USER,
-            actor_id=getattr(actor, 'id', None),
-            actor_email=getattr(actor, 'email', ''),
-            action=AuditAction.UPDATE,
-            entity_type='AnalysisRequest',
-            entity_id=analysis_request.id,
-            diff={'after': {
-                'notify_cytova_outcome': 'IDENTITY_MISMATCH',
-                'cytova_patient_id_attempted': (cytova_patient_id or '').strip()[:32],
-            }},
-            ip_address=getattr(request, 'audit_ip', None),
-            user_agent=getattr(request, 'audit_user_agent', ''),
+    patient = analysis_request.patient
+
+    if explicit_supplied:
+        # Back-compat path. Run the original interactive verification
+        # against the supplied claim — same code site Notify-Cytova
+        # used pre-Phase-D, no behaviour change.
+        profile = verify_patient_identity(
+            cytova_patient_id, first_name, last_name, date_of_birth,
         )
-        raise IdentityVerificationFailed()
+        if profile is None:
+            # Audit the *failed* attempt with the supplied Cytova ID
+            # only — name/DOB never recorded. Helps detect
+            # brute-force patterns against a single known ID without
+            # storing PII per attempt.
+            AuditLog.objects.create(
+                actor_type=ActorType.STAFF_USER,
+                actor_id=getattr(actor, 'id', None),
+                actor_email=getattr(actor, 'email', ''),
+                action=AuditAction.UPDATE,
+                entity_type='AnalysisRequest',
+                entity_id=analysis_request.id,
+                diff={'after': {
+                    'notify_cytova_outcome': 'IDENTITY_MISMATCH',
+                    'cytova_patient_id_attempted': (cytova_patient_id or '').strip()[:32],
+                }},
+                ip_address=getattr(request, 'audit_ip', None),
+                user_agent=getattr(request, 'audit_user_agent', ''),
+            )
+            raise IdentityVerificationFailed()
+    elif patient.has_cytova_identity:
+        # Linked path. The link was already verified at link time
+        # (Phase B), so we don't re-run the interactive name/DOB
+        # match — re-checking ``is_active`` on the global account is
+        # enough to catch a deactivation since the link.
+        profile = _resolve_linked_profile(patient)
+        if profile is None:
+            # Audit with a distinct outcome marker so an audit reader
+            # can tell "linked-but-now-inactive" apart from a fresh
+            # interactive mismatch. The lab user sees the same
+            # generic message either way.
+            AuditLog.objects.create(
+                actor_type=ActorType.STAFF_USER,
+                actor_id=getattr(actor, 'id', None),
+                actor_email=getattr(actor, 'email', ''),
+                action=AuditAction.UPDATE,
+                entity_type='AnalysisRequest',
+                entity_id=analysis_request.id,
+                diff={'after': {
+                    'notify_cytova_outcome': 'LINKED_ACCOUNT_INACTIVE',
+                    'patient_id': str(patient.id),
+                }},
+                ip_address=getattr(request, 'audit_ip', None),
+                user_agent=getattr(request, 'audit_user_agent', ''),
+            )
+            raise IdentityVerificationFailed()
+    else:
+        # Neither path applies — the operator hit the endpoint on an
+        # unlinked patient without supplying identity. The Phase E UI
+        # routes around this (it links first), so this is the safety
+        # net for callers that bypassed the UX hint.
+        raise MissingIdentity()
 
     # --- Step 3 + 4: snapshot + audit in a single atomic block -----
     lab_name = _resolve_lab_name(request)

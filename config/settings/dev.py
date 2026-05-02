@@ -59,6 +59,7 @@ REST_FRAMEWORK = {
         'slug_check': '30/hour',
         # Dev/tests use a generous cap; the prod default is in base.py.
         'notify_cytova': '1000/hour',
+        'link_cytova_identity': '1000/hour',
     },
 }
 

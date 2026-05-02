@@ -34,6 +34,36 @@ class PatientDetailSerializer(serializers.ModelSerializer):
     full_name = serializers.SerializerMethodField()
     portal_account = serializers.SerializerMethodField()
     created_by = serializers.SerializerMethodField()
+    # ---- Cytova patient-identity link (Phase C exposure) ------------
+    # Read-only summary of the lab → global Cytova link, scoped to
+    # what the lab UI legitimately needs to render the linked-state
+    # badge + recovery actions:
+    #
+    #   - ``has_cytova_identity``                — drives badge visibility
+    #     and gates the "Notify Cytova" CTA without needing the UI to
+    #     check both halves of the snapshot.
+    #   - ``cytova_patient_id``                  — already public to the
+    #     patient (CV-XXXX-XXXX), printable on receipts. Empty when
+    #     unlinked.
+    #   - ``cytova_identity_verified_at``        — when the link was
+    #     last confirmed via the global identity-verification service.
+    #     Surfaces in the badge tooltip / detail row.
+    #   - ``cytova_identity_verified_by_display``— display name of the
+    #     receptionist / lab admin who linked. ``None`` after that
+    #     staff user is removed (FK is SET_NULL by design).
+    #   - ``cytova_identity_unlinked_at``        — surfaces only on
+    #     unlinked rows that were previously linked, so the UI can
+    #     show "Last unlinked at …" without inferring it.
+    #
+    # NOT exposed by design:
+    #   - ``cytova_patient_account_id``  internal cross-schema snapshot
+    #     UUID; useful only to the backend's re-verification path.
+    #   - ANY field from the global ``PatientAccount`` row (email,
+    #     name, DOB) — that data lives in the public schema and the
+    #     lab tenant must never carry a serialised copy. The link is
+    #     a *snapshot*, not a join.
+    has_cytova_identity = serializers.BooleanField(read_only=True)
+    cytova_identity_verified_by_display = serializers.SerializerMethodField()
 
     class Meta:
         model = Patient
@@ -45,6 +75,10 @@ class PatientDetailSerializer(serializers.ModelSerializer):
             'insurance_number',
             'is_active', 'portal_account',
             'created_by', 'created_at', 'updated_at',
+            # Cytova link — see the field-level rationale above.
+            'has_cytova_identity', 'cytova_patient_id',
+            'cytova_identity_verified_at', 'cytova_identity_verified_by_display',
+            'cytova_identity_unlinked_at',
         ]
 
     def get_full_name(self, obj):
@@ -64,6 +98,16 @@ class PatientDetailSerializer(serializers.ModelSerializer):
                 'email': obj.created_by.email if obj.created_by else None,
             }
         return None
+
+    def get_cytova_identity_verified_by_display(self, obj):
+        """Display name of the staff user who linked this patient.
+        ``None`` when the link is fresh (verified_by_id unset) or
+        when the staff user has been removed (the FK is SET_NULL by
+        design — verified_at survives, the now-orphaned reference
+        clears). Mirrors the ``_user_display`` pattern used by
+        ``apps.requests.serializers``."""
+        user = obj.cytova_identity_verified_by
+        return user.display_name if user is not None else None
 
 
 class PatientCreateSerializer(serializers.Serializer):
@@ -143,3 +187,19 @@ class PortalAccountCreateSerializer(serializers.Serializer):
                 'A portal account with this email already exists.'
             )
         return value
+
+
+class CytovaIdentityLinkSerializer(serializers.Serializer):
+    """Input shape for ``POST /patients/{id}/link-cytova-identity/``.
+
+    Mirrors ``apps.requests.serializers.NotifyCytovaSerializer`` field
+    by field — the same identity-verification call site consumes both,
+    so the input contract stays consistent across the two surfaces. No
+    field-level validation lives here: any normalisation /
+    canonicalisation happens inside the lookup layer (so the lab
+    tenant never has its own copy of the rules).
+    """
+    cytova_patient_id = serializers.CharField(max_length=32)
+    first_name = serializers.CharField(max_length=100)
+    last_name = serializers.CharField(max_length=100)
+    date_of_birth = serializers.DateField()

@@ -72,6 +72,72 @@ class Patient(BaseModel):
         related_name='created_patients',
     )
 
+    # ---- Cytova patient identity link --------------------------------
+    # Snapshot of a verified link between this tenant-local Patient and
+    # a global ``apps.patient_portal.PatientAccount``. The link is set
+    # by the lab once, after the receptionist enters the patient's
+    # Cytova credentials and the global identity-verification service
+    # confirms a match. Once linked, Notify Cytova and any other
+    # patient-portal-bound action can reuse the verified identity
+    # without re-prompting the operator for the patient's name / DOB.
+    #
+    # Cross-schema reference rules:
+    #   - ``cytova_patient_account_id`` is a UUID *snapshot* — never
+    #     a foreign key. ``PatientAccount`` lives in the public
+    #     schema; cross-schema FKs aren't supported by django-tenants
+    #     and would also be a layering violation. Validity is
+    #     re-checked at use time (e.g. before Notify Cytova actually
+    #     shares).
+    #   - ``cytova_patient_id`` mirrors what the patient sees on their
+    #     side (CV-XXXX-XXXX, 12 chars). It's the human-readable
+    #     reference an operator can quote on the phone, and the value
+    #     the lab UI surfaces on the linked-state badge.
+    #
+    # Uniqueness:
+    #   - Two local patients pointing at the same global Cytova ID
+    #     would almost certainly indicate an operator error or stale
+    #     record. We enforce that with a partial unique constraint
+    #     covering only non-empty values, so unlinked rows (the
+    #     default) don't compete on the empty-string default.
+    cytova_patient_id = models.CharField(
+        max_length=12, blank=True, default='', db_index=True,
+        help_text='Snapshot of the global Cytova Patient ID '
+                  '(CV-XXXX-XXXX) once a verified link exists. '
+                  'Empty when the patient is not linked.',
+    )
+    cytova_patient_account_id = models.UUIDField(
+        null=True, blank=True, db_index=True,
+        help_text='Snapshot of the global PatientAccount UUID at '
+                  'link time. NOT a foreign key — patient_portal '
+                  'tables live in the public schema. Validity is '
+                  're-checked at use time.',
+    )
+    cytova_identity_verified_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text='When the link was created via the global identity '
+                  'verification service.',
+    )
+    cytova_identity_verified_by = models.ForeignKey(
+        'users.StaffUser',
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='cytova_links_verified',
+        help_text='Staff member who performed the link.',
+    )
+    cytova_identity_unlinked_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text='When the link was last cleared. Survives a '
+                  'subsequent re-link so the audit trail is '
+                  'continuous; the link service stamps a fresh '
+                  'verified_at on relink.',
+    )
+    cytova_identity_unlinked_by = models.ForeignKey(
+        'users.StaffUser',
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='cytova_links_unlinked',
+    )
+
     class Meta:
         verbose_name = 'Patient'
         verbose_name_plural = 'Patients'
@@ -83,6 +149,16 @@ class Patient(BaseModel):
             models.UniqueConstraint(
                 fields=['document_type', 'document_number'],
                 name='unique_patient_document',
+            ),
+            # Partial unique: one local patient per global Cytova ID
+            # within this tenant schema. The ``exclude empty`` clause
+            # is critical — every unlinked row carries the empty
+            # string (the field's default), and a plain unique index
+            # would refuse to keep more than one of them.
+            models.UniqueConstraint(
+                fields=['cytova_patient_id'],
+                condition=~models.Q(cytova_patient_id=''),
+                name='unique_patient_cytova_id_when_set',
             ),
         ]
 
@@ -105,6 +181,14 @@ class Patient(BaseModel):
     @property
     def has_portal_account(self):
         return hasattr(self, 'portal_account') and self.portal_account is not None
+
+    @property
+    def has_cytova_identity(self) -> bool:
+        """True iff the patient has been linked to a global Cytova
+        account. Both halves of the snapshot must be populated; an
+        unlinked or partially-cleared row reads as False so the UI
+        and Notify Cytova flow never act on half-state."""
+        return bool(self.cytova_patient_id) and self.cytova_patient_account_id is not None
 
 
 class PatientPortalAccountManager(BaseUserManager):

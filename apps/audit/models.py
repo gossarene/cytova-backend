@@ -42,6 +42,13 @@ class AuditAction(models.TextChoices):
     RESULT_REOPENED = 'RESULT_REOPENED', 'Result Reopened'
     RESULT_SHARED_CYTOVA = 'RESULT_SHARED_CYTOVA', 'Result Shared via Cytova'
     CYTOVA_SHARE_REVOKED = 'CYTOVA_SHARE_REVOKED', 'Cytova Share Revoked'
+    # Cytova patient-identity link lifecycle on the local Patient row.
+    # ``LINKED`` fires once the global identity-verification service
+    # confirms the receptionist's claim; ``UNLINKED`` fires on every
+    # explicit clear (so an audit reader can reconstruct the link
+    # history even across multiple link → unlink → relink cycles).
+    PATIENT_CYTOVA_IDENTITY_LINKED = 'PATIENT_CYTOVA_IDENTITY_LINKED', 'Patient Cytova Identity Linked'
+    PATIENT_CYTOVA_IDENTITY_UNLINKED = 'PATIENT_CYTOVA_IDENTITY_UNLINKED', 'Patient Cytova Identity Unlinked'
 
 
 class AuditLog(models.Model):
@@ -66,7 +73,7 @@ class AuditLog(models.Model):
     actor_email = models.CharField(max_length=255, null=True, blank=True)
 
     action = models.CharField(
-        max_length=20, choices=AuditAction.choices, db_index=True
+        max_length=40, choices=AuditAction.choices, db_index=True
     )
     entity_type = models.CharField(max_length=100, db_index=True)
     entity_id = models.UUIDField(null=True, blank=True, db_index=True)

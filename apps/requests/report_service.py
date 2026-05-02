@@ -84,26 +84,86 @@ class RequestReportService:
         request,
     ) -> AnalysisRequestReport:
         """
-        Produce version 1 if no current version exists yet; otherwise
-        return the current version unchanged. Only VALIDATED requests
-        can be reported.
+        Produce a new report version when none is current; otherwise
+        return the current version unchanged.
 
-        Idempotent on purpose: a UI refresh or a re-click should not
-        produce a silent new version — that is what ``regenerate`` is
-        for.
+        Three flows converge here:
+
+        1. **Initial generation** — no rows exist yet → create
+           ``version_number=1`` with ``is_current=True``.
+        2. **Idempotent read** — a current row already has a PDF (the
+           normal post-generate state, including ``RESULT_ISSUED``
+           where the patient is reading it) → return it untouched. A
+           UI refresh / re-click never produces a silent new version.
+        3. **Post-reopen regeneration** — historical rows exist but
+           none is current (``reopen-result`` flipped the previous
+           current to ``is_current=False`` and walked the request
+           back to ``VALIDATED``) → create
+           ``max(version_number) + 1`` as the new current. The
+           previous PDF is preserved because the file key embeds
+           ``version_number`` and the row's UUID.
+
+        The legacy implementation hard-coded ``version_number=1`` on
+        the no-current branch, which collided with the unique
+        ``(analysis_request, version_number)`` constraint as soon as
+        ``reopen-result`` had been used (v1 still existed,
+        ``is_current=False``). That manifested as a 500 from
+        ``POST /requests/{id}/report/`` after reopen. Computing the
+        next version from the locked existing set fixes the collision
+        and makes the post-reopen flow indistinguishable from a fresh
+        generation from the operator's point of view.
         """
         _assert_validated(analysis_request)
 
-        current = RequestReportService.get_current(analysis_request)
+        # Lock existing versions so two concurrent generate calls can't
+        # both race to insert version N. The lock is held for the full
+        # transaction; the partial unique constraint on ``is_current``
+        # provides DB-level backup if the lock is somehow bypassed.
+        existing = list(
+            AnalysisRequestReport.objects
+            .select_for_update()
+            .filter(analysis_request=analysis_request)
+            .order_by('-version_number')
+        )
+
+        current = next((r for r in existing if r.is_current), None)
         if current is not None and current.pdf_file_key:
+            # Flow 2 — idempotent read. No write happens here, so the
+            # RESULT_ISSUED lock isn't relevant: the patient is just
+            # looking at the PDF that was already issued.
             return current
+
+        # We're about to produce a new version. This is a WRITE — the
+        # issuance lock must hold. ``_assert_report_writable`` refuses
+        # ``RESULT_ISSUED`` and only accepts ``VALIDATED``; that's why
+        # ``reopen-result`` (which transitions back to VALIDATED) is
+        # the legitimate way to land on the post-reopen branch.
+        _assert_report_writable(analysis_request)
+
+        next_version = (existing[0].version_number + 1) if existing else 1
+
+        # Defensive: if a current row exists but has no PDF, it's a
+        # leftover from a crashed prior call. Demote it before insert
+        # so the partial unique constraint on ``is_current`` holds.
+        if current is not None:
+            current.is_current = False
+            current.save(update_fields=['is_current', 'updated_at'])
 
         return _create_version(
             analysis_request=analysis_request,
-            version_number=1,
+            version_number=next_version,
             generated_by=generated_by,
             request=request,
-            audit_action=AuditAction.CREATE,
+            # CREATE for the very first version of a request (clean
+            # provenance signal for audit readers); UPDATE for
+            # subsequent versions, regardless of whether they came
+            # from this method post-reopen or from ``regenerate``
+            # directly. Both writers ultimately produce the same
+            # "new version on a request that already had one" event.
+            audit_action=(
+                AuditAction.CREATE if next_version == 1
+                else AuditAction.UPDATE
+            ),
         )
 
     @staticmethod

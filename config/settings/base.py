@@ -297,6 +297,11 @@ REST_FRAMEWORK = {
         # against a known Cytova ID — the service also writes an audit
         # row on each failed verification so abuse is observable.
         'notify_cytova': '20/hour',
+        # Patient-identity link: same brute-force surface as
+        # notify_cytova (same identity-verification call), so we cap
+        # at the same band. Failed verifications also write an audit
+        # row so abuse is observable.
+        'link_cytova_identity': '20/hour',
     },
 }
 
