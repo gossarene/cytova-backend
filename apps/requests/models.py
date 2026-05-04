@@ -551,11 +551,29 @@ class RequestLabel(BaseModel):
     """
     One label row inside a batch.
 
-    ``barcode_value`` is the canonical, **system-wide unique** identifier
-    printed on the physical label and scanned throughout downstream
-    workflow — the unique + indexed constraint means any scan in any
-    module can resolve back in O(1) to the label, the batch, and the
-    parent analysis request, preserving full traceability.
+    ``barcode_value`` is the canonical identifier printed on the
+    physical label and scanned throughout downstream workflow.
+
+    Uniqueness contract (Phase 4 of the flexible-labels rollout)
+    -----------------------------------------------------------
+    The field is **indexed but no longer system-wide unique**. Two
+    different uniqueness regimes coexist depending on
+    ``LabSettings.label_numbering_mode``:
+
+      - ``PER_FAMILY`` (default): the
+        ``apps.requests.label_service`` allocator emits a fresh
+        sequence value per label, so ``barcode_value`` is naturally
+        unique inside the batch and across batches.
+      - ``SAME_REQUEST_NUMBER``: the allocator emits ONE value and
+        every ``RequestLabel`` in the batch reuses it. Within-batch
+        duplicates are intentional; cross-batch uniqueness is still
+        guaranteed by the locked ``LabelSequence`` allocator (each
+        period_key + last_value pair appears at most once).
+
+    The DB-level unique constraint that pre-Phase-4 enforced has
+    been dropped — it would otherwise refuse the
+    SAME_REQUEST_NUMBER inserts. The remaining ``db_index=True`` is
+    what keeps scan-to-label lookups O(1).
 
     Hard delete is blocked — labels are traceability records.
     """
@@ -566,9 +584,11 @@ class RequestLabel(BaseModel):
     )
     barcode_value = models.CharField(
         max_length=64,
-        unique=True,
         db_index=True,
-        help_text='System-wide unique identifier printed on the label and scanned in workflow.',
+        help_text='Identifier printed on the label and scanned in '
+                  'workflow. Unique per batch in PER_FAMILY mode, '
+                  'shared across the batch in SAME_REQUEST_NUMBER '
+                  'mode (Phase 4 of the flexible-labels rollout).',
     )
     label_index = models.PositiveSmallIntegerField(
         help_text='1-based position of this label within the batch.',
@@ -626,20 +646,40 @@ class RequestReferenceSequence(models.Model):
 
 class LabelSequence(models.Model):
     """
-    Per-tenant monthly counter used by the numeric label code allocator.
+    Per-tenant counter used by the numeric label code allocator.
 
-    One row per ``(year, month)`` within this tenant's schema. Because
-    the table lives in the tenant schema, the ``(year, month)`` unique
-    constraint is already tenant-scoped — no ``tenant_code`` column is
-    required on the row itself. The allocator composes the final label
-    code by prefixing the tenant's public-schema numeric_code.
+    Schema rationale
+    ----------------
+    One row per period within this tenant's schema. The period itself
+    is encoded as a single ``period_key`` string so the same model
+    serves both reset modes the lab can configure (Phase 1):
 
-    Access path for concurrency safety: callers wrap ``get_or_create``
-    + ``select_for_update`` + increment in a single ``transaction.atomic``
-    block so overlapping label generations serialise on this row.
+      - ``MONTHLY``  → ``period_key`` is ``"YYYY-MM"`` (10 chars max).
+      - ``YEARLY``   → ``period_key`` is ``"YYYY"``.
+
+    Pre-Phase-2 the model used ``(year, month)`` integers; Phase 2's
+    migration backfills every existing row's ``period_key`` from
+    those columns and drops them. The lookup surface for callers is
+    intentionally a single string so the allocator can switch reset
+    modes without re-shaping the model again.
+
+    Tenant scoping is implicit: the table lives in the tenant schema,
+    so the ``unique(period_key)`` constraint is already
+    tenant-scoped — no ``tenant_code`` column needed.
+
+    Concurrency contract
+    --------------------
+    Callers MUST wrap ``get_or_create(period_key=...)`` +
+    ``select_for_update().get(period_key=...)`` + increment in a
+    single ``transaction.atomic`` block. Overlapping label
+    generations then serialise on this row's PostgreSQL row lock.
     """
-    year = models.PositiveSmallIntegerField()
-    month = models.PositiveSmallIntegerField()
+    period_key = models.CharField(
+        max_length=10,
+        help_text='Period the sequence resets on. "YYYY-MM" for '
+                  'monthly resets, "YYYY" for yearly. Computed by '
+                  'apps.requests.label_service.period_key_for.',
+    )
     last_value = models.PositiveIntegerField(default=0)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -648,16 +688,19 @@ class LabelSequence(models.Model):
         verbose_name_plural = 'Label Sequences'
         constraints = [
             models.UniqueConstraint(
-                fields=['year', 'month'],
-                name='unique_label_sequence_year_month',
+                fields=['period_key'],
+                name='unique_label_sequence_period_key',
             ),
         ]
         indexes = [
-            models.Index(fields=['year', 'month']),
+            models.Index(
+                fields=['period_key'],
+                name='label_sequence_period_idx',
+            ),
         ]
 
     def __str__(self):
-        return f'LabelSequence({self.year:04d}-{self.month:02d} @ {self.last_value})'
+        return f'LabelSequence({self.period_key} @ {self.last_value})'
 
 
 # ---------------------------------------------------------------------------

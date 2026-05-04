@@ -25,7 +25,11 @@ logger = logging.getLogger(__name__)
 
 VERIFICATION_SUBJECT = 'Your Cytova verification code'
 PASSWORD_RESET_SUBJECT = 'Reset your Cytova password'
-PATIENT_RESULT_READY_SUBJECT = 'Your lab result is ready'
+# Patient-result-ready subject is no longer a static constant — Phase 2
+# of the customisable-templates rollout moved it into
+# ``LabSettings.patient_result_email_subject_template``. The renderer
+# falls back to ``"Your lab result is ready"`` when the operator's
+# template is empty, so the visible default copy is unchanged.
 PATIENT_VERIFY_SUBJECT = 'Verify your Cytova account'
 PATIENT_SHARED_RESULT_SUBJECT = 'New lab result available in Cytova'
 
@@ -103,6 +107,9 @@ class EmailService:
         recipient_name: str,
         secure_link: str,
         lab_name: str = '',
+        request_reference: str = '',
+        subject_template: str = '',
+        body_template: str = '',
     ) -> EmailResult:
         """Notify a patient that their result is ready, by email.
 
@@ -111,20 +118,42 @@ class EmailService:
         URL via the existing tenant-isolated patient-access flow, which
         handles authentication (PDF password) and brute-force protection.
 
+        Phase 2 of the customisable-templates rollout added the
+        ``subject_template`` / ``body_template`` / ``request_reference``
+        kwargs. The caller (``RequestNotificationService``) reads the
+        operator-customised templates from ``LabSettings`` and threads
+        them in. Empty templates fall back to the canonical hard-coded
+        copy so any caller still on the pre-Phase-2 contract sends the
+        same email it always has — back-compat is byte-for-byte
+        preserved on the fallback path.
+
+        The four-variable allow-list (``patient_first_name``,
+        ``lab_name``, ``result_link``, ``request_reference``) is the
+        structural confidentiality guarantee — even an operator
+        attempting to paste medical content into a template gets the
+        literal placeholder back, never the value.
+
         Same delivery contract as other EmailService methods — failures
         return ``EmailResult(ok=False, error=...)`` rather than raising,
         so the caller can record the failed attempt without crashing the
         notify-patient endpoint.
         """
-        html_body, text_body = render_patient_result_ready(
+        subject, html_body, text_body = render_patient_result_ready(
             first_name=recipient_name,
             secure_link=secure_link,
             lab_name=lab_name,
+            request_reference=request_reference,
+            subject_template=subject_template,
+            body_template=body_template,
         )
         message = EmailMessage(
             to_email=recipient_email,
             to_name=recipient_name or '',
-            subject=PATIENT_RESULT_READY_SUBJECT,
+            # Use the rendered subject directly. The rendered subject
+            # falls back to ``PATIENT_RESULT_READY_SUBJECT`` (the
+            # canonical default) when ``subject_template`` is empty,
+            # so back-compat is preserved.
+            subject=subject,
             text=text_body,
             html=html_body,
         )

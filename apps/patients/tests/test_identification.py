@@ -25,7 +25,7 @@ class TestDocumentTypeEnum:
         values = {c.value for c in DocumentType}
         assert values == {
             'NATIONAL_ID_CARD', 'PASSPORT', 'CIP',
-            'RESIDENCE_PERMIT', 'OTHER',
+            'RESIDENCE_PERMIT', 'OTHER', 'UNKNOWN',
         }
 
 

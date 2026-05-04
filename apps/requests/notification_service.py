@@ -203,11 +203,28 @@ class RequestNotificationService:
             raise PatientEmailMissing()
 
         service = get_email_service()
+        # Phase 2 of the customisable-templates rollout: thread the
+        # operator-customised subject + body templates through to
+        # the renderer. Empty strings (the migration default) make
+        # the renderer fall back to the canonical hard-coded copy,
+        # so tenants that haven't touched the fields experience
+        # zero behavioural drift. ``request_reference`` populates
+        # the operator's optional ``{{ request_reference }}``
+        # placeholder; we pass the public-facing value (matches
+        # what the operator sees on receipts), falling back to the
+        # internal request_number so the variable is never empty.
         delivery = service.send_patient_result_ready_email(
             recipient_email=recipient_email,
             recipient_name=patient.first_name,
             secure_link=secure_link,
             lab_name=lab_settings.lab_name or '',
+            request_reference=(
+                analysis_request.public_reference
+                or analysis_request.request_number
+                or ''
+            ),
+            subject_template=lab_settings.patient_result_email_subject_template,
+            body_template=lab_settings.patient_result_email_body_template,
         )
 
         provider_name = service.provider.name

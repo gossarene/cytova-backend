@@ -221,13 +221,52 @@ def render_password_reset(*, first_name: str, reset_url: str, expires_minutes: i
 # appears in the rendered output.
 # ---------------------------------------------------------------------------
 
-_RESULT_READY_HTML_TEMPLATE = """\
+_RESULT_READY_DEFAULT_TITLE = 'Your lab result is ready'
+
+
+def _render_html_body_paragraphs(rendered_body: str) -> str:
+    """Convert the operator's rendered body (plain text, possibly
+    multi-paragraph) into a sequence of HTML ``<tr><td>`` rows that
+    slot into the branded shell.
+
+    Splits on blank lines for paragraph breaks, then on single
+    newlines for soft line breaks. Each chunk is HTML-escaped — the
+    operator's text is treated as plain text, never as raw HTML, so
+    a name like ``"O'Brien"`` or a stray ``<`` can't break the
+    surrounding markup. The placeholder substitution itself already
+    escaped the four allowed variables (the renderer was called
+    with ``escape_html=True``); this layer escapes the operator's
+    *literal* characters.
+    """
+    paragraphs = [p for p in rendered_body.split('\n\n') if p.strip()]
+    cells = []
+    for para in paragraphs:
+        # Soft line breaks within a paragraph render as ``<br>``.
+        # Each segment is HTML-escaped so operator-typed angle
+        # brackets / ampersands stay literal.
+        lines = [html.escape(line) for line in para.split('\n')]
+        inner = '<br>'.join(lines)
+        cells.append(
+            '          <tr>\n'
+            '            <td style="font-size:14px; line-height:1.6; '
+            'color:#475569; padding-bottom:16px;">\n'
+            f'              {inner}\n'
+            '            </td>\n'
+            '          </tr>'
+        )
+    return '\n'.join(cells)
+
+
+# HTML shell with an explicit ``{title}`` slot + a ``{body_paragraphs}``
+# slot for the operator's rendered text. The CTA button + footer stay
+# fixed (spec §5: "result link should still be shown as a CTA button").
+_RESULT_READY_HTML_SHELL = """\
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Your lab result is ready</title>
+  <title>{title}</title>
 </head>
 <body style="margin:0; padding:0; background:#f8fafc; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif; color:#0f172a;">
   <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="background:#f8fafc; padding:40px 16px;">
@@ -241,14 +280,10 @@ _RESULT_READY_HTML_TEMPLATE = """\
           </tr>
           <tr>
             <td style="font-size:18px; font-weight:600; color:#0f172a; padding-bottom:8px;">
-              Your lab result is ready
+              {title}
             </td>
           </tr>
-          <tr>
-            <td style="font-size:14px; line-height:1.6; color:#475569; padding-bottom:24px;">
-              Hi {first_name}, your lab result is ready. You can access it securely using the link below.
-            </td>
-          </tr>
+{body_paragraphs}
           <tr>
             <td align="center" style="padding:8px 0 24px 0;">
               <a href="{secure_link}" style="display:inline-block; padding:12px 28px; background:#2563eb; color:#ffffff; font-size:14px; font-weight:600; text-decoration:none; border-radius:10px;">
@@ -267,11 +302,6 @@ _RESULT_READY_HTML_TEMPLATE = """\
             </td>
           </tr>
           <tr>
-            <td style="font-size:13px; line-height:1.6; color:#64748b; padding-bottom:32px;">
-              For your privacy, the result file may require a password to open.
-            </td>
-          </tr>
-          <tr>
             <td style="border-top:1px solid #e2e8f0; padding-top:20px; font-size:12px; line-height:1.5; color:#94a3b8;">
               If you did not expect this email, you can safely ignore it.
             </td>
@@ -286,48 +316,142 @@ _RESULT_READY_HTML_TEMPLATE = """\
 """
 
 
-_RESULT_READY_TEXT_TEMPLATE = """\
-Hi {first_name},
-
-Your lab result is ready. You can access it securely using the link below:
-
-  {secure_link}
-
-For your privacy, the result file may require a password to open.
-
-If you did not expect this email, you can safely ignore it.
-
-— {footer}
-"""
-
-
 def render_patient_result_ready(
     *,
     first_name: str,
     secure_link: str,
     lab_name: str = '',
-) -> Tuple[str, str]:
-    """Return (html_body, text_body) for the patient result-ready email.
+    request_reference: str = '',
+    subject_template: str = '',
+    body_template: str = '',
+) -> Tuple[str, str, str]:
+    """Render the patient result-ready email — branded HTML shell +
+    plain-text body + subject line.
 
-    The body never contains medical data — only a generic notice and the
-    secure access URL. ``lab_name`` is optional and only used as a friendly
-    sign-off; pass an empty string to fall back to "Cytova".
+    Returns
+    -------
+    ``(subject, html_body, text_body)``. Phase 2 widened the return
+    shape from ``(html, text)`` to a 3-tuple so the caller can use
+    the rendered subject directly in ``EmailMessage.subject``
+    instead of relying on a separate hard-coded constant.
+
+    Templates
+    ---------
+    Two operator-customisable inputs (Phase 1's LabSettings fields):
+
+      - ``subject_template`` — empty falls back to
+        ``"Your lab result is ready"``. The rendered subject also
+        doubles as the in-body bold title so customising one knob
+        gives the operator a coherent visual.
+      - ``body_template`` — empty falls back to today's hard-coded
+        body copy verbatim, so tenants that touch nothing
+        experience zero behavioural drift on rollout.
+
+    Both go through ``render_safe_notification_template`` with
+    ``escape_html=True`` for HTML rendering and ``escape_html=False``
+    for plain-text. The four allow-listed variables are populated
+    from the call args; nothing else can be substituted no matter
+    what the template references.
+
+    Confidentiality contract (re-asserted from module docstring)
+    -----------------------------------------------------------
+    The renderer's allow-list is the structural guarantee that no
+    medical content can reach the email body — even an operator
+    pasting ``"value: {{ result_value }}"`` after a save-time
+    bypass would see the literal placeholder, not the value, in
+    the rendered output. Phase 1's serializer validator prevents
+    the bypass on the standard admin path.
+
+    The CTA button is always rendered (spec §5: "result link
+    should still be shown as a CTA button"). Operators who include
+    ``{{ result_link }}`` in their body get the URL inline AND the
+    button below; operators who omit it get just the button.
     """
+    from .safe_template import render_safe_notification_template
+
     safe_name = (first_name or 'there').strip() or 'there'
     safe_lab = (lab_name or '').strip()
     footer = safe_lab or 'Cytova'
-    return (
-        _RESULT_READY_HTML_TEMPLATE.format(
-            first_name=html.escape(safe_name),
-            secure_link=secure_link,
-            footer=html.escape(footer),
-        ),
-        _RESULT_READY_TEXT_TEMPLATE.format(
-            first_name=safe_name,
-            secure_link=secure_link,
-            footer=footer,
-        ),
+
+    # Build the four-variable context once. Same dict is used for
+    # subject + HTML body + text body; the renderer is purely a
+    # function of (template, context, escape_html).
+    context = {
+        'patient_first_name': safe_name,
+        'lab_name': safe_lab,
+        'result_link': secure_link,
+        'request_reference': request_reference or '',
+    }
+
+    # Subject. Empty template → canonical default. Subjects are
+    # plain text (never HTML), so escape_html=False.
+    subject = (
+        render_safe_notification_template(
+            subject_template, context, escape_html=False,
+        ).strip()
+        or _RESULT_READY_DEFAULT_TITLE
     )
+
+    # Body — text version. Operator's text comes through verbatim
+    # (newlines preserved). Empty template falls back to today's
+    # default, byte-for-byte identical to pre-Phase-2.
+    if body_template:
+        text_body = (
+            render_safe_notification_template(
+                body_template, context, escape_html=False,
+            )
+            + f'\n\n— {footer}\n'
+        )
+    else:
+        # The pre-Phase-2 default text body verbatim, so a tenant
+        # that never touches the field gets exactly today's email.
+        text_body = (
+            f'Hi {safe_name},\n\n'
+            f'Your lab result is ready. You can access it securely '
+            f'using the link below:\n\n'
+            f'  {secure_link}\n\n'
+            f'For your privacy, the result file may require a '
+            f'password to open.\n\n'
+            f'If you did not expect this email, you can safely '
+            f'ignore it.\n\n'
+            f'— {footer}\n'
+        )
+
+    # Body — HTML version. Operator's text gets paragraph-broken +
+    # HTML-escaped. Empty template falls back to today's default
+    # paragraph (single line).
+    if body_template:
+        # Render with ``escape_html=False`` because the paragraph
+        # formatter below already calls ``html.escape`` on every
+        # line. Escaping at substitution time too would double-
+        # escape: ``"<Ada>"`` would become ``&amp;lt;Ada&amp;gt;``
+        # instead of the correct ``&lt;Ada&gt;``. Single escape
+        # pass at the paragraph level handles both substituted
+        # values AND operator-typed literal characters uniformly.
+        rendered_html_body = render_safe_notification_template(
+            body_template, context, escape_html=False,
+        )
+        body_paragraphs = _render_html_body_paragraphs(rendered_html_body)
+    else:
+        # Reproduce the pre-Phase-2 single body paragraph.
+        body_paragraphs = (
+            '          <tr>\n'
+            '            <td style="font-size:14px; line-height:1.6; '
+            'color:#475569; padding-bottom:24px;">\n'
+            f'              Hi {html.escape(safe_name)}, your lab '
+            f'result is ready. You can access it securely using the '
+            f'link below.\n'
+            '            </td>\n'
+            '          </tr>'
+        )
+
+    html_body = _RESULT_READY_HTML_SHELL.format(
+        title=html.escape(subject),
+        body_paragraphs=body_paragraphs,
+        secure_link=secure_link,
+        footer=html.escape(footer),
+    )
+    return (subject, html_body, text_body)
 
 
 # ---------------------------------------------------------------------------

@@ -6,14 +6,17 @@ management (create, delete). All write operations produce AuditLog records.
 """
 from datetime import date
 import logging
+import secrets
+import string
 
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.utils import timezone
+from rest_framework import serializers as drf_serializers
 
 from apps.audit.models import AuditLog, AuditAction, ActorType
 from apps.users.models import StaffUser
 from common.utils.crypto import generate_secure_token
-from .models import Patient, PatientPortalAccount
+from .models import DocumentType, Patient, PatientPortalAccount
 
 logger = logging.getLogger(__name__)
 
@@ -58,12 +61,122 @@ class AlreadyLinked(CytovaLinkError):
     )
 
 
+class DateOfBirthRequired(CytovaLinkError):
+    """Refused because the local patient has no DOB on file
+    (``date_of_birth_unknown=True``). The global identity-verification
+    service requires an exact DOB match, so a link request without a
+    DOB has nothing to match against. The lab must update the
+    patient's DOB before attempting to link."""
+    code = 'DATE_OF_BIRTH_REQUIRED'
+    message = 'Date of birth is required to link a Cytova identity.'
+
+
+# ---------------------------------------------------------------------------
+# Auto-generated identity number for ``DocumentType.UNKNOWN`` patients
+# ---------------------------------------------------------------------------
+
+# Alphabet for the 6-character suffix. Excludes visually confusable
+# characters (``O``/``0``, ``I``/``1``) so a clerk reading an
+# auto-generated ID off paper has no ambiguity. Same convention the
+# Cytova patient ID generator uses elsewhere in the codebase.
+_AUTO_ID_ALPHABET = ''.join(
+    c for c in (string.ascii_uppercase + string.digits)
+    if c not in 'OIL01'
+)
+_AUTO_ID_PREFIX = 'AUTO-PT'
+_AUTO_ID_SUFFIX_LEN = 6
+# Collision retries. The suffix space is 32^6 ≈ 1B values per day —
+# a within-tenant collision is astronomically unlikely. Five
+# retries handle the impossible case where the operator runs the
+# generator inside a tight loop and happens to hit the same suffix
+# before the unique-constraint check sees the prior insert.
+_AUTO_ID_MAX_ATTEMPTS = 5
+
+
+def _generate_unknown_identity_number(today: date | None = None) -> str:
+    """Build a fresh ``AUTO-PT-YYYYMMDD-XXXXXX`` identifier.
+
+    Pure helper — does NOT check the DB or guarantee within-tenant
+    uniqueness on its own. The caller wraps the insert in a retry
+    loop driven by ``IntegrityError`` from the existing
+    ``unique(document_type, document_number)`` constraint, which is
+    where uniqueness is actually enforced.
+    """
+    when = today or timezone.localdate()
+    suffix = ''.join(
+        secrets.choice(_AUTO_ID_ALPHABET)
+        for _ in range(_AUTO_ID_SUFFIX_LEN)
+    )
+    return f'{_AUTO_ID_PREFIX}-{when:%Y%m%d}-{suffix}'
+
+
+def _generate_with_retry() -> str:
+    """Pre-flight uniqueness check for the auto-generated identifier.
+
+    The DB-level retry (driven by ``IntegrityError`` on insert) is
+    the load-bearing safety net; this helper is the cheap optimistic
+    check that avoids burning an entire transaction on the
+    99.9999%-of-the-time-fine path. Returns the first candidate
+    that doesn't already collide with an existing
+    ``(UNKNOWN, document_number)`` row in the current tenant schema.
+    """
+    for _ in range(_AUTO_ID_MAX_ATTEMPTS):
+        candidate = _generate_unknown_identity_number()
+        if not Patient.objects.filter(
+            document_type=DocumentType.UNKNOWN,
+            document_number=candidate,
+        ).exists():
+            return candidate
+    # Astronomically unlikely to land here. Returning the last
+    # candidate lets the caller's IntegrityError-retry loop have
+    # one more swing before giving up — the constraint at the DB
+    # level is the only authoritative gate.
+    return candidate
+
+
 class PatientService:
 
     @staticmethod
     def create_patient(validated_data: dict, created_by: StaffUser, request) -> Patient:
+        # Resolve identity-number provenance BEFORE the insert.
+        #
+        # Cases A/B from the rollout spec:
+        #   A. ``document_type=UNKNOWN`` + empty ``document_number``
+        #      → service auto-generates an ``AUTO-PT-…`` placeholder
+        #      and stamps ``identity_number_auto_generated=True`` so
+        #      the UI can render it as a placeholder rather than a
+        #      real ID.
+        #   B. ``document_type=UNKNOWN`` + operator-supplied number
+        #      → keep the operator's value verbatim and set the flag
+        #      to False (the operator vouched for it).
+        #   B. (cont.) Any real ``document_type`` (NATIONAL_ID_CARD,
+        #      PASSPORT, …) → number must be present (serializer
+        #      enforced); flag stays False.
+        validated_data = dict(validated_data)  # copy — mutate locally
+        doc_type = validated_data.get('document_type')
+        doc_number = (validated_data.get('document_number') or '').strip()
+        auto_generated = False
+        if doc_type == DocumentType.UNKNOWN and not doc_number:
+            doc_number = _generate_with_retry()
+            auto_generated = True
+        validated_data['document_number'] = doc_number
+        validated_data['identity_number_auto_generated'] = auto_generated
+
         patient = Patient(created_by=created_by, **validated_data)
-        patient.save()
+        # Auto-generated IDs race the unique constraint vanishingly
+        # rarely (32^6 suffix space, per-day-scoped). The retry below
+        # is the safety net — falls back to a fresh suffix on the
+        # impossible-but-possible collision.
+        for attempt in range(_AUTO_ID_MAX_ATTEMPTS):
+            try:
+                with transaction.atomic():
+                    patient.save()
+                break
+            except IntegrityError:
+                if not auto_generated or attempt + 1 == _AUTO_ID_MAX_ATTEMPTS:
+                    raise
+                patient.document_number = _generate_unknown_identity_number()
+                validated_data['document_number'] = patient.document_number
 
         AuditLog.objects.create(
             actor_type=ActorType.STAFF_USER,
@@ -75,6 +188,8 @@ class PatientService:
             diff={'after': {
                 'document_type': patient.document_type,
                 'document_number': patient.document_number,
+                'identity_number_auto_generated': patient.identity_number_auto_generated,
+                'date_of_birth_unknown': patient.date_of_birth_unknown,
                 'first_name': patient.first_name,
                 'last_name': patient.last_name,
             }},
@@ -91,11 +206,81 @@ class PatientService:
         updated_by: StaffUser,
         request,
     ) -> Patient:
+        # Type-transition handling (rollout spec §1):
+        #
+        #   real → UNKNOWN, number kept       → flag stays False.
+        #   real → UNKNOWN, number cleared    → auto-generate, flag True.
+        #   UNKNOWN → real, number provided   → flag flips to False.
+        #   UNKNOWN → real, number missing    → serializer rejects.
+        #   UNKNOWN → UNKNOWN, number unchanged → no-op.
+        #
+        # The resolution lives here (not in the serializer) so the
+        # auto-generation side-effect stays off the validation pass.
+        # The serializer's job is to refuse impossible combinations
+        # (UNKNOWN→real without number); the service's job is to
+        # populate ``document_number`` + ``identity_number_auto_generated``
+        # consistently across the supported transitions.
+        validated_data = dict(validated_data)
+        next_type = validated_data.get('document_type', patient.document_type)
+        # ``document_number`` may be present-but-blank in the payload
+        # (operator clearing the field) — distinguish that from
+        # "field not in payload at all" so we can preserve the
+        # patient's current number on a partial update that doesn't
+        # touch identity.
+        number_in_payload = 'document_number' in validated_data
+        next_number = (
+            (validated_data.get('document_number') or '').strip()
+            if number_in_payload
+            else patient.document_number
+        )
+
+        if next_type == DocumentType.UNKNOWN:
+            if not next_number:
+                # Auto-generate a fresh placeholder. We do this
+                # whether the patient was previously UNKNOWN with
+                # the old auto-generated number cleared, or
+                # transitioning real → UNKNOWN with the number
+                # cleared. Either way the operator wants a fresh
+                # placeholder.
+                next_number = _generate_with_retry()
+                validated_data['identity_number_auto_generated'] = True
+            else:
+                # Operator supplied a real number alongside UNKNOWN
+                # — they're vouching for it. Flag stays False.
+                validated_data['identity_number_auto_generated'] = False
+        else:
+            # Transitioning to (or staying on) a real type. The
+            # serializer guarantees ``next_number`` is non-empty;
+            # the flag flips to False so the UI stops rendering
+            # the value as a placeholder.
+            validated_data['identity_number_auto_generated'] = False
+
+        validated_data['document_type'] = next_type
+        validated_data['document_number'] = next_number
+
         before = {k: getattr(patient, k) for k in validated_data}
 
         for field, value in validated_data.items():
             setattr(patient, field, value)
-        patient.save(update_fields=list(validated_data.keys()) + ['updated_at'])
+
+        # Same retry-on-collision logic as create. Only fires when
+        # the auto-generator produced the number.
+        for attempt in range(_AUTO_ID_MAX_ATTEMPTS):
+            try:
+                with transaction.atomic():
+                    patient.save(
+                        update_fields=list(validated_data.keys())
+                        + ['updated_at'],
+                    )
+                break
+            except IntegrityError:
+                if (
+                    not validated_data.get('identity_number_auto_generated')
+                    or attempt + 1 == _AUTO_ID_MAX_ATTEMPTS
+                ):
+                    raise
+                patient.document_number = _generate_unknown_identity_number()
+                validated_data['document_number'] = patient.document_number
 
         after = {k: getattr(patient, k) for k in validated_data}
 
@@ -238,6 +423,17 @@ class PatientService:
         # audit lineage stays continuous (no silent identity swap).
         if patient.has_cytova_identity:
             raise AlreadyLinked()
+
+        # Flexible-identity rollout pre-check: a patient flagged
+        # ``date_of_birth_unknown`` cannot be linked because the
+        # global identity-verification service requires an exact
+        # DOB match. Fail closed before burning an identity-
+        # verification attempt that would 100% fail on the DOB
+        # comparison anyway. Distinct error code so the lab UI can
+        # surface the exact recovery path: "update the patient's
+        # DOB first, then link".
+        if patient.date_of_birth_unknown or patient.date_of_birth is None:
+            raise DateOfBirthRequired()
 
         # Identity verification — delegated to the patient_portal
         # module so the matching rules stay in one place. Returns the

@@ -41,7 +41,8 @@ from .serializers import (
     PortalAccountSerializer,
 )
 from .services import (
-    AlreadyLinked, CytovaLinkError, IdentityVerificationFailed,
+    AlreadyLinked, CytovaLinkError, DateOfBirthRequired,
+    IdentityVerificationFailed,
     PatientService,
 )
 
@@ -163,9 +164,15 @@ class PatientViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet):
             identity_serializer.is_valid(raise_exception=True)
             identity_data = dict(identity_serializer.validated_data)
 
-        # Validate normal fields
+        # Validate normal fields. Pass the patient via context so
+        # the DOB Case C/D cross-field validator can read the
+        # current ``date_of_birth`` / ``date_of_birth_unknown``
+        # when the partial update touches only one of them.
         normal_data_input = {k: v for k, v in request.data.items() if k not in identity_fields}
-        normal_serializer = PatientUpdateSerializer(data=normal_data_input, partial=True)
+        normal_serializer = PatientUpdateSerializer(
+            data=normal_data_input, partial=True,
+            context={'patient': patient},
+        )
         normal_serializer.is_valid(raise_exception=True)
         normal_data = dict(normal_serializer.validated_data)
 

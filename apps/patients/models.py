@@ -33,6 +33,14 @@ class DocumentType(models.TextChoices):
     CIP = 'CIP', 'CIP'
     RESIDENCE_PERMIT = 'RESIDENCE_PERMIT', 'Residence Permit'
     OTHER = 'OTHER', 'Other'
+    # Explicit "no document on file" marker. When the operator picks
+    # UNKNOWN and leaves the number blank, the service auto-generates
+    # a technical identifier (``AUTO-PT-YYYYMMDD-XXXXXX``) and stamps
+    # ``identity_number_auto_generated=True`` so the UI can
+    # distinguish a real ID from a placeholder. Distinct from
+    # ``OTHER`` (which still expects a real-but-uncategorised
+    # number).
+    UNKNOWN = 'UNKNOWN', 'Unknown / not provided'
 
 
 class Patient(BaseModel):
@@ -47,10 +55,34 @@ class Patient(BaseModel):
         default=DocumentType.NATIONAL_ID_CARD,
     )
     document_number = models.CharField(max_length=100, db_index=True)
+    identity_number_auto_generated = models.BooleanField(
+        default=False,
+        help_text='True when ``document_number`` was auto-generated '
+                  'by the service (typically because the operator '
+                  'picked ``DocumentType.UNKNOWN`` and left the number '
+                  'blank). The UI uses this to render the value as a '
+                  'placeholder rather than a real ID — surfacing it as '
+                  'a real ID would mislead downstream operators and '
+                  'patients about the document\'s provenance.',
+    )
 
     first_name = models.CharField(max_length=100)
     last_name = models.CharField(max_length=100)
-    date_of_birth = models.DateField()
+    # ``date_of_birth`` was historically NOT NULL. The
+    # flexible-identity rollout relaxes this to allow patients
+    # whose DOB the lab simply doesn't have on file (typically
+    # samples received from partners with incomplete metadata).
+    # Pair it with ``date_of_birth_unknown`` so the UI can
+    # distinguish "missing" from "0000-00-00" or sentinel dates;
+    # validators refuse a null DOB unless the flag is explicitly
+    # set, so a forgotten field cannot land null by accident.
+    date_of_birth = models.DateField(null=True, blank=True)
+    date_of_birth_unknown = models.BooleanField(
+        default=False,
+        help_text='True when the lab confirms the DOB is unavailable. '
+                  'When true, ``date_of_birth`` may be null. When false, '
+                  'validators require ``date_of_birth`` to be set.',
+    )
     gender = models.CharField(max_length=10, choices=Gender.choices)
     nationality = models.CharField(max_length=100, blank=True, default='')
 

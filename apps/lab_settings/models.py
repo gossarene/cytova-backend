@@ -9,9 +9,38 @@ One ``LabSettings`` row exists per tenant schema. A get-or-create helper
 returns the current row on first access so the app never has to check
 for existence at call sites.
 """
+from django.core.validators import MinValueValidator
 from django.db import models
 
 from common.models import BaseModel
+
+
+class LabelNumberingMode(models.TextChoices):
+    """How a request's labels share (or not) a numeric label code.
+
+    - ``PER_FAMILY`` — every label gets its own freshly-allocated
+      numeric code from the tenant sequence. This is the historical
+      behaviour and stays the default.
+    - ``SAME_REQUEST_NUMBER`` — one numeric code is allocated per
+      request and reused for every label in the batch. Useful when
+      operators want a single visible identifier across all tubes
+      from one request, with the family disambiguating them.
+    """
+    PER_FAMILY = 'PER_FAMILY', 'Per family'
+    SAME_REQUEST_NUMBER = 'SAME_REQUEST_NUMBER', 'Same request number'
+
+
+class LabelSequenceResetPeriod(models.TextChoices):
+    """How often the tenant's label sequence counter resets.
+
+    - ``MONTHLY`` — historical behaviour, sequence resets at the
+      first of every month. Period key is ``YYYY-MM``.
+    - ``YEARLY`` — sequence resets at the first of every year.
+      Period key is ``YYYY``. Useful for labs with low monthly
+      throughput that prefer one continuous number line per year.
+    """
+    MONTHLY = 'MONTHLY', 'Monthly'
+    YEARLY = 'YEARLY', 'Yearly'
 
 
 class LabSettings(BaseModel):
@@ -125,6 +154,83 @@ class LabSettings(BaseModel):
                   'patient portal (Notify Cytova). When disabled, the '
                   'endpoint refuses with CYTOVA_CHANNEL_DISABLED and the '
                   'lab UI hides the channel.',
+    )
+
+    # -- Patient notification email templates (Phase 1 of the
+    #    customisable-templates rollout) --
+    #
+    # Both fields are operator-customisable copy that the patient-
+    # result-ready email service renders via
+    # ``common.email.safe_template.render_safe_notification_template``
+    # at send time. The renderer recognises only the four placeholders
+    # listed in ``PATIENT_NOTIFICATION_ALLOWED_VARS``; the serializer
+    # validator refuses to save any template that references anything
+    # else. That two-layer guarantee is the load-bearing safety
+    # property — operators cannot smuggle medical content into a
+    # patient email no matter what they paste into the field.
+    #
+    # The defaults reproduce today's hard-coded copy verbatim, so
+    # tenants that touch nothing experience zero behavioural drift
+    # when Phase 2 wires the templates into the email service.
+    patient_result_email_subject_template = models.CharField(
+        max_length=200,
+        blank=True,
+        default='Your lab result is ready',
+        help_text='Subject line of the patient result-ready email. '
+                  'Allowed variables: {{ patient_first_name }}, '
+                  '{{ lab_name }}, {{ result_link }}, '
+                  '{{ request_reference }}.',
+    )
+    patient_result_email_body_template = models.TextField(
+        blank=True,
+        default=(
+            'Hello {{ patient_first_name }},\n\n'
+            'Your lab result is ready. You can access it securely '
+            'using the link below:\n\n'
+            '{{ result_link }}\n\n'
+            'For your privacy, please do not share this link.'
+        ),
+        help_text='Body of the patient result-ready email. Same '
+                  'allowed variables as the subject. Operators MUST '
+                  'NOT include medical content (result values, '
+                  'diagnosis, exam names) — the validator refuses '
+                  'any template referencing forbidden placeholders.',
+    )
+
+    # -- Label generation behaviour --
+    # New in Phase 1 of the flexible-labels rollout. Defaults are
+    # chosen to preserve the pre-rollout behaviour exactly:
+    #   - ``label_numbering_mode = PER_FAMILY``  → one fresh numeric
+    #     code per label, identical to today's allocator loop.
+    #   - ``extra_label_count = 2``             → matches the
+    #     hard-coded ``EXTRA_LABELS_BONUS = 2`` constant the label
+    #     service has used since launch.
+    #   - ``label_sequence_reset_period = MONTHLY`` → the
+    #     ``LabelSequence`` model is currently keyed on ``(year,
+    #     month)``, which is monthly reset by definition.
+    # The label generation service does NOT yet read these fields —
+    # Phases 2-4 wire them up. Surfacing them here first lets the
+    # admin UI render the controls and lets ops review per-tenant
+    # values via the read serializer ahead of the behaviour change.
+    label_numbering_mode = models.CharField(
+        max_length=24, choices=LabelNumberingMode.choices,
+        default=LabelNumberingMode.PER_FAMILY,
+        help_text='How a request\'s labels share (or not) a numeric '
+                  'label code. Defaults to PER_FAMILY (current '
+                  'behaviour).',
+    )
+    extra_label_count = models.PositiveSmallIntegerField(
+        default=2,
+        validators=[MinValueValidator(0)],
+        help_text='Number of extra labels appended to every batch on '
+                  'top of the per-family labels. Default 2 preserves '
+                  'the pre-rollout behaviour; set to 0 to disable.',
+    )
+    label_sequence_reset_period = models.CharField(
+        max_length=10, choices=LabelSequenceResetPeriod.choices,
+        default=LabelSequenceResetPeriod.MONTHLY,
+        help_text='How often the tenant\'s label sequence counter '
+                  'resets. Defaults to MONTHLY (current behaviour).',
     )
 
     # -- Billing --

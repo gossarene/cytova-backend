@@ -21,8 +21,10 @@ class PatientListSerializer(serializers.ModelSerializer):
         model = Patient
         fields = [
             'id', 'document_type', 'document_number',
+            'identity_number_auto_generated',
             'first_name', 'last_name', 'full_name',
-            'date_of_birth', 'gender', 'nationality',
+            'date_of_birth', 'date_of_birth_unknown',
+            'gender', 'nationality',
             'is_active', 'has_portal_account', 'created_at',
         ]
 
@@ -69,8 +71,13 @@ class PatientDetailSerializer(serializers.ModelSerializer):
         model = Patient
         fields = [
             'id', 'document_type', 'document_number',
+            # Flexible-identity rollout — surfaced read-only so the
+            # UI can render a placeholder badge instead of treating
+            # an auto-generated number as a real ID.
+            'identity_number_auto_generated',
             'first_name', 'last_name', 'full_name',
-            'date_of_birth', 'gender', 'nationality',
+            'date_of_birth', 'date_of_birth_unknown',
+            'gender', 'nationality',
             'phone', 'email', 'city_of_residence', 'address',
             'insurance_number',
             'is_active', 'portal_account',
@@ -111,11 +118,41 @@ class PatientDetailSerializer(serializers.ModelSerializer):
 
 
 class PatientCreateSerializer(serializers.Serializer):
+    """Patient creation input.
+
+    Flexible-identity rollout (rules from the spec):
+
+      - **Case A** ``document_type=UNKNOWN`` → ``document_number``
+        is optional. The service auto-generates an ``AUTO-PT-…``
+        identifier and stamps ``identity_number_auto_generated``
+        when the operator leaves it blank.
+      - **Case B** ``document_type != UNKNOWN`` → ``document_number``
+        is required. Operator vouches for a real document number.
+      - **Case C** ``date_of_birth_unknown=True`` → ``date_of_birth``
+        is optional / nullable. The serializer accepts a missing
+        DOB only when this explicit flag is set, so a forgotten
+        date-picker can never silently land null.
+      - **Case D** ``date_of_birth_unknown=False`` →
+        ``date_of_birth`` is required.
+
+    Both flags + the auto-generated marker stay invisible on the
+    *input* side (operator never sets ``identity_number_auto_generated``;
+    the service decides). On the *output* side the detail
+    serializer surfaces them so the UI can render appropriate
+    placeholders.
+    """
     document_type = serializers.ChoiceField(choices=DocumentType.choices)
-    document_number = serializers.CharField(max_length=100)
+    # Case A relaxation: allow blank when type is UNKNOWN. Cross-
+    # field validation enforces that Case B still requires a value.
+    document_number = serializers.CharField(
+        max_length=100, required=False, allow_blank=True, default='',
+    )
     first_name = serializers.CharField(max_length=100)
     last_name = serializers.CharField(max_length=100)
-    date_of_birth = serializers.DateField()
+    # Case C/D relaxation: nullable on the wire. The validator
+    # below enforces that Case D still requires the field.
+    date_of_birth = serializers.DateField(required=False, allow_null=True)
+    date_of_birth_unknown = serializers.BooleanField(required=False, default=False)
     gender = serializers.ChoiceField(choices=Gender.choices)
     nationality = serializers.CharField(max_length=100, required=False, allow_blank=True, default='')
     phone = serializers.CharField(max_length=30, required=False, allow_blank=True, default='')
@@ -125,13 +162,53 @@ class PatientCreateSerializer(serializers.Serializer):
     insurance_number = serializers.CharField(max_length=100, required=False, allow_blank=True, default='')
 
     def validate(self, attrs):
-        # BR-P1: document_type + document_number unique within tenant
         doc_type = attrs.get('document_type')
-        doc_number = attrs.get('document_number')
-        if Patient.objects.filter(document_type=doc_type, document_number=doc_number).exists():
+        doc_number = (attrs.get('document_number') or '').strip()
+        dob = attrs.get('date_of_birth')
+        dob_unknown = attrs.get('date_of_birth_unknown', False)
+
+        # Case B: real document type → number required.
+        if doc_type != DocumentType.UNKNOWN and not doc_number:
             raise serializers.ValidationError({
-                'document_number': 'A patient with this document type and number already exists in this laboratory.'
+                'document_number': (
+                    'Identity number is required for this document '
+                    'type. Pick "Unknown / not provided" if no '
+                    'document is available.'
+                ),
             })
+
+        # Case D: DOB required unless explicitly flagged unknown.
+        if not dob_unknown and dob is None:
+            raise serializers.ValidationError({
+                'date_of_birth': (
+                    'Date of birth is required. Set '
+                    '"date_of_birth_unknown" to true if the DOB is '
+                    'genuinely not on file.'
+                ),
+            })
+
+        # Case A consistency: an unknown DOB explicitly stored as
+        # ``date_of_birth_unknown=True`` MUST clear the date field
+        # too — keeping a date alongside the unknown flag would let
+        # downstream code make decisions on stale data.
+        if dob_unknown and dob is not None:
+            attrs['date_of_birth'] = None
+
+        # BR-P1: document_type + document_number unique within
+        # tenant. Skipped for UNKNOWN-with-blank-number because the
+        # service will generate a fresh number that's checked at
+        # insert time via the DB unique constraint.
+        if doc_number:
+            if Patient.objects.filter(
+                document_type=doc_type, document_number=doc_number,
+            ).exists():
+                raise serializers.ValidationError({
+                    'document_number': (
+                        'A patient with this document type and number '
+                        'already exists in this laboratory.'
+                    ),
+                })
+
         return attrs
 
 
@@ -140,10 +217,16 @@ class PatientUpdateSerializer(serializers.Serializer):
     Partial update for normal patient fields.
     Identity fields (document_type, document_number) are NOT accepted here —
     they require patients.update_identity and use PatientIdentityUpdateSerializer.
+
+    DOB fields ARE accepted here because flipping
+    ``date_of_birth_unknown`` is a normal data-entry correction
+    (operator located the DOB after initial intake) and doesn't
+    require the elevated identity permission.
     """
     first_name = serializers.CharField(max_length=100, required=False)
     last_name = serializers.CharField(max_length=100, required=False)
-    date_of_birth = serializers.DateField(required=False)
+    date_of_birth = serializers.DateField(required=False, allow_null=True)
+    date_of_birth_unknown = serializers.BooleanField(required=False)
     gender = serializers.ChoiceField(choices=Gender.choices, required=False)
     nationality = serializers.CharField(max_length=100, required=False, allow_blank=True)
     phone = serializers.CharField(max_length=30, required=False, allow_blank=True)
@@ -152,29 +235,114 @@ class PatientUpdateSerializer(serializers.Serializer):
     address = serializers.CharField(required=False, allow_blank=True)
     insurance_number = serializers.CharField(max_length=100, required=False, allow_blank=True)
 
+    def validate(self, attrs):
+        # Case C/D enforcement on partial updates. We only check
+        # when EITHER ``date_of_birth`` or ``date_of_birth_unknown``
+        # is in the payload — a partial update that doesn't touch
+        # DOB at all leaves the existing values alone.
+        patient = self.context.get('patient')
+        if 'date_of_birth' in attrs or 'date_of_birth_unknown' in attrs:
+            dob = attrs.get(
+                'date_of_birth',
+                getattr(patient, 'date_of_birth', None) if patient else None,
+            )
+            dob_unknown = attrs.get(
+                'date_of_birth_unknown',
+                getattr(patient, 'date_of_birth_unknown', False) if patient else False,
+            )
+            if not dob_unknown and dob is None:
+                raise serializers.ValidationError({
+                    'date_of_birth': (
+                        'Date of birth is required. Set '
+                        '"date_of_birth_unknown" to true if the DOB '
+                        'is genuinely not on file.'
+                    ),
+                })
+            # Same Case A consistency rule as create — clear the
+            # date field when the operator flips the flag on.
+            if dob_unknown and dob is not None:
+                attrs['date_of_birth'] = None
+        return attrs
+
 
 class PatientIdentityUpdateSerializer(serializers.Serializer):
     """
     Update identity fields only. Requires patients.update_identity permission.
     Validates uniqueness of the new document_type + document_number pair.
+
+    Type-transition rules (rollout spec §1):
+
+      - ``UNKNOWN → real type`` requires ``document_number`` to be
+        present in the payload (or already on the patient row).
+        The service flips ``identity_number_auto_generated=False``.
+      - ``real → UNKNOWN`` accepts an empty number; the service
+        auto-generates a placeholder and sets the flag to True.
+      - Same-type updates behave exactly as before.
     """
     document_type = serializers.ChoiceField(choices=DocumentType.choices, required=False)
-    document_number = serializers.CharField(max_length=100, required=False)
+    document_number = serializers.CharField(
+        max_length=100, required=False, allow_blank=True,
+    )
 
     def validate(self, attrs):
         if not attrs:
             return attrs
-        # If either field is being changed, check uniqueness of the resulting pair
         patient = self.context.get('patient')
-        doc_type = attrs.get('document_type', patient.document_type if patient else None)
-        doc_number = attrs.get('document_number', patient.document_number if patient else None)
-        qs = Patient.objects.filter(document_type=doc_type, document_number=doc_number)
-        if patient:
-            qs = qs.exclude(pk=patient.pk)
-        if qs.exists():
+        # Resolve the EFFECTIVE type + number after this update —
+        # absent fields fall back to the patient's current values.
+        doc_type = attrs.get(
+            'document_type',
+            patient.document_type if patient else None,
+        )
+        # ``document_number`` may be present-but-blank (operator
+        # clearing the field). Distinguish that from "field absent
+        # from payload" so we know whether to fall back to the
+        # patient's current value.
+        #
+        # Special case: UNKNOWN → real type. The patient's current
+        # ``document_number`` is an auto-generated ``AUTO-PT-…``
+        # placeholder, not a real identifier. Inheriting it would
+        # smuggle the placeholder into a real-type row. Force the
+        # operator to supply a real number explicitly.
+        if 'document_number' in attrs:
+            doc_number = (attrs.get('document_number') or '').strip()
+        elif (
+            patient is not None
+            and patient.identity_number_auto_generated
+            and doc_type != DocumentType.UNKNOWN
+        ):
+            doc_number = ''
+        else:
+            doc_number = patient.document_number if patient else ''
+
+        # UNKNOWN → real type without a number → reject.
+        # The service can't auto-generate against a real type — that
+        # would be misleading.
+        if doc_type != DocumentType.UNKNOWN and not doc_number:
             raise serializers.ValidationError({
-                'document_number': 'A patient with this document type and number already exists in this laboratory.'
+                'document_number': (
+                    'Identity number is required for this document '
+                    'type. Pick "Unknown / not provided" if no '
+                    'document is available.'
+                ),
             })
+
+        # Within-tenant uniqueness check. Skip when the resulting
+        # number would be empty (UNKNOWN + blank — service will
+        # generate a fresh value).
+        if doc_number:
+            qs = Patient.objects.filter(
+                document_type=doc_type, document_number=doc_number,
+            )
+            if patient:
+                qs = qs.exclude(pk=patient.pk)
+            if qs.exists():
+                raise serializers.ValidationError({
+                    'document_number': (
+                        'A patient with this document type and number '
+                        'already exists in this laboratory.'
+                    ),
+                })
         return attrs
 
 
