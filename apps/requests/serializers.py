@@ -635,6 +635,15 @@ class RequestLabelBatchSerializer(serializers.ModelSerializer):
     generated_by_email = serializers.CharField(
         source='generated_by.email', read_only=True, default=None,
     )
+    # Download tracking — drives the frontend's "Mark Collected" gate.
+    # ``has_been_downloaded`` is the canonical flag the UI branches on
+    # (matches the backend gate's rule); ``download_count`` and
+    # ``downloaded_at`` are surfaced for operator-facing display
+    # ("downloaded 3 times" / "first downloaded on …").
+    has_been_downloaded = serializers.BooleanField(read_only=True)
+    downloaded_by_email = serializers.CharField(
+        source='downloaded_by.email', read_only=True, default=None,
+    )
 
     class Meta:
         model = RequestLabelBatch
@@ -647,6 +656,10 @@ class RequestLabelBatchSerializer(serializers.ModelSerializer):
             'generated_by_email',
             'pdf_url',
             'labels',
+            'has_been_downloaded',
+            'download_count',
+            'downloaded_at',
+            'downloaded_by_email',
         ]
 
     def get_pdf_url(self, obj):

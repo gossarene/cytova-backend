@@ -533,6 +533,48 @@ class RequestLabelBatch(BaseModel):
         help_text='Internal storage key for the rendered PDF. Never exposed to clients as-is.',
     )
 
+    # ---- Download tracking ------------------------------------------
+    # Collection (mark-collected) requires labels to have been
+    # downloaded at least once. Without this gate a technician could
+    # transition the workflow forward on tubes that nobody has the
+    # printed labels for, breaking the scan-based traceability chain.
+    #
+    # Three fields rather than one boolean:
+    #   - ``downloaded_at``  pin the FIRST download for the audit
+    #     trail (so the timestamp doesn't drift on every re-fetch).
+    #   - ``downloaded_by``  who unblocked collection. SET_NULL so a
+    #     subsequent staff-deletion doesn't break the batch row.
+    #   - ``download_count`` operational signal \u2014 used by the gate
+    #     (``> 0`` means the labels reached the lab). The frontend
+    #     renders a re-download CTA from the same value.
+    #
+    # ``download_count`` is the canonical gate signal because it
+    # survives the (rare) edge case where ``downloaded_at`` was
+    # cleared manually (data migration, GDPR request, etc.). The
+    # rule is "the labels left this server at least once", which
+    # the counter reflects most reliably.
+    downloaded_at = models.DateTimeField(
+        null=True, blank=True, db_index=True,
+        help_text='Timestamp of the FIRST successful PDF download. '
+                  'Stays pinned across re-downloads \u2014 the gate uses '
+                  'download_count for "ever downloaded?" checks; this '
+                  'field is the audit-grade first-touch.',
+    )
+    downloaded_by = models.ForeignKey(
+        'users.StaffUser',
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='first_downloaded_label_batches',
+        help_text='Staff user who first downloaded the PDF. SET_NULL '
+                  'on user deletion so the timestamp survives.',
+    )
+    download_count = models.PositiveIntegerField(
+        default=0,
+        help_text='Total successful PDF downloads. The mark-collected '
+                  'gate refuses when this is 0; > 0 means the labels '
+                  'reached the lab at least once.',
+    )
+
     class Meta:
         verbose_name = 'Request Label Batch'
         verbose_name_plural = 'Request Label Batches'
@@ -540,6 +582,14 @@ class RequestLabelBatch(BaseModel):
 
     def __str__(self):
         return f'{self.analysis_request.request_number} \u2192 {self.label_count} labels'
+
+    @property
+    def has_been_downloaded(self) -> bool:
+        """Single source of truth for the collection gate. Reads
+        ``download_count > 0`` so any future helper that resets the
+        timestamp without touching the counter still gates correctly
+        (and vice versa)."""
+        return self.download_count > 0
 
     def delete(self, *args, **kwargs):
         raise PermissionError(

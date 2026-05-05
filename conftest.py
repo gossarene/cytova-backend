@@ -189,16 +189,65 @@ def make_request():
 
 @pytest.fixture(autouse=True)
 def _auto_generate_labels_on_confirm(request, _test_tenant_schema, db, monkeypatch):
-    # Tests that explicitly manage label generation (``apps/requests/tests/
-    # test_labels.py`` and the dedicated collection-enforcement suite) opt
-    # out by declaring ``pytestmark = pytest.mark.no_auto_labels`` at module
-    # level — see those files.
-    if request.node.get_closest_marker('no_auto_labels'):
-        yield
-        return
+    # Two markers, intentionally split so a test can opt out of the
+    # auto-generate behaviour without losing the auto-download
+    # stamp (which is what un-blocks ``mark_collected``):
+    #
+    #   no_auto_labels         — disables BOTH auto-generation and
+    #                            the auto-download wrap. Use when the
+    #                            test exercises the un-downloaded
+    #                            state directly (e.g. download-gate
+    #                            tests, label-numbering tests where
+    #                            no batch should exist yet).
+    #   no_auto_label_download — disables ONLY the auto-download
+    #                            wrap. Use when the test needs to
+    #                            assert that ``download_count == 0``
+    #                            on a freshly-generated batch.
+    #
+    # The split lets the ~19 legacy files that opt out of
+    # auto-generation keep working without each having to add a
+    # download call after every ``generate_or_get``.
+    skip_all = request.node.get_closest_marker('no_auto_labels') is not None
+    # Independent of ``skip_all`` — a test can opt out of auto-
+    # generation while still benefiting from the auto-download
+    # stamp on its own ``generate_or_get`` calls. Tests that need
+    # ``download_count == 0`` to be visible (the download-gate
+    # tests) opt out of BOTH markers explicitly.
+    skip_download_wrap = (
+        request.node.get_closest_marker('no_auto_label_download') is not None
+    )
 
     from apps.requests.services import AnalysisRequestService
     from apps.requests.label_service import RequestLabelService
+
+    # ---- generate_or_get wrap (independent of auto-generate-on-create)
+    # Wraps the service entry point so any test that calls
+    # ``RequestLabelService.generate_or_get`` directly — including
+    # tests with ``no_auto_labels`` that drive label generation
+    # themselves — gets the auto-download stamp by default. Tests
+    # that need to assert ``download_count == 0`` opt out via
+    # ``no_auto_label_download``.
+    if not skip_download_wrap:
+        original_generate = RequestLabelService.generate_or_get
+
+        @staticmethod
+        def wrapped_generate(*args, **kwargs):
+            batch = original_generate(*args, **kwargs)
+            if batch is not None:
+                from django.db.models import F
+                from apps.requests.models import RequestLabelBatch
+                RequestLabelBatch.objects.filter(pk=batch.pk).update(
+                    download_count=F('download_count') + 1,
+                )
+            return batch
+
+        monkeypatch.setattr(
+            RequestLabelService, 'generate_or_get', wrapped_generate,
+        )
+
+    if skip_all:
+        yield
+        return
 
     original_create = AnalysisRequestService.create
 
@@ -210,6 +259,10 @@ def _auto_generate_labels_on_confirm(request, _test_tenant_schema, db, monkeypat
             request = kwargs.get('request')
             if created_by is not None and request is not None:
                 try:
+                    # The wrapped ``generate_or_get`` (above) already
+                    # stamps the auto-download, so this call uniformly
+                    # leaves the batch in a "ready for collection"
+                    # state. Don't double-bump here.
                     RequestLabelService.generate_or_get(
                         analysis_request=ar,
                         generated_by=created_by,

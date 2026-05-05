@@ -847,14 +847,37 @@ class AnalysisRequestItemService:
                 f"(current status: {ar.status}).",
             )
 
-        # Traceability gate: collection is only meaningful once a
-        # specimen tube carries a printed label. Blocking here prevents
-        # un-labeled tubes from entering the workflow and keeps
-        # scan-based downstream steps auditable end-to-end.
-        if not RequestLabelBatch.objects.filter(analysis_request=ar).exists():
+        # Traceability gate — two-stage check.
+        #
+        #   1. Labels must EXIST. Without a generated batch the
+        #      operator has no barcoded tubes, so collection has
+        #      nothing to scan against.
+        #   2. The PDF must have been DOWNLOADED at least once.
+        #      Generation alone doesn't put labels on physical
+        #      tubes — the operator has to print them. Without the
+        #      download we'd be marking specimens "collected" on
+        #      tubes that nobody has the labels for, breaking the
+        #      scan-based traceability chain at the next step.
+        #
+        # Both checks raise ``ValidationError`` with the exact
+        # phrasing the frontend's helper text quotes — so the toast
+        # the operator sees on a backend-rejected attempt matches
+        # the inline guidance under the disabled CTA. The two
+        # messages are deliberately distinct so the operator knows
+        # whether the next step is "generate labels" or "download
+        # labels".
+        batch = RequestLabelBatch.objects.filter(
+            analysis_request=ar,
+        ).only('download_count').first()
+        if batch is None:
             raise ValidationError(
                 'Labels must be generated for this request before specimens '
                 'can be marked as collected.'
+            )
+        if batch.download_count == 0:
+            raise ValidationError(
+                'Labels must be downloaded before specimens can be marked '
+                'as collected.'
             )
 
         if item.status != ItemStatus.PENDING:

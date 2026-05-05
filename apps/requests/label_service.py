@@ -213,6 +213,60 @@ def _allocate_numeric_code(
 
 
 # -----------------------------------------------------------------------------
+# Patient-field formatters
+# -----------------------------------------------------------------------------
+#
+# The label printer must NEVER crash on a patient with missing
+# identity / DOB. The flexible-identity rollout made both nullable on
+# the model side; these helpers translate the patient row into the
+# strings a label can safely render. Anti-deception rules:
+#
+#   - Auto-generated ``AUTO-PT-…`` numbers are placeholders, NOT real
+#     IDs. They MUST NOT appear on a printed label, otherwise an
+#     operator scanning the tube could mistake the placeholder for
+#     a real document number.
+#   - A null DOB MUST not crash; the label shows "Not provided"
+#     instead, matching the on-screen detail page wording.
+
+_NOT_PROVIDED = 'Not provided'
+
+
+def format_patient_dob_for_label(patient) -> str:
+    """ISO date string of ``patient.date_of_birth`` when set, else
+    a fixed "Not provided" sentinel. The flexible-identity rollout
+    means either ``date_of_birth`` is null OR
+    ``date_of_birth_unknown`` is true (the two should coincide; we
+    treat either signal as "no DOB on file" defensively)."""
+    if patient.date_of_birth_unknown or patient.date_of_birth is None:
+        return _NOT_PROVIDED
+    return patient.date_of_birth.isoformat()
+
+
+def format_patient_identity_for_label(patient) -> str:
+    """Identity string suitable for printing on a label.
+
+    Returns the operator-supplied document number for real types.
+    Returns "Not provided" for ``UNKNOWN`` / auto-generated rows so
+    the ``AUTO-PT-…`` placeholder never reaches paper. Empty real
+    numbers (the lab booked the patient with a real type but no
+    number on file — pre-rollout legacy data) also surface as "Not
+    provided" so the contract is uniform.
+
+    Currently the renderer doesn't print this line, but exposing
+    the helper keeps the safety property in one place: any future
+    layout that opts to surface the document number can call this
+    helper and inherit the anti-leak guarantee for free."""
+    from apps.patients.models import DocumentType
+    if (
+        patient.identity_number_auto_generated
+        or patient.document_type == DocumentType.UNKNOWN
+        or not patient.document_number
+    ):
+        return _NOT_PROVIDED
+    return patient.document_number
+
+
+# -----------------------------------------------------------------------------
 # Payload builder
 # -----------------------------------------------------------------------------
 
@@ -223,11 +277,12 @@ def _build_payloads(
     patient = request.patient
     collection = (request.confirmed_at or batch.generated_at).date()
     labels = list(batch.labels.order_by('label_index'))
+    patient_dob = format_patient_dob_for_label(patient)
     return [
         LabelPayload(
             numeric_code=label.barcode_value,
             patient_name=patient.full_name,
-            patient_dob=patient.date_of_birth.isoformat(),
+            patient_dob=patient_dob,
             collection_date=collection.isoformat(),
             request_number=request.request_number,
             family_name=label.family_name,

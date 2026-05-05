@@ -642,8 +642,20 @@ class TestLabelsDownload:
 class TestLabelDownloadAfterCollection:
 
     def _generate_labels(self, admin_client, ar):
+        """Generate the batch AND issue the now-required first
+        download. The download-gating rule (added with the
+        flexible-identity rollout's download tracking) refuses
+        ``mark_collected`` until the labels left the server at
+        least once. Every test in this class generates labels then
+        marks collected, so the helper bundles both steps."""
         resp = admin_client.post(f'{API}/{ar.id}/labels/')
         assert resp.status_code == 200
+        # First download — bumps download_count to 1, unblocks the
+        # mark-collected gate. We use admin_client here because the
+        # admin role can always download; per-role download gating
+        # is exercised by the dedicated permission tests.
+        dl = admin_client.get(f'{API}/{ar.id}/labels/download/')
+        assert dl.status_code == 200
         return _data(resp)
 
     def test_partial_collection_allows_download(

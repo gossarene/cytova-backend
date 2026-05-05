@@ -11,7 +11,9 @@ AnalysisRequestItemViewSet  (nested under requests)
 import logging
 
 from django.core.files.storage import default_storage
+from django.db.models import F
 from django.http import FileResponse
+from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters, status
 from rest_framework.decorators import action
@@ -454,6 +456,57 @@ class AnalysisRequestViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet)
                 raise PermissionDenied(
                     'Labels cannot be downloaded after all specimens are collected.'
                 )
+
+        # Stamp the download BEFORE streaming the file. Two
+        # operations:
+        #
+        #   1. Always increment ``download_count`` via an
+        #      F-expression so concurrent downloads can't lose
+        #      counts. The counter is the canonical "ever
+        #      downloaded?" signal the mark-collected gate reads.
+        #   2. First-touch wins via a conditional UPDATE on
+        #      ``downloaded_at IS NULL`` — the row count tells us
+        #      whether THIS request was the first-touch winner.
+        #      That avoids a TOCTOU race where two concurrent
+        #      downloads would both think they're first.
+        #
+        # We stamp BEFORE returning the FileResponse so the gate
+        # state is correct the moment the byte stream starts. Even
+        # if the client aborts the download mid-stream, the labels
+        # left this server (the bytes are on the wire), so the gate
+        # should consider them downloaded.
+        from .models import RequestLabelBatch
+        RequestLabelBatch.objects.filter(pk=batch.pk).update(
+            download_count=F('download_count') + 1,
+        )
+        first_touch = RequestLabelBatch.objects.filter(
+            pk=batch.pk, downloaded_at__isnull=True,
+        ).update(
+            downloaded_at=timezone.now(),
+            downloaded_by=request.user,
+        )
+        if first_touch:
+            # Single audit row on the first download — subsequent
+            # re-downloads only bump the counter. Re-downloading is
+            # routine (operator reprints) and doesn't merit fresh
+            # audit noise; the first-touch is the security-meaningful
+            # event ("the labels left the lab's server").
+            AuditLog.objects.create(
+                actor_type=ActorType.STAFF_USER,
+                actor_id=request.user.id,
+                actor_email=request.user.email,
+                action=AuditAction.VIEW,
+                entity_type='RequestLabelBatch',
+                entity_id=batch.id,
+                diff={'after': {
+                    'event': 'labels_first_downloaded',
+                    'request_number': ar.request_number,
+                    'analysis_request_id': str(ar.id),
+                    'label_count': batch.label_count,
+                }},
+                ip_address=getattr(request, 'audit_ip', None),
+                user_agent=getattr(request, 'audit_user_agent', ''),
+            )
 
         file_obj = default_storage.open(batch.pdf_file_key, 'rb')
         return FileResponse(
