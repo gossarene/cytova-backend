@@ -43,6 +43,13 @@ SHARED_APPS = [
     # schema once justified by traffic / isolation requirements.
     'apps.patient_portal',
 
+    # Platform admin back-office identity (core.cytova.io). Public
+    # schema only — must NOT appear in TENANT_APPS or platform-admin
+    # rows would propagate into every lab tenant. See
+    # ``apps/platform_admin/__init__.py`` for the architecture
+    # rationale.
+    'apps.platform_admin',
+
     # Standard Django shared apps
     'django.contrib.contenttypes',
     'django.contrib.auth',

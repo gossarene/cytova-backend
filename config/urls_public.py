@@ -19,6 +19,13 @@ urlpatterns = [
     # Platform admin + public onboarding (mounted in apps.tenants.urls)
     path('api/v1/platform/', include('apps.tenants.urls')),
 
+    # Platform-admin back-office identity (auth/login + auth/me).
+    # Distinct mount point from the legacy ``/api/v1/platform/auth/``
+    # so the new auth surface coexists with the older tenant-CRUD
+    # surface during the foundation phase. Public schema only —
+    # explicitly NOT included in the tenant URL conf.
+    path('api/v1/platform-admin/', include('apps.platform_admin.urls')),
+
     # Global Cytova patient signup (PatientAccount/Profile/Consent live in
     # the public schema). Same routes are also mounted on the tenant URL
     # conf — see ``config/urls.py`` — so the endpoint is reachable from
