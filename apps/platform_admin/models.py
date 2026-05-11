@@ -221,6 +221,18 @@ class PlatformAuditAction(models.TextChoices):
     PLATFORM_DASHBOARD_VIEWED = (
         'PLATFORM_DASHBOARD_VIEWED', 'Platform Dashboard Viewed',
     )
+    PLATFORM_ADMIN_CREATED = (
+        'PLATFORM_ADMIN_CREATED', 'Platform Admin Created',
+    )
+    PLATFORM_ADMIN_DEACTIVATED = (
+        'PLATFORM_ADMIN_DEACTIVATED', 'Platform Admin Deactivated',
+    )
+    PLATFORM_ADMIN_REACTIVATED = (
+        'PLATFORM_ADMIN_REACTIVATED', 'Platform Admin Reactivated',
+    )
+    PLATFORM_ADMIN_ROLE_CHANGED = (
+        'PLATFORM_ADMIN_ROLE_CHANGED', 'Platform Admin Role Changed',
+    )
 
 
 class PlatformAdminAuditLog(models.Model):

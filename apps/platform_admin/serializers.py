@@ -14,6 +14,67 @@ class PlatformAdminLoginSerializer(serializers.Serializer):
     password = serializers.CharField(write_only=True)
 
 
+class PlatformAdminTeamMemberSerializer(serializers.ModelSerializer):
+    """Read shape for ``/team/`` list + detail + action responses.
+
+    Mirrors ``PlatformAdminProfileSerializer`` but is the canonical
+    name used by the team API surface. Kept distinct so a future
+    profile-only fields change (e.g. preferences) doesn't churn the
+    team list contract.
+    """
+    full_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PlatformAdminUser
+        fields = [
+            'id', 'email', 'first_name', 'last_name', 'full_name',
+            'role', 'is_active', 'last_login',
+            'created_at', 'updated_at',
+        ]
+        read_only_fields = fields
+
+    def get_full_name(self, obj) -> str:
+        return obj.full_name
+
+
+class PlatformAdminTeamCreateSerializer(serializers.Serializer):
+    """Input for ``POST /team/``."""
+    # Match django-tenants email handling — case-insensitive uniqueness
+    # is enforced in the service. Validation here just normalises.
+    email = serializers.EmailField()
+    first_name = serializers.CharField(
+        max_length=100, required=False, allow_blank=True, default='',
+    )
+    last_name = serializers.CharField(
+        max_length=100, required=False, allow_blank=True, default='',
+    )
+    role = serializers.ChoiceField(
+        # Sourced lazily so a new role added to the enum is picked up
+        # without a re-import. Each ``ChoiceField`` instance freezes the
+        # choices at definition time, but that's fine — the import sits
+        # at module top-level so any value change requires a restart
+        # anyway.
+        choices=[],
+    )
+
+    def __init__(self, *args, **kwargs):
+        # ``ChoiceField.choices`` can't reference an import that isn't
+        # in scope at class-body evaluation order. Wire it up here.
+        super().__init__(*args, **kwargs)
+        from .models import PlatformAdminRole
+        self.fields['role'].choices = PlatformAdminRole.choices
+
+
+class PlatformAdminTeamChangeRoleSerializer(serializers.Serializer):
+    """Input for ``POST /team/{id}/change-role/``."""
+    role = serializers.ChoiceField(choices=[])
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        from .models import PlatformAdminRole
+        self.fields['role'].choices = PlatformAdminRole.choices
+
+
 class PlatformAdminProfileSerializer(serializers.ModelSerializer):
     """Read-only profile shape returned by ``/auth/me/``.
 

@@ -12,6 +12,12 @@ The full paths are:
   POST /api/v1/platform-admin/patients/{id}/deactivate/
   POST /api/v1/platform-admin/patients/{id}/reactivate/
   GET  /api/v1/platform-admin/dashboard/
+  GET  /api/v1/platform-admin/team/
+  GET  /api/v1/platform-admin/team/{id}/
+  POST /api/v1/platform-admin/team/
+  POST /api/v1/platform-admin/team/{id}/deactivate/
+  POST /api/v1/platform-admin/team/{id}/reactivate/
+  POST /api/v1/platform-admin/team/{id}/change-role/
 
 The mount happens only on the public-schema URL conf so the routes
 literally do not exist on tenant subdomains. Lab staff hitting
@@ -23,6 +29,7 @@ from rest_framework.routers import DefaultRouter
 
 from .dashboard_views import PlatformDashboardView
 from .patient_views import PlatformPatientAccountViewSet
+from .team_views import PlatformAdminTeamViewSet
 from .tenant_views import PlatformTenantViewSet
 from .views import PlatformAdminLoginView, PlatformAdminMeView
 
@@ -31,6 +38,9 @@ router = DefaultRouter(trailing_slash=True)
 router.register('tenants', PlatformTenantViewSet, basename='platform-admin-tenants')
 router.register(
     'patients', PlatformPatientAccountViewSet, basename='platform-admin-patients',
+)
+router.register(
+    'team', PlatformAdminTeamViewSet, basename='platform-admin-team',
 )
 
 
