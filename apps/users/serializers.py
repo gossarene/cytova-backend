@@ -29,6 +29,11 @@ class StaffUserDetailSerializer(serializers.ModelSerializer):
             'id', 'email', 'title', 'first_name', 'last_name',
             'full_name', 'display_name', 'professional_display_name',
             'role', 'is_active', 'has_signature',
+            # Per-user opt-in for internal-workflow emails. The
+            # LAB_ADMIN can flip these on the staff-user edit page;
+            # see ``StaffUserUpdateSerializer``.
+            'receive_review_ready_notifications',
+            'receive_result_rejection_notifications',
             'created_by', 'created_at', 'updated_at',
         ]
 
@@ -68,6 +73,13 @@ class StaffUserCreateSerializer(serializers.Serializer):
         min_length=8,
         style={'input_type': 'password'},
     )
+    # Optional opt-ins for the two internal-workflow email channels.
+    # When omitted, the ``StaffUserManager.create_user`` smart-default
+    # mapping kicks in (BIOLOGIST/LAB_ADMIN → review-ready,
+    # TECHNICIAN → rejection). When the caller passes an explicit
+    # value (True or False), it wins — roles are a suggestion.
+    receive_review_ready_notifications = serializers.BooleanField(required=False)
+    receive_result_rejection_notifications = serializers.BooleanField(required=False)
 
     def validate_email(self, value):
         if StaffUser.objects.filter(email=value).exists():
@@ -80,6 +92,12 @@ class StaffUserUpdateSerializer(serializers.Serializer):
     first_name = serializers.CharField(max_length=100, required=False)
     last_name = serializers.CharField(max_length=100, required=False)
     role = serializers.ChoiceField(choices=Role.choices, required=False)
+    # Per-user notification opt-ins — the LAB_ADMIN can flip these
+    # for any teammate. Permission to call this endpoint is enforced
+    # at the view layer (existing IsLabAdmin guard); the serializer
+    # treats them as plain booleans.
+    receive_review_ready_notifications = serializers.BooleanField(required=False)
+    receive_result_rejection_notifications = serializers.BooleanField(required=False)
 
 
 class MeSerializer(serializers.ModelSerializer):

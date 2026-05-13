@@ -302,6 +302,42 @@ class LabSettings(BaseModel):
     label_show_barcode = models.BooleanField(default=True)
     label_show_numeric_code = models.BooleanField(default=True)
 
+    # -- Internal-workflow notifications -----------------------------------
+    # Three-level kill-switch for the staff-to-staff email surface
+    # (review-ready + rejection emails delivered through
+    # ``apps.internal_notifications``):
+    #
+    #   - The global flag is the master off-switch. When False,
+    #     NO workflow email is sent regardless of per-event flags
+    #     or per-user preferences.
+    #   - The two per-event flags suppress one channel without
+    #     affecting the other (a lab can keep rejection emails on
+    #     while muting review-ready blasts during a busy day).
+    #   - The actual recipient list is filtered by the per-user
+    #     ``StaffUser.receive_*`` flags, so role-based defaults
+    #     are smart suggestions, not the final authority.
+    #
+    # The defaults preserve the prior behaviour: a lab that does
+    # not visit the new settings page keeps receiving the same
+    # emails the role-based resolver delivered before this phase.
+    internal_notifications_enabled = models.BooleanField(
+        default=True,
+        help_text='Master switch for internal-workflow emails '
+                  '(biologist review-ready, technician rejection). '
+                  'When False, no workflow email is sent regardless '
+                  'of the per-event flags below.',
+    )
+    notify_review_ready_enabled = models.BooleanField(
+        default=True,
+        help_text='If False, biologist review-ready emails are '
+                  'suppressed even when the master switch is on.',
+    )
+    notify_result_rejected_enabled = models.BooleanField(
+        default=True,
+        help_text='If False, technician rejection emails are '
+                  'suppressed even when the master switch is on.',
+    )
+
     class Meta:
         verbose_name = 'Lab Settings'
         verbose_name_plural = 'Lab Settings'

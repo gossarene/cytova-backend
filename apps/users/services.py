@@ -26,11 +26,20 @@ class UserService:
         Create a new staff user within the current tenant schema.
         The temporary password is set immediately; the user should change it
         on first login (password-reset flow).
+
+        Routes through ``StaffUser.objects.create_user`` so that role-derived
+        notification defaults are applied when the caller didn't explicitly
+        supply ``receive_review_ready_notifications`` /
+        ``receive_result_rejection_notifications``.
         """
         password = validated_data.pop('password')
-        user = StaffUser(created_by=created_by, **validated_data)
-        user.set_password(password)
-        user.save()
+        email = validated_data.pop('email')
+        user = StaffUser.objects.create_user(
+            email=email,
+            password=password,
+            created_by=created_by,
+            **validated_data,
+        )
 
         AuditLog.objects.create(
             actor_type=ActorType.STAFF_USER,

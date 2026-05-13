@@ -158,6 +158,19 @@ def _create_item_with_traceability(
     if not hasattr(item, '_exam_definition_cache'):
         item.exam_definition = ExamDefinition.objects.get(id=item_data['exam_definition_id'])
 
+    # Catalog-state snapshot: freeze the result structure + active
+    # parameter set as they stood AT ITEM CREATION. A subsequent
+    # structural correction on the exam definition therefore does
+    # NOT leak into in-flight requests — the result-entry services
+    # read these snapshots via ``effective_*`` helpers.
+    item.result_structure_snapshot = item.exam_definition.result_structure
+    item.parameter_ids_snapshot = [
+        str(pid) for pid in
+        item.exam_definition.parameters
+        .filter(is_active=True)
+        .values_list('id', flat=True)
+    ]
+
     manual_billed = item_data.get('billed_price')
     _resolve_item_pricing(item, analysis_request, manual_billed_price=manual_billed)
     item.save()

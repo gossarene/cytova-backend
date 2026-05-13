@@ -77,6 +77,8 @@ TENANT_APPS = [
     'apps.partners',
     'apps.invoicing',
     'apps.financial_reports',  # Read-only simulation surface; no models.
+    'apps.exam_reports',  # Read-only operational pivot reports; no models.
+    'apps.internal_notifications',  # Staff-to-staff workflow emails (review-ready / rejection).
     'apps.alerts',
     'apps.dashboard',
     'apps.audit',

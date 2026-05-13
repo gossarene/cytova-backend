@@ -17,7 +17,8 @@ from apps.audit.models import AuditLog, AuditAction, ActorType
 from apps.users.models import StaffUser
 from .models import (
     ExamCategory, ExamFamily, ExamSubFamily, TubeType, ExamTechnique,
-    ExamDefinition, LabExamSettings, PricingRule, PricingType,
+    ExamDefinition, ExamParameter, LabExamSettings, PricingRule, PricingType,
+    ResultStructure,
 )
 
 logger = logging.getLogger(__name__)
@@ -452,6 +453,193 @@ class ExamDefinitionService:
             entity_type='ExamDefinition',
             entity_id=exam.id,
             diff={'after': {'is_active': False}},
+            ip_address=getattr(request, 'audit_ip', None),
+            user_agent=getattr(request, 'audit_user_agent', ''),
+        )
+
+        return exam
+
+    @staticmethod
+    def change_structure(
+        exam: ExamDefinition,
+        new_structure: str,
+        parameters: list | None,
+        updated_by: StaffUser,
+        request,
+    ) -> ExamDefinition:
+        """
+        Switch ``exam.result_structure`` between SINGLE_VALUE and
+        MULTI_PARAMETER without breaking existing requests.
+
+        Why this method exists
+        ----------------------
+        ``ExamDefinitionUpdateSerializer`` deliberately refuses
+        ``result_structure`` via the normal PATCH path — a silent
+        flip would change how every in-flight item is interpreted
+        at result entry. This method makes the change explicit,
+        validated, and audited; in-flight items are protected
+        upstream by the ``result_structure_snapshot`` /
+        ``parameter_ids_snapshot`` fields on ``AnalysisRequestItem``,
+        which freeze the original structure at item creation time.
+
+        Behaviour
+        ---------
+        SINGLE_VALUE → MULTI_PARAMETER:
+          - Requires ``parameters`` to seed the new structure with
+            at least one row.
+          - Each entry is ``{code, name, unit?, reference_range?,
+            display_order?}``.
+          - The exam-level ``unit`` and ``reference_range`` are
+            cleared (a MULTI_PARAMETER exam doesn't carry them on
+            the parent).
+
+        MULTI_PARAMETER → SINGLE_VALUE:
+          - Existing parameters are NOT deleted. They stay on the
+            row so historical ``ResultValue`` rows that FK them via
+            ``on_delete=PROTECT`` remain readable. The active ones
+            are flipped to ``is_active=False`` so they don't appear
+            in future-item parameter snapshots.
+          - The caller supplies ``unit`` / ``reference_range`` via
+            the standard PATCH for the new SINGLE_VALUE shape.
+
+        Same-structure no-op:
+          - Returns the exam unchanged without writing an audit row.
+
+        Audit
+        -----
+        Writes ONE ``AuditLog`` row with
+        ``entity_type='ExamDefinition'``, ``action=UPDATE``, and a
+        diff that pins the structural change:
+            {
+              'before': {'result_structure': '...'},
+              'after':  {'result_structure': '...'},
+              'structure_change': True,
+              'parameters_added':       N,
+              'parameters_deactivated': N,
+            }
+        No patient data is touched.
+        """
+        if new_structure not in {
+            ResultStructure.SINGLE_VALUE, ResultStructure.MULTI_PARAMETER,
+        }:
+            raise ValidationError({
+                'result_structure': (
+                    f'Unknown result structure {new_structure!r}.'
+                ),
+            })
+
+        if exam.result_structure == new_structure:
+            # No-op — caller passed the current value. Don't write
+            # an audit row for a non-event.
+            return exam
+
+        before_structure = exam.result_structure
+        params_added = 0
+        params_deactivated = 0
+
+        # SINGLE_VALUE → MULTI_PARAMETER
+        if new_structure == ResultStructure.MULTI_PARAMETER:
+            seed = list(parameters or [])
+            # Re-activate previously deactivated parameters that
+            # were on the row before — preserves their ids so any
+            # legacy snapshot pointing at them stays meaningful.
+            existing = list(exam.parameters.all())
+            if not seed and not any(p.is_active for p in existing):
+                # No new parameters supplied AND no existing active
+                # parameters to revive: refuse the transition. A
+                # MULTI_PARAMETER exam with zero parameters can't be
+                # entered.
+                raise ValidationError({
+                    'parameters': (
+                        'At least one parameter is required when '
+                        'switching to MULTI_PARAMETER.'
+                    ),
+                })
+
+            for p in seed:
+                # Idempotent: re-using an existing code on the same
+                # exam reactivates that parameter rather than
+                # rejecting the call (an admin correcting their own
+                # earlier mistake shouldn't have to chase down a
+                # duplicate-code error).
+                code = (p.get('code') or '').strip()
+                if not code:
+                    raise ValidationError({
+                        'parameters': 'Each parameter requires a non-empty code.',
+                    })
+                name = (p.get('name') or '').strip()
+                if not name:
+                    raise ValidationError({
+                        'parameters': 'Each parameter requires a non-empty name.',
+                    })
+
+                match = next(
+                    (e for e in existing if e.code == code), None,
+                )
+                if match is None:
+                    ExamParameter.objects.create(
+                        exam_definition=exam,
+                        code=code, name=name,
+                        unit=p.get('unit', ''),
+                        reference_range=p.get('reference_range', ''),
+                        display_order=p.get('display_order', 0),
+                        is_active=True,
+                    )
+                    params_added += 1
+                else:
+                    # Reactivate + refresh editable fields.
+                    match.name = name
+                    match.unit = p.get('unit', match.unit)
+                    match.reference_range = p.get(
+                        'reference_range', match.reference_range,
+                    )
+                    match.display_order = p.get(
+                        'display_order', match.display_order,
+                    )
+                    if not match.is_active:
+                        match.is_active = True
+                    match.save(update_fields=[
+                        'name', 'unit', 'reference_range',
+                        'display_order', 'is_active', 'updated_at',
+                    ])
+
+            exam.result_structure = ResultStructure.MULTI_PARAMETER
+            exam.unit = ''
+            exam.reference_range = ''
+            exam.save(update_fields=[
+                'result_structure', 'unit', 'reference_range', 'updated_at',
+            ])
+
+        # MULTI_PARAMETER → SINGLE_VALUE
+        else:
+            # Soft-deactivate active parameters — historical
+            # ``ResultValue`` rows continue to reference them via
+            # the PROTECT FK; deletion is intentionally blocked at
+            # the model level so this branch can't accidentally
+            # erase a clinical trail.
+            for param in exam.parameters.filter(is_active=True):
+                param.is_active = False
+                param.save(update_fields=['is_active', 'updated_at'])
+                params_deactivated += 1
+
+            exam.result_structure = ResultStructure.SINGLE_VALUE
+            exam.save(update_fields=['result_structure', 'updated_at'])
+
+        AuditLog.objects.create(
+            actor_type=ActorType.STAFF_USER,
+            actor_id=updated_by.id,
+            actor_email=updated_by.email,
+            action=AuditAction.UPDATE,
+            entity_type='ExamDefinition',
+            entity_id=exam.id,
+            diff={
+                'before': {'result_structure': before_structure},
+                'after': {'result_structure': exam.result_structure},
+                'structure_change': True,
+                'parameters_added': params_added,
+                'parameters_deactivated': params_deactivated,
+                'exam_code': exam.code,
+            },
             ip_address=getattr(request, 'audit_ip', None),
             user_agent=getattr(request, 'audit_user_agent', ''),
         )

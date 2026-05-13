@@ -49,6 +49,7 @@ from .serializers import (
     SampleTypeSerializer,
     LabExamSettingsSerializer,
     LabExamSettingsWriteSerializer,
+    ExamDefinitionStructureChangeSerializer,
     ExamParameterSerializer,
     ExamParameterWriteSerializer,
     ExamParameterUpdateSerializer,
@@ -535,6 +536,33 @@ class ExamDefinitionViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet):
             deactivated_by=request.user,
             request=request,
         )
+        return Response(ExamDefinitionDetailSerializer(exam).data)
+
+    @action(detail=True, methods=['post'], url_path='change-structure')
+    def change_structure(self, request, pk=None):
+        """``POST /exam-definitions/{id}/change-structure/``
+
+        Switch the exam's ``result_structure`` between SINGLE_VALUE
+        and MULTI_PARAMETER. This is the ONLY sanctioned write path
+        for that field — the standard PATCH refuses it because a
+        silent flip would change how every in-flight item is
+        interpreted at result entry. In-flight items are protected
+        upstream by the ``result_structure_snapshot`` on
+        ``AnalysisRequestItem``; see the service docstring.
+        """
+        exam = self.get_object()
+        serializer = ExamDefinitionStructureChangeSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        exam = ExamDefinitionService.change_structure(
+            exam=exam,
+            new_structure=serializer.validated_data['result_structure'],
+            parameters=serializer.validated_data.get('parameters') or [],
+            updated_by=request.user,
+            request=request,
+        )
+        exam = ExamDefinition.objects.select_related(
+            'category', 'family', 'sub_family', 'tube_type', 'technique', 'lab_settings',
+        ).prefetch_related('parameters').get(id=exam.id)
         return Response(ExamDefinitionDetailSerializer(exam).data)
 
     @action(detail=True, methods=['get', 'put'], url_path='settings')

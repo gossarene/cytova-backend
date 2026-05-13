@@ -86,10 +86,15 @@ def _get_file_or_404(result_pk, pk) -> ResultFile:
 class ResultVersionViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet):
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_class = ResultVersionFilter
+    # Patient name is searchable for the worklist UX; the request
+    # number + exam fields stay for backwards compatibility.
     search_fields = [
         'item__exam_definition__code',
         'item__exam_definition__name',
         'item__analysis_request__request_number',
+        'item__analysis_request__public_reference',
+        'item__analysis_request__patient__first_name',
+        'item__analysis_request__patient__last_name',
     ]
     ordering_fields = ['created_at', 'status', 'version_number', 'published_at']
     ordering = ['-created_at']
@@ -102,7 +107,7 @@ class ResultVersionViewSet(ListModelMixin, RetrieveModelMixin, GenericViewSet):
             ResultVersion.objects
             .select_related(
                 'item__exam_definition',
-                'item__analysis_request',
+                'item__analysis_request__patient',
                 'entered_by', 'submitted_by',
                 'validated_by', 'rejected_by', 'published_by',
             )

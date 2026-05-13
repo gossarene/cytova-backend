@@ -21,6 +21,17 @@ PLATFORM_ONLY_ROLES: frozenset[str] = frozenset()  # No tenant role is platform-
 TENANT_ROLES: frozenset[str] = frozenset(r.value for r in Role)
 
 
+#: Smart defaults for the per-user notification flags, keyed by
+#: role. Applied at creation time by ``StaffUserManager.create_user``
+#: ONLY when the caller didn't explicitly pass a value — roles are
+#: a suggestion, never the final authority.
+_ROLE_NOTIFICATION_DEFAULTS: dict[str, dict[str, bool]] = {
+    Role.BIOLOGIST: {'receive_review_ready_notifications': True},
+    Role.LAB_ADMIN: {'receive_review_ready_notifications': True},
+    Role.TECHNICIAN: {'receive_result_rejection_notifications': True},
+}
+
+
 class StaffUserManager(BaseUserManager):
     """Custom manager for StaffUser using email as the unique identifier."""
 
@@ -28,6 +39,16 @@ class StaffUserManager(BaseUserManager):
         if not email:
             raise ValueError('An email address is required.')
         email = self.normalize_email(email)
+
+        # Apply role-derived notification defaults BEFORE constructing
+        # the model so the operator can still override them by passing
+        # explicit kwargs (e.g. ``receive_review_ready_notifications=False``
+        # for a biologist who doesn't want the blast). The defaults
+        # never overwrite an already-supplied value.
+        role = extra_fields.get('role')
+        for field, value in _ROLE_NOTIFICATION_DEFAULTS.get(role, {}).items():
+            extra_fields.setdefault(field, value)
+
         user = self.model(email=email, **extra_fields)
         user.set_password(password)
         user.save(using=self._db)
@@ -81,6 +102,26 @@ class StaffUser(AbstractBaseUser, PermissionsMixin):
         default='',
         help_text='Internal storage key for the user\'s signature image. '
                   'Rendered on reports validated by this user.',
+    )
+
+    # -- Internal-workflow notification preferences --
+    # Per-user opt-in flags for the two internal email channels.
+    # Role-based "smart defaults" are applied at creation time
+    # via ``StaffUserManager.create_user`` — see that method's
+    # docstring for the mapping. After creation, the LAB_ADMIN
+    # can flip these flags manually for any user; roles are NOT
+    # the final authority on who receives emails.
+    receive_review_ready_notifications = models.BooleanField(
+        default=False,
+        help_text='If True, this user receives the "request ready for '
+                  'biological validation" email when a request becomes '
+                  'reviewable.',
+    )
+    receive_result_rejection_notifications = models.BooleanField(
+        default=False,
+        help_text='If True, this user receives the "your submitted '
+                  'result was rejected" email when a biologist rejects '
+                  'a result they entered.',
     )
 
     # Django internals

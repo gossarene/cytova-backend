@@ -43,6 +43,10 @@ from reportlab.pdfgen import canvas
 from apps.audit.models import ActorType, AuditAction, AuditLog
 from apps.catalog.models import ResultStructure
 from apps.lab_settings.models import LabSettings
+from apps.patients.identity import (
+    SKIP_REASON_INCOMPLETE_IDENTITY,
+    is_patient_identity_reliable_for_history,
+)
 from apps.requests.branding import ReportBranding, resolve_result_report_branding
 from apps.requests.models import (
     AnalysisRequest, AnalysisRequestReport, RequestStatus,
@@ -324,6 +328,21 @@ def _create_version(
     report.pdf_file_key = file_key
     report.save(update_fields=['pdf_file_key', 'updated_at'])
 
+    # Note whether previous-value lookup was suppressed on this run
+    # because the patient's identity wasn't reliable enough for
+    # cross-request matching. Surfacing the reason on the audit row
+    # makes the "why is there no Previous column?" answer one query
+    # away — without leaking patient DOB or document number.
+    audit_after: dict = {
+        'analysis_request_id': str(analysis_request.id),
+        'request_number': analysis_request.request_number,
+        'version_number': version_number,
+    }
+    if not is_patient_identity_reliable_for_history(analysis_request.patient):
+        audit_after['previous_values_skipped_reason'] = (
+            SKIP_REASON_INCOMPLETE_IDENTITY
+        )
+
     AuditLog.objects.create(
         actor_type=ActorType.STAFF_USER,
         actor_id=getattr(generated_by, 'id', None),
@@ -331,11 +350,7 @@ def _create_version(
         action=audit_action,
         entity_type='AnalysisRequestReport',
         entity_id=report.id,
-        diff={'after': {
-            'analysis_request_id': str(analysis_request.id),
-            'request_number': analysis_request.request_number,
-            'version_number': version_number,
-        }},
+        diff={'after': audit_after},
         ip_address=getattr(request, 'audit_ip', None),
         user_agent=getattr(request, 'audit_user_agent', ''),
     )
@@ -401,6 +416,9 @@ def _collect_sections(analysis_request: AnalysisRequest) -> list[dict]:
         analysis_request, exam_def_ids,
     )
 
+    # Local import — avoids a module-load cycle with apps.requests.services.
+    from apps.requests.item_structure import effective_result_structure
+
     families: dict[str, dict] = {}
     for item in items:
         version = current_versions.get(item.id)
@@ -415,12 +433,19 @@ def _collect_sections(analysis_request: AnalysisRequest) -> list[dict]:
         values = list(version.values.order_by('display_order'))
         prev_version = previous_lookup.get(exam_def.id)
 
+        # The report MUST render the structure that drove result
+        # entry — not whatever the catalog says today — so a
+        # structural correction on the exam definition after this
+        # request was finalised never rewrites the historical
+        # report's interpretation. Snapshot wins; live falls back.
+        item_structure = effective_result_structure(item)
+
         # Attach previous data to each value or the exam dict
         prev_value_single = None
         prev_date_single = None
         if prev_version is not None:
             prev_vals = {v.parameter_id: v for v in prev_version.values.all()}
-            if exam_def.result_structure == ResultStructure.MULTI_PARAMETER:
+            if item_structure == ResultStructure.MULTI_PARAMETER:
                 for val in values:
                     pv = prev_vals.get(val.parameter_id)
                     val.previous_value = pv.value if pv else None
@@ -452,7 +477,7 @@ def _collect_sections(analysis_request: AnalysisRequest) -> list[dict]:
             'code': exam_def.code,
             'name': exam_def.name,
             'technique': exam_def.technique.name if exam_def.technique else '',
-            'structure': exam_def.result_structure,
+            'structure': item_structure,
             'version': version,
             'values': values,
             'previous_value': prev_value_single,
@@ -484,11 +509,26 @@ def _build_previous_lookup(
     - Result version is the item's current version and is VALIDATED.
     - Among candidates, the one from the most recently created request
       wins (closest temporal comparison).
+
+    Identity guard
+    --------------
+    Returns ``{}`` (and skips the SQL entirely) when the patient's
+    identity is not reliable enough for cross-request matching —
+    see ``apps.patients.identity.is_patient_identity_reliable_for_history``.
+    The risk being mitigated: a placeholder document number or an
+    unknown DOB can match a different real person on the join, so
+    we'd surface someone else's history on the current report. The
+    safe fallback is "no previous values" — the renderer collapses
+    the Previous column cleanly when no row supplies it.
     """
     if not exam_def_ids:
         return {}
 
     patient = current_request.patient
+    if not is_patient_identity_reliable_for_history(patient):
+        # NO database query is issued in this branch. Counter-tested
+        # in ``test_previous_results_identity_guard.py``.
+        return {}
 
     candidates = list(
         ResultVersion.objects.filter(

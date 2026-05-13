@@ -71,6 +71,13 @@ class LabSettingsSerializer(serializers.ModelSerializer):
             'label_horizontal_gap_mm', 'label_vertical_gap_mm',
             'label_thermal_gap_mm',
             'label_show_barcode', 'label_show_numeric_code',
+            # internal-workflow notification settings (staff-to-staff
+            # workflow emails — biologist review-ready, technician
+            # rejection). Distinct from the patient-facing
+            # ``notification_enable_*`` block above.
+            'internal_notifications_enabled',
+            'notify_review_ready_enabled',
+            'notify_result_rejected_enabled',
             'updated_at',
         ]
         read_only_fields = [
@@ -149,6 +156,12 @@ class LabSettingsUpdateSerializer(serializers.ModelSerializer):
             'label_horizontal_gap_mm', 'label_vertical_gap_mm',
             'label_thermal_gap_mm',
             'label_show_barcode', 'label_show_numeric_code',
+            # internal-workflow notification settings — LAB_ADMIN-
+            # writable via the same PATCH endpoint that already
+            # owns the rest of the lab settings.
+            'internal_notifications_enabled',
+            'notify_review_ready_enabled',
+            'notify_result_rejected_enabled',
         ]
         extra_kwargs = {f: {'required': False} for f in fields}
 

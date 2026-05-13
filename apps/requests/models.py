@@ -388,6 +388,34 @@ class AnalysisRequestItem(BaseModel):
         help_text='How the billed price was determined.',
     )
 
+    # ---- Catalog snapshot — protects in-flight requests when the lab
+    # corrects an ExamDefinition's result structure or parameter set after
+    # the fact. Populated at item creation; legacy rows have empty values
+    # and the readers fall back to the live exam definition.
+    #
+    # Why a snapshot here and not just on ResultValue:
+    # ``ResultValue.name_snapshot`` already freezes individual parameter
+    # metadata, but a structural change (SINGLE_VALUE ↔ MULTI_PARAMETER)
+    # would otherwise flip how the item is interpreted at result-entry
+    # time — there's no ResultValue yet to anchor the structure on.
+    result_structure_snapshot = models.CharField(
+        max_length=20,
+        blank=True,
+        default='',
+        help_text='Result structure on the exam definition AT ITEM CREATION. '
+                  'Empty string on legacy rows; readers fall back to '
+                  '``exam_definition.result_structure`` in that case.',
+    )
+    parameter_ids_snapshot = models.JSONField(
+        default=list,
+        blank=True,
+        help_text='Active ExamParameter ids at item creation time, as a list '
+                  'of UUID strings. Used by result-entry services to scope '
+                  'the parameter set to what existed when the item was made '
+                  '— adding a parameter later does NOT inject it into '
+                  'in-flight requests.',
+    )
+
     # Specimen collection — populated when a technician marks the item
     # as collected. These fields live on the item (not the traceability
     # row) because collection is a per-item operational milestone and

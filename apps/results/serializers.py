@@ -68,9 +68,31 @@ class ResultVersionListSerializer(serializers.ModelSerializer):
     exam_name = serializers.CharField(
         source='item.exam_definition.name', read_only=True,
     )
+    # Request-level identifiers — the new worklist UX is
+    # request-oriented (click a row opens the request detail).
+    # Both the internal ``request_number`` and the operator-facing
+    # ``public_reference`` are surfaced; the UI prefers the public
+    # reference and falls back to the request number when blank.
+    request_id = serializers.UUIDField(
+        source='item.analysis_request_id', read_only=True,
+    )
     request_number = serializers.CharField(
         source='item.analysis_request.request_number', read_only=True,
     )
+    request_public_reference = serializers.CharField(
+        source='item.analysis_request.public_reference',
+        read_only=True, default='',
+    )
+    # Patient identifiers — minimal surface. ``patient_display_name``
+    # is the composed full name; we never include the document
+    # number here because the list is rendered to every staff role
+    # with results.view (auto-generated documents are not meant to
+    # be displayed as a patient identity).
+    patient_id = serializers.UUIDField(
+        source='item.analysis_request.patient_id',
+        read_only=True, default=None,
+    )
+    patient_display_name = serializers.SerializerMethodField()
     entered_by_email = serializers.CharField(
         source='entered_by.email', read_only=True, default=None,
     )
@@ -79,7 +101,9 @@ class ResultVersionListSerializer(serializers.ModelSerializer):
     class Meta:
         model = ResultVersion
         fields = [
-            'id', 'item_id', 'exam_code', 'exam_name', 'request_number',
+            'id', 'item_id', 'exam_code', 'exam_name',
+            'request_id', 'request_number', 'request_public_reference',
+            'patient_id', 'patient_display_name',
             'version_number', 'is_current', 'status',
             'is_abnormal', 'result_value', 'result_unit',
             'entered_by_email', 'entered_at',
@@ -89,6 +113,18 @@ class ResultVersionListSerializer(serializers.ModelSerializer):
 
     def get_files_count(self, obj):
         return obj.files.count()
+
+    def get_patient_display_name(self, obj):
+        # Defensive nesting walk — the result-detail surfaces would
+        # have already 404'd if any link were missing, but the list
+        # endpoint never narrows by request, so a corrupted row
+        # shouldn't blow up the page.
+        item = getattr(obj, 'item', None)
+        ar = getattr(item, 'analysis_request', None) if item else None
+        patient = getattr(ar, 'patient', None) if ar else None
+        if patient is None:
+            return None
+        return patient.full_name or None
 
 
 class ResultVersionDetailSerializer(serializers.ModelSerializer):

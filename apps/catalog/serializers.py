@@ -438,6 +438,39 @@ class ExamDefinitionCreateSerializer(serializers.Serializer):
         return attrs
 
 
+class ExamDefinitionStructureChangeSerializer(serializers.Serializer):
+    """Input for ``POST /exam-definitions/{id}/change-structure/``.
+
+    Allows a lab admin to correct a mis-typed structure on an exam
+    definition without breaking existing requests (in-flight items
+    keep their snapshotted structure — see
+    ``apps.requests.item_structure``).
+
+    Switching to MULTI_PARAMETER REQUIRES a non-empty ``parameters``
+    list — the service refuses an empty target since a multi-param
+    exam with zero parameters can't be entered. Reusing an existing
+    parameter ``code`` reactivates that parameter rather than
+    failing on the (exam, code) unique constraint, so an admin
+    correcting their own earlier flip-flop doesn't need to chase
+    down hidden rows.
+    """
+    result_structure = serializers.ChoiceField(
+        choices=ResultStructure.choices,
+    )
+    parameters = ExamParameterWriteSerializer(many=True, required=False, default=[])
+
+    def validate(self, attrs):
+        structure = attrs['result_structure']
+        params = attrs.get('parameters') or []
+        if structure == ResultStructure.MULTI_PARAMETER:
+            codes = [p.get('code', '').strip() for p in params]
+            if len(codes) != len(set(codes)):
+                raise serializers.ValidationError({
+                    'parameters': 'Parameter codes must be unique within the exam.',
+                })
+        return attrs
+
+
 class ExamDefinitionUpdateSerializer(serializers.Serializer):
     """code and result_structure are immutable after creation."""
     family_id = serializers.UUIDField(required=False)

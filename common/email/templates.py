@@ -636,3 +636,213 @@ def render_patient_shared_result(*, view_url: str) -> Tuple[str, str]:
         _PATIENT_SHARED_HTML_TEMPLATE.format(view_url=view_url),
         _PATIENT_SHARED_TEXT_TEMPLATE.format(view_url=view_url),
     )
+
+
+# ---------------------------------------------------------------------------
+# Internal-staff workflow templates
+#
+# Confidentiality contract: these templates ARE allowed to mention
+# request reference, exam name, and the rejection comment (which is
+# operator-written feedback for the technician — not a result value).
+# They MUST NOT include:
+#   - any result value / numeric measurement
+#   - any patient first name, last name, DOB, document number, or email
+#   - any reference range
+#   - any clinical interpretation
+#
+# The accompanying tests grep the rendered output to keep this honest.
+# ---------------------------------------------------------------------------
+
+_BIOLOGIST_READY_TEXT_TEMPLATE = """\
+Hi {first_name},
+
+A laboratory request is ready for biological validation.
+
+Request: {request_reference}
+{exam_summary_block}
+
+Open this request in Cytova to review and validate the results:
+{review_url}
+
+— Cytova
+You're receiving this because you are a biologist on this laboratory.
+"""
+
+_BIOLOGIST_READY_HTML_TEMPLATE = """\
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"></head>
+<body style="margin:0;padding:0;background:#f8fafc;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#0f172a;">
+  <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="background:#f8fafc;padding:40px 16px;">
+    <tr><td align="center">
+      <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="520" style="max-width:520px;background:#ffffff;border:1px solid #e2e8f0;border-radius:16px;padding:32px;">
+        <tr><td style="padding-bottom:16px;font-size:13px;color:#64748b;letter-spacing:0.04em;">CYTOVA · INTERNAL</td></tr>
+        <tr><td style="padding-bottom:8px;font-size:18px;font-weight:600;color:#0f172a;">Request ready for biological validation</td></tr>
+        <tr><td style="padding-bottom:16px;font-size:14px;line-height:1.6;color:#475569;">Hi {first_name}, all required exam results have been submitted on this request and are awaiting your validation.</td></tr>
+        <tr><td style="padding-bottom:16px;font-size:14px;line-height:1.6;color:#0f172a;">
+          <div style="font-weight:600;">Request: {request_reference}</div>
+          {exam_summary_html}
+        </td></tr>
+        <tr><td align="center" style="padding:8px 0 24px 0;">
+          <a href="{review_url}" style="display:inline-block;background:#2563eb;color:#ffffff;text-decoration:none;padding:12px 24px;border-radius:10px;font-size:14px;font-weight:600;">Review request in Cytova</a>
+        </td></tr>
+        <tr><td style="padding-top:16px;border-top:1px solid #e2e8f0;font-size:12px;color:#94a3b8;line-height:1.6;">You're receiving this because you are a biologist on this laboratory. This notification carries no result values or patient details — open Cytova to see them.</td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body></html>
+"""
+
+
+def render_biologist_request_ready(
+    *,
+    first_name: str,
+    request_reference: str,
+    exam_names: list[str],
+    review_url: str,
+) -> Tuple[str, str]:
+    """Render the "request ready for biological validation" email.
+
+    ``exam_names`` is a small list of exam display names — purely
+    metadata, never a result value. Anything more clinical (units,
+    reference ranges, computed values) belongs only behind the
+    review link.
+
+    Caller must already have filtered the list to a reasonable
+    size; we don't truncate here so the audit content is verbatim
+    what the recipient sees.
+    """
+    safe_name = (first_name or 'there').strip() or 'there'
+    safe_ref = (request_reference or '').strip() or '(no reference)'
+
+    # Build a concise, escape-safe summary block. We keep it to a
+    # short bullet list so the email stays scannable.
+    text_summary = '\n'.join(
+        f'  - {n}' for n in exam_names if n
+    )
+    if text_summary:
+        text_block = f'Exams:\n{text_summary}'
+    else:
+        text_block = '(see request in Cytova for the full exam list)'
+
+    html_items = ''.join(
+        f'<li style="margin:4px 0;color:#475569;">{html.escape(n)}</li>'
+        for n in exam_names if n
+    )
+    if html_items:
+        html_summary = (
+            '<ul style="margin:8px 0 0 0;padding-left:20px;font-size:14px;">'
+            + html_items
+            + '</ul>'
+        )
+    else:
+        html_summary = (
+            '<div style="font-size:13px;color:#64748b;margin-top:4px;">'
+            'See the request in Cytova for the exam list.</div>'
+        )
+
+    return (
+        _BIOLOGIST_READY_HTML_TEMPLATE.format(
+            first_name=html.escape(safe_name),
+            request_reference=html.escape(safe_ref),
+            exam_summary_html=html_summary,
+            review_url=review_url,
+        ),
+        _BIOLOGIST_READY_TEXT_TEMPLATE.format(
+            first_name=safe_name,
+            request_reference=safe_ref,
+            exam_summary_block=text_block,
+            review_url=review_url,
+        ),
+    )
+
+
+_TECH_REJECTED_TEXT_TEMPLATE = """\
+Hi {first_name},
+
+A result you submitted has been rejected by a biologist and needs to be
+re-entered.
+
+Request: {request_reference}
+Exam:    {exam_name}
+{notes_block}
+
+Open the request in Cytova to enter a corrected result:
+{review_url}
+
+— Cytova
+"""
+
+_TECH_REJECTED_HTML_TEMPLATE = """\
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"></head>
+<body style="margin:0;padding:0;background:#f8fafc;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#0f172a;">
+  <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="background:#f8fafc;padding:40px 16px;">
+    <tr><td align="center">
+      <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="520" style="max-width:520px;background:#ffffff;border:1px solid #e2e8f0;border-radius:16px;padding:32px;">
+        <tr><td style="padding-bottom:16px;font-size:13px;color:#b45309;letter-spacing:0.04em;">CYTOVA · INTERNAL</td></tr>
+        <tr><td style="padding-bottom:8px;font-size:18px;font-weight:600;color:#0f172a;">A result you submitted was rejected</td></tr>
+        <tr><td style="padding-bottom:16px;font-size:14px;line-height:1.6;color:#475569;">Hi {first_name}, a biologist asked for this result to be re-entered.</td></tr>
+        <tr><td style="padding-bottom:16px;font-size:14px;line-height:1.6;color:#0f172a;">
+          <div><span style="color:#64748b;">Request:</span> <strong>{request_reference}</strong></div>
+          <div><span style="color:#64748b;">Exam:</span> <strong>{exam_name}</strong></div>
+          {notes_html}
+        </td></tr>
+        <tr><td align="center" style="padding:8px 0 24px 0;">
+          <a href="{review_url}" style="display:inline-block;background:#2563eb;color:#ffffff;text-decoration:none;padding:12px 24px;border-radius:10px;font-size:14px;font-weight:600;">Open request in Cytova</a>
+        </td></tr>
+        <tr><td style="padding-top:16px;border-top:1px solid #e2e8f0;font-size:12px;color:#94a3b8;line-height:1.6;">This notification only mentions the request reference, the exam name, and the rejection note. Open Cytova to see the rest.</td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body></html>
+"""
+
+
+def render_technician_result_rejected(
+    *,
+    first_name: str,
+    request_reference: str,
+    exam_name: str,
+    rejection_notes: str,
+    review_url: str,
+) -> Tuple[str, str]:
+    """Render the "your submitted result was rejected" email.
+
+    The rejection note is operator-written feedback (biologist →
+    technician). It MAY contain context like "wrong sample tube"
+    or "value looks too low — please re-check"; that's the point.
+    Callers are responsible for not pasting clinical content
+    there, but the template doesn't try to police the note.
+    """
+    safe_name = (first_name or 'there').strip() or 'there'
+    safe_ref = (request_reference or '').strip() or '(no reference)'
+    safe_exam = (exam_name or '').strip() or '(unnamed exam)'
+    notes = (rejection_notes or '').strip()
+
+    if notes:
+        notes_text = f'Note:    {notes}'
+        notes_html = (
+            '<div style="margin-top:8px;padding:12px;background:#fef3c7;'
+            'border-left:3px solid #f59e0b;font-size:13px;color:#78350f;">'
+            f'{html.escape(notes)}</div>'
+        )
+    else:
+        notes_text = ''
+        notes_html = ''
+
+    return (
+        _TECH_REJECTED_HTML_TEMPLATE.format(
+            first_name=html.escape(safe_name),
+            request_reference=html.escape(safe_ref),
+            exam_name=html.escape(safe_exam),
+            notes_html=notes_html,
+            review_url=review_url,
+        ),
+        _TECH_REJECTED_TEXT_TEMPLATE.format(
+            first_name=safe_name,
+            request_reference=safe_ref,
+            exam_name=safe_exam,
+            notes_block=notes_text,
+            review_url=review_url,
+        ),
+    )

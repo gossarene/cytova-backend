@@ -91,15 +91,73 @@ _RESULT_ENTRY_ELIGIBLE = {
 }
 
 
-def _create_result_values(version: ResultVersion, values_input: list, exam_def) -> list:
+def _maybe_notify_request_ready(analysis_request, *, actor) -> None:
+    """Hook fired after every ``submit`` to decide whether the
+    biologist review-ready email should be queued.
+
+    The trigger is "every active item on this request has a
+    current SUBMITTED or VALIDATED version". That's the operational
+    definition of "all required results in" — biologists only
+    care about reviewing a request when there's nothing left
+    pending entry.
+
+    Failures here MUST NOT propagate: the result submission is
+    already committed, and the notification service is a side
+    channel. A swallowed exception is logged but never re-raised.
+    """
+    try:
+        from apps.internal_notifications.services import (
+            notify_request_ready_for_review,
+        )
+        analysis_request.refresh_from_db(fields=['status'])
+        # Two states qualify as "ready for the biologist to look":
+        #   - AWAITING_REVIEW : at least one item still under review,
+        #     others may already be validated. Every active item has
+        #     at least a SUBMITTED current version.
+        #   - READY_FOR_RELEASE : every active item is validated.
+        #     Still reachable from a normal submit when only one
+        #     biologist also validates inline.
+        if analysis_request.status not in (
+            RequestStatus.AWAITING_REVIEW, RequestStatus.READY_FOR_RELEASE,
+        ):
+            return
+        # Confirm every active item is at least UNDER_REVIEW —
+        # protects against the partial state where AWAITING_REVIEW
+        # was reached on the FIRST submit of a multi-exam request.
+        active = [
+            i for i in analysis_request.items.all()
+            if i.status != ItemStatus.REJECTED
+        ]
+        eligible_states = {ItemStatus.UNDER_REVIEW, ItemStatus.VALIDATED}
+        if not active or not all(i.status in eligible_states for i in active):
+            return
+        notify_request_ready_for_review(analysis_request, actor=actor)
+    except Exception:  # noqa: BLE001 — notification failure must not break workflow
+        import logging
+        logging.getLogger(__name__).exception(
+            'Failed to schedule review-ready notification for request %s',
+            analysis_request.id,
+        )
+
+
+def _create_result_values(version: ResultVersion, values_input: list, item) -> list:
     """
     Create ResultValue rows for a version based on structured input.
     Snapshots metadata from the catalog at creation time.
     Returns the created rows.
+
+    Reads the result structure + active-parameter scope from the
+    item's snapshot (via ``effective_*`` helpers) so a structural
+    correction on the exam definition AFTER item creation never
+    flips how an in-flight item is interpreted at entry time.
     """
     from apps.catalog.models import ResultStructure, ExamParameter
+    from apps.requests.item_structure import (
+        effective_active_parameter_ids, effective_result_structure,
+    )
 
-    structure = exam_def.result_structure
+    exam_def = item.exam_definition
+    structure = effective_result_structure(item)
 
     if structure == ResultStructure.SINGLE_VALUE:
         if len(values_input) > 1:
@@ -126,17 +184,22 @@ def _create_result_values(version: ResultVersion, values_input: list, exam_def) 
     if len(param_ids) != len(set(param_ids)):
         raise ValidationError('Duplicate parameter entries are not allowed.')
 
+    # Allowed parameters for THIS item — scoped by the snapshot so a
+    # parameter added after item creation is rejected here, and a
+    # parameter deactivated after item creation is still accepted
+    # (the item was made when it existed).
+    allowed_ids = set(effective_active_parameter_ids(item))
     valid_params = {
         str(p.id): p
         for p in ExamParameter.objects.filter(
-            exam_definition=exam_def, is_active=True,
+            id__in=allowed_ids,
         )
     }
     for pid in param_ids:
         if str(pid) not in valid_params:
             raise ValidationError(
-                f'Parameter {pid} is not a valid active parameter '
-                f'for exam {exam_def.code}.'
+                f'Parameter {pid} is not a valid parameter '
+                f'for this item (exam {exam_def.code}).'
             )
 
     created = []
@@ -160,10 +223,10 @@ def _create_result_values(version: ResultVersion, values_input: list, exam_def) 
     return created
 
 
-def _replace_result_values(version: ResultVersion, values_input: list, exam_def) -> list:
+def _replace_result_values(version: ResultVersion, values_input: list, item) -> list:
     """Replace all value rows on a DRAFT version (for update)."""
     ResultValue.objects.filter(result_version=version).delete()
-    return _create_result_values(version, values_input, exam_def)
+    return _create_result_values(version, values_input, item)
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +307,7 @@ class ResultVersionService:
         _create_result_values(
             version,
             values if values is not None else [],
-            exam_def,
+            item,
         )
 
         if item.status == ItemStatus.COLLECTED:
@@ -302,8 +365,7 @@ class ResultVersionService:
             )
 
         if values_input is not None:
-            exam_def = version.item.exam_definition
-            _replace_result_values(version, values_input, exam_def)
+            _replace_result_values(version, values_input, version.item)
 
         return version
 
@@ -377,26 +439,36 @@ class ResultVersionService:
           ResultValue row
         """
         from apps.catalog.models import ResultStructure
+        from apps.requests.item_structure import (
+            effective_active_parameter_ids, effective_result_structure,
+        )
 
         _assert_not_issued(version.item)
         if not version.is_current:
             raise ValidationError('Only the current version can be submitted.')
 
-        exam_def = version.item.exam_definition
+        # Snapshot drives the completeness contract — a parameter
+        # added to the exam AFTER this item was created is NOT a
+        # required field on this submission, and a parameter
+        # deactivated after creation is still expected on this
+        # submission because the operator made the request when it
+        # was active.
+        structure = effective_result_structure(version.item)
 
-        if exam_def.result_structure == ResultStructure.MULTI_PARAMETER:
-            active_param_ids = set(
-                exam_def.parameters
-                .filter(is_active=True)
-                .values_list('id', flat=True)
-            )
-            filled_param_ids = set(
+        if structure == ResultStructure.MULTI_PARAMETER:
+            required_param_ids = {
+                # Stored as strings in the snapshot — cast back to
+                # the UUIDs the ResultValue rows use.
+                pid for pid in effective_active_parameter_ids(version.item)
+            }
+            filled_param_ids = {
+                str(pid) for pid in
                 version.values
                 .filter(parameter_id__isnull=False)
                 .exclude(value='')
                 .values_list('parameter_id', flat=True)
-            )
-            missing = active_param_ids - filled_param_ids
+            }
+            missing = required_param_ids - filled_param_ids
             if missing:
                 raise ValidationError(
                     f'{len(missing)} parameter(s) still need a value '
@@ -438,6 +510,15 @@ class ResultVersionService:
         ResultVersionService._refresh_review_status(
             item.analysis_request, actor=submitted_by, request=request,
         )
+
+        # Internal notifications — fire when this submission tipped
+        # the request into "all required results submitted" (i.e.
+        # AWAITING_REVIEW with every active item already under
+        # review or validated). The notification service dedupes
+        # per (request, review_cycle, recipient) so calling on
+        # every submit is safe; only the last submit of a round
+        # actually produces emails.
+        _maybe_notify_request_ready(item.analysis_request, actor=submitted_by)
 
         return version
 
@@ -549,6 +630,22 @@ class ResultVersionService:
         ResultVersionService._refresh_review_status(
             item.analysis_request, actor=rejected_by, request=request,
         )
+
+        # Internal notifications — tell the technician who submitted
+        # this version that it was rejected, so they can re-enter it.
+        # Dedupe key is per-version so a (hypothetical) second
+        # rejection of the same version cannot resend.
+        try:
+            from apps.internal_notifications.services import (
+                notify_technician_result_rejected,
+            )
+            notify_technician_result_rejected(version, actor=rejected_by)
+        except Exception:  # noqa: BLE001 — notification failure must not affect the reject
+            import logging
+            logging.getLogger(__name__).exception(
+                'Failed to schedule rejection notification for version %s',
+                version.id,
+            )
 
         return version
 

@@ -14,10 +14,12 @@ from .providers.base import EmailMessage, EmailProvider, EmailResult
 from .providers.brevo import BrevoEmailProvider
 from .providers.console import ConsoleEmailProvider
 from .templates import (
+    render_biologist_request_ready,
     render_password_reset,
     render_patient_result_ready,
     render_patient_shared_result,
     render_patient_verification,
+    render_technician_result_rejected,
     render_verification,
 )
 
@@ -32,6 +34,10 @@ PASSWORD_RESET_SUBJECT = 'Reset your Cytova password'
 # template is empty, so the visible default copy is unchanged.
 PATIENT_VERIFY_SUBJECT = 'Verify your Cytova account'
 PATIENT_SHARED_RESULT_SUBJECT = 'New lab result available in Cytova'
+# Internal-staff workflow subjects (biologist + technician). Kept as
+# constants so SIEM filters and audit logs can match against them.
+BIOLOGIST_REVIEW_READY_SUBJECT = '[Cytova] Request ready for biological validation'
+TECH_RESULT_REJECTED_SUBJECT = '[Cytova] A result you submitted was rejected'
 
 # Provider name → human-readable label used in startup logs.
 _PROVIDERS = ('console', 'brevo')
@@ -244,6 +250,78 @@ class EmailService:
             to_email=recipient_email,
             to_name='',
             subject=PATIENT_SHARED_RESULT_SUBJECT,
+            text=text_body,
+            html=html_body,
+        )
+        return self.provider.send(message)
+
+
+    def send_biologist_review_ready_email(
+        self,
+        *,
+        recipient_email: str,
+        recipient_name: str,
+        request_reference: str,
+        exam_names: list[str],
+        review_url: str,
+    ) -> EmailResult:
+        """Notify a biologist that an analysis request has all its
+        results submitted and is awaiting biological validation.
+
+        Internal-staff path. The template renders only the request
+        reference, the exam name list, and the CTA URL — never a
+        result value, never patient PII. Failures are returned via
+        ``EmailResult(ok=False)``; the calling notification service
+        flips its log row to ``FAILED`` rather than rolling back
+        the underlying workflow transaction (the staff result
+        submission MUST succeed even if SMTP is down).
+        """
+        html_body, text_body = render_biologist_request_ready(
+            first_name=recipient_name,
+            request_reference=request_reference,
+            exam_names=exam_names,
+            review_url=review_url,
+        )
+        message = EmailMessage(
+            to_email=recipient_email,
+            to_name=recipient_name or '',
+            subject=BIOLOGIST_REVIEW_READY_SUBJECT,
+            text=text_body,
+            html=html_body,
+        )
+        return self.provider.send(message)
+
+
+    def send_technician_result_rejected_email(
+        self,
+        *,
+        recipient_email: str,
+        recipient_name: str,
+        request_reference: str,
+        exam_name: str,
+        rejection_notes: str,
+        review_url: str,
+    ) -> EmailResult:
+        """Notify a technician that their submitted result was
+        rejected by a biologist and needs to be re-entered.
+
+        Same delivery contract as the other ``send_*`` methods.
+        ``rejection_notes`` is operator-written feedback — the
+        caller is responsible for keeping clinical content out of
+        it; the template treats it as plain text and escapes it
+        when rendering HTML.
+        """
+        html_body, text_body = render_technician_result_rejected(
+            first_name=recipient_name,
+            request_reference=request_reference,
+            exam_name=exam_name,
+            rejection_notes=rejection_notes,
+            review_url=review_url,
+        )
+        message = EmailMessage(
+            to_email=recipient_email,
+            to_name=recipient_name or '',
+            subject=TECH_RESULT_REJECTED_SUBJECT,
             text=text_body,
             html=html_body,
         )
